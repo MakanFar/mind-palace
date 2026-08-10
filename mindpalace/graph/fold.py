@@ -19,6 +19,71 @@ ACTION_TO_STATUS = {"confirm": "confirmed", "dismiss": "dismissed"}
 UNKNOWN_TYPE = "unknown"
 
 
+class FoldError(ValueError):
+    """Base for every condition `fold` refuses to silently paper over.
+
+    A caller processing a whole vault (see the `sync` pipeline, which folds
+    every note unconditionally and must keep the vault usable when
+    individual files are malformed) can catch this one class to know "the
+    source set failed validation," or catch a specific subtype below to
+    read the structured attributes it needs to quarantine the offending
+    note(s) or assertion and continue rebuilding everything else.
+    """
+
+
+class DuplicateAssertionIdError(FoldError):
+    """An assertion or claim id was seen in more than one note.
+
+    Assertion ids are meant to be unique across the whole current source
+    set; reusing one is a caller bug (e.g. failing to mint a fresh id when
+    a note is regenerated). Left unchecked, it doesn't just drop a record
+    -- it can double-count into an aggregate's weight while the published
+    `assertions`/`claims` table silently keeps only the last one seen.
+    """
+
+    def __init__(self, assertion_id: str, note_ids: tuple[str, ...]):
+        self.assertion_id = assertion_id
+        self.note_ids = note_ids
+        first, second = note_ids
+        super().__init__(
+            f"duplicate assertion id {assertion_id!r}: already recorded from "
+            f"note {first!r}, seen again in note {second!r}. Assertion ids "
+            f"must be unique across the source set -- re-processing a note "
+            f"must produce fresh ids, never reuse one, or aggregates would "
+            f"silently double-count."
+        )
+
+
+class UnknownEdgeTypeError(FoldError):
+    """A relationship assertion names an edge type absent from config."""
+
+    def __init__(self, edge_type: str, note_id: str, assertion_id: str):
+        self.edge_type = edge_type
+        self.note_id = note_id
+        self.assertion_id = assertion_id
+        super().__init__(
+            f"note {note_id}: unknown edge type {edge_type!r} "
+            f"(assertion {assertion_id})"
+        )
+
+
+class UnknownDecisionActionError(FoldError):
+    """The decision log carries an action `fold` doesn't recognise.
+
+    `DecisionLog.append` now rejects unknown actions at write time, so this
+    should be unreachable in practice; it remains here as defence in depth
+    against a decision log written by an older or buggy caller.
+    """
+
+    def __init__(self, action: str, assertion_id: str):
+        self.action = action
+        self.assertion_id = assertion_id
+        super().__init__(
+            f"assertion {assertion_id!r}: unrecognised decision action "
+            f"{action!r} (expected one of {sorted(ACTION_TO_STATUS)})"
+        )
+
+
 @dataclass(frozen=True)
 class FoldedEntity:
     slug: str
@@ -82,10 +147,7 @@ def _status(item_id: str, statuses: dict[str, str]) -> str:
     try:
         return ACTION_TO_STATUS[action]
     except KeyError:
-        raise ValueError(
-            f"assertion {item_id!r}: unrecognised decision action {action!r} "
-            f"(expected one of {sorted(ACTION_TO_STATUS)})"
-        ) from None
+        raise UnknownDecisionActionError(action=action, assertion_id=item_id) from None
 
 
 def fold(
@@ -113,18 +175,13 @@ def fold(
 
         for raw in note.relationship_assertions:
             if raw.type not in config.edge_types:
-                raise ValueError(
-                    f"note {note.id}: unknown edge type {raw.type!r} "
-                    f"(assertion {raw.id})"
+                raise UnknownEdgeTypeError(
+                    edge_type=raw.type, note_id=note.id, assertion_id=raw.id
                 )
             if raw.id in assertions:
-                raise ValueError(
-                    f"duplicate relationship assertion id {raw.id!r}: already "
-                    f"recorded from note {assertions[raw.id].note_id!r}, seen "
-                    f"again in note {note.id!r}. Assertion ids must be unique "
-                    f"across the source set -- re-processing a note must "
-                    f"produce fresh ids, never reuse one, or aggregates would "
-                    f"silently double-count."
+                raise DuplicateAssertionIdError(
+                    assertion_id=raw.id,
+                    note_ids=(assertions[raw.id].note_id, note.id),
                 )
             source, target = slugify(raw.source), slugify(raw.target)
             touch(source, note.id, None)
@@ -142,22 +199,23 @@ def fold(
             )
             assertions[raw.id] = folded
 
-            key = aggregate_key(
-                source, raw.type, target, symmetric=config.is_symmetric(raw.type)
-            )
+            symmetric = config.is_symmetric(raw.type)
+            key = aggregate_key(source, raw.type, target, symmetric=symmetric)
             grouped.setdefault(key, []).append(folded)
             if key not in aggregate_shape:
-                left, _, rest = key.removeprefix("r:").partition("|")
-                edge_type, _, right = rest.partition("|")
-                aggregate_shape[key] = (left, edge_type, right)
+                # Capture (source, type, target) directly from values already
+                # in hand -- never re-derive them by parsing `key` apart.
+                # `key`'s "|"-joined format has no character restriction on
+                # edge-type names (config.load_config doesn't enforce one),
+                # so an edge type containing "|" would silently mis-split.
+                left, right = sorted((source, target)) if symmetric else (source, target)
+                aggregate_shape[key] = (left, raw.type, right)
 
         for raw_claim in note.claim_assertions:
             if raw_claim.id in claims:
-                raise ValueError(
-                    f"duplicate claim assertion id {raw_claim.id!r}: already "
-                    f"recorded from note {claims[raw_claim.id].note_id!r}, "
-                    f"seen again in note {note.id!r}. Assertion ids must be "
-                    f"unique across the source set."
+                raise DuplicateAssertionIdError(
+                    assertion_id=raw_claim.id,
+                    note_ids=(claims[raw_claim.id].note_id, note.id),
                 )
             subject = slugify(raw_claim.subject)
             touch(subject, note.id, None)

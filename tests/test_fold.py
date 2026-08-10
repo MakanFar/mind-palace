@@ -1,7 +1,13 @@
 import pytest
 
 from mindpalace.config import Config, EdgeType, Thresholds
-from mindpalace.graph.fold import fold
+from mindpalace.graph.fold import (
+    DuplicateAssertionIdError,
+    FoldError,
+    UnknownDecisionActionError,
+    UnknownEdgeTypeError,
+    fold,
+)
 from mindpalace.models import ClaimAssertion, EntityInstance, Note, RelationshipAssertion
 
 
@@ -208,6 +214,27 @@ def test_unknown_edge_type_is_rejected(config):
         fold([note], {}, config)
 
 
+def test_dismissing_one_of_three_and_leaving_one_proposed_still_traverses(config):
+    """Mixed statuses on the same pair: one confirmed, one dismissed, one
+    still proposed. traversable/weight/mean_strength must reflect only the
+    confirmed assertion -- proposed and dismissed both contribute nothing."""
+    note = make_note(
+        "n_01",
+        "2026-08-01T00:00:00Z",
+        relationships=[
+            rel("x_1", "a", "b", strength=4),  # dismissed
+            rel("x_2", "a", "b", strength=8),  # confirmed
+            rel("x_3", "a", "b", strength=2),  # left proposed
+        ],
+    )
+    statuses = {"x_1": "dismiss", "x_2": "confirm"}
+    [aggregate] = fold([note], statuses, config).aggregates.values()
+    assert aggregate.traversable is True
+    assert aggregate.weight == 1
+    assert aggregate.mean_strength == 8.0
+    assert set(aggregate.assertion_ids) == {"x_1", "x_2", "x_3"}
+
+
 # --- Additional adversarial tests (not in the brief) ---
 #
 # The brief's task description explicitly asks: "Can any input cause an
@@ -217,7 +244,9 @@ def test_unknown_edge_type_is_rejected(config):
 # duplicate id, and the duplicate is independently appended into `grouped`
 # for aggregation, meaning a re-used id can be double-counted into an
 # aggregate's weight while the `assertions` table silently keeps only one
-# of the two. These tests pin the corrected behaviour: surface loudly.
+# of the two. These tests pin the corrected behaviour: surface loudly, with
+# structured attributes a caller (the vault-wide `sync`) can act on rather
+# than parse out of a message string.
 
 
 def test_duplicate_relationship_assertion_id_across_notes_is_rejected(config):
@@ -227,8 +256,11 @@ def test_duplicate_relationship_assertion_id_across_notes_is_rejected(config):
     second = make_note(
         "n_02", "2026-08-02T00:00:00Z", relationships=[rel("x_1", "c", "d")]
     )
-    with pytest.raises(Exception, match="x_1"):
+    with pytest.raises(DuplicateAssertionIdError) as excinfo:
         fold([first, second], {}, config)
+    assert isinstance(excinfo.value, FoldError)
+    assert excinfo.value.assertion_id == "x_1"
+    assert excinfo.value.note_ids == ("n_01", "n_02")
 
 
 def test_duplicate_claim_assertion_id_across_notes_is_rejected(config):
@@ -238,16 +270,66 @@ def test_duplicate_claim_assertion_id_across_notes_is_rejected(config):
     second = make_note(
         "n_02", "2026-08-02T00:00:00Z", claims=[ClaimAssertion("k_1", "b", "Second.")]
     )
-    with pytest.raises(Exception, match="k_1"):
+    with pytest.raises(DuplicateAssertionIdError) as excinfo:
         fold([first, second], {}, config)
+    assert isinstance(excinfo.value, FoldError)
+    assert excinfo.value.assertion_id == "k_1"
+    assert excinfo.value.note_ids == ("n_01", "n_02")
+
+
+def test_unknown_edge_type_error_carries_structured_attributes(config):
+    note = make_note(
+        "n_01",
+        "2026-08-01T00:00:00Z",
+        relationships=[rel("x_1", "a", "b", edge_type="invented")],
+    )
+    with pytest.raises(UnknownEdgeTypeError) as excinfo:
+        fold([note], {}, config)
+    assert isinstance(excinfo.value, FoldError)
+    assert excinfo.value.edge_type == "invented"
+    assert excinfo.value.note_id == "n_01"
+    assert excinfo.value.assertion_id == "x_1"
 
 
 def test_unrecognized_decision_action_is_rejected(config):
     note = make_note(
         "n_01", "2026-08-01T00:00:00Z", relationships=[rel("x_1", "a", "b")]
     )
-    with pytest.raises(Exception, match="bogus"):
+    with pytest.raises(UnknownDecisionActionError) as excinfo:
         fold([note], {"x_1": "bogus"}, config)
+    assert isinstance(excinfo.value, FoldError)
+    assert excinfo.value.action == "bogus"
+    assert excinfo.value.assertion_id == "x_1"
+
+
+def test_edge_type_name_containing_pipe_does_not_corrupt_the_aggregate(config):
+    """`aggregate_key` joins source/type/target with "|" and config places no
+    character restriction on edge-type names. Fold must capture
+    (source, type, target) directly rather than re-parsing the key string,
+    or an edge type like "relates|to" would mis-split into the wrong
+    source/type/target -- corrupting Aggregate fields and, downstream, the
+    `degree` dict that computes rank."""
+    piped_config = Config(
+        schema_version=1,
+        entity_types=["concept"],
+        edge_types={
+            "relates|to": EdgeType("relates|to", directed=False, cluster_weight=1.0),
+        },
+        thresholds=Thresholds(150, 2.0, 0.35, 0.5),
+        embedder={"kind": "stub"},
+        templates={},
+    )
+    note = make_note(
+        "n_01",
+        "2026-08-01T00:00:00Z",
+        relationships=[rel("x_1", "a", "b", edge_type="relates|to")],
+    )
+    [aggregate] = fold([note], {"x_1": "confirm"}, piped_config).aggregates.values()
+    assert aggregate.source == "a"
+    assert aggregate.type == "relates|to"
+    assert aggregate.target == "b"
+    assert aggregate.traversable is True
+    assert aggregate.weight == 1
 
 
 def test_fold_output_is_independent_of_input_note_ordering(config):

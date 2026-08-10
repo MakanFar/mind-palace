@@ -76,6 +76,9 @@ class OpLog:
         return list(begun.values())
 
 
+VALID_ACTIONS = {"confirm", "dismiss"}
+
+
 class DecisionLog:
     """Durable review events. Assertion status is the fold of this log."""
 
@@ -90,6 +93,15 @@ class DecisionLog:
         op_id: str,
         reason: str | None = None,
     ) -> None:
+        if action not in VALID_ACTIONS:
+            raise ValueError(
+                f"invalid decision action {action!r} for assertion "
+                f"{assertion_id!r} (expected one of {sorted(VALID_ACTIONS)}). "
+                f"The decision log is one shared file for the whole vault -- "
+                f"an invalid action written here would block every future "
+                f"rebuild with no way to quarantine just this line, so it is "
+                f"rejected before it can be durably written."
+            )
         _append_line(
             self.path,
             {

@@ -1,3 +1,5 @@
+import pytest
+
 from mindpalace.oplog import DecisionLog, OpLog
 
 
@@ -65,6 +67,18 @@ def test_confirmation_clears_a_prior_dismissal_reason(tmp_path):
     decisions.append("x_01", "dismiss", "resolve_assertion", "op_1", "different sense")
     decisions.append("x_01", "confirm", "resolve_assertion", "op_2")
     assert decisions.dismissal_reasons() == {}
+
+
+def test_append_rejects_an_invalid_action(tmp_path):
+    """The decision log is one shared file for the whole vault: a bad action
+    line, once durably written, would block every future rebuild with no
+    per-file quarantine available. Reject it before it can be written."""
+    path = tmp_path / "decisions.jsonl"
+    decisions = DecisionLog(path)
+    with pytest.raises(ValueError, match="bogus"):
+        decisions.append("x_01", "bogus", "resolve_assertion", "op_1")
+    # Nothing durable was written -- the file must not even exist.
+    assert not path.exists()
 
 
 def test_oplog_survives_truncated_final_line(tmp_path):
