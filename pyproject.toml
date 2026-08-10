@@ -26,6 +26,16 @@ build-backend = "hatchling.build"
 testpaths = ["tests"]
 addopts = "-m 'not network'"
 markers = ["network: requires network access (model download)"]
+filterwarnings = [
+    # graspologic's inference submodule eagerly imports hyppo (unrelated to
+    # the partition/clustering API this project uses), which still imports a
+    # deprecated scipy.sparse path. Scoped to the exact originating module so
+    # genuine DeprecationWarnings anywhere else stay visible.
+    "ignore::DeprecationWarning:hyppo\\.independence\\.hhg",
+    # numba (a graspologic-native transitive dependency) warns about a
+    # keyword it now defaults to True; scoped to the module that issues it.
+    "ignore:.*nopython=False.*:numba.core.errors.NumbaDeprecationWarning:numba\\.core\\.decorators",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["mindpalace"]
