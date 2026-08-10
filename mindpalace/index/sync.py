@@ -205,8 +205,12 @@ def _ambiguous_alias_issues(
     """
     owners: dict[str, list[str]] = {}
     for page in entity_pages:
-        for alias in page.user.get("aliases", []):
-            owners.setdefault(slugify(alias), []).append(page.slug)
+        # Dedupe per page before recording a claim: a page listing the same
+        # alias twice (or the same alias in two different cases -- both
+        # normalise to the same slug) must count as one claim, not two, or
+        # it self-collides and gets reported as ambiguous against itself.
+        for alias in {slugify(a) for a in page.user.get("aliases", [])}:
+            owners.setdefault(alias, []).append(page.slug)
 
     issues: list[tuple[str, str, str]] = []
     for alias, slugs in sorted(owners.items()):

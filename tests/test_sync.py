@@ -183,6 +183,48 @@ def test_ambiguous_alias_is_reported_as_a_vault_issue(conn, vault, config):
     assert stored == 1
 
 
+def test_a_repeated_alias_on_one_entity_is_not_a_collision(conn, vault, config):
+    """Regression: `_ambiguous_alias_issues` used to append `page.slug` once
+    per alias *occurrence* rather than once per *page*, so a single entity
+    listing the same alias twice yielded `owners["shared-name"] ==
+    ["alpha", "alpha"]` -- length 2, past the skip check -- and reported a
+    self-contradictory issue naming only one entity as "claimed by more
+    than one entity". One entity repeating its own alias is not a claim by
+    more than one entity and must not be reported."""
+    _, store = vault
+    store.write_entity_page(
+        EntityPage(
+            slug="alpha",
+            type="concept",
+            description="",
+            user={"aliases": ["shared-name", "shared-name"]},
+        )
+    )
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    assert not any(issue[1] == "ambiguous_alias" for issue in report.issues)
+
+
+def test_a_case_variant_alias_on_one_entity_is_not_a_collision(conn, vault, config):
+    """Same bug, reached via the other route into it: two case variants of
+    one alias on the same page normalise to the same slug, so they must
+    dedupe exactly like a literal repeat does."""
+    _, store = vault
+    store.write_entity_page(
+        EntityPage(
+            slug="alpha",
+            type="concept",
+            description="",
+            user={"aliases": ["Shared-Name", "shared-name"]},
+        )
+    )
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    assert not any(issue[1] == "ambiguous_alias" for issue in report.issues)
+
+
 def test_sync_records_the_embedder_in_cache_meta(conn, vault, config):
     _, store = vault
     add_note(store, "n_01", "scaling-laws")
