@@ -65,6 +65,13 @@ class VaultStore:
     # ---- Tier 2 -------------------------------------------------------
 
     def write_entity_page(self, page: EntityPage) -> Path:
+        # Validate that description doesn't contain marker lines
+        for line in page.description.splitlines():
+            if line.strip() == RELATED_OPEN:
+                raise ValueError(f"Description contains marker line: {RELATED_OPEN}")
+            if line.strip() == RELATED_CLOSE:
+                raise ValueError(f"Description contains marker line: {RELATED_CLOSE}")
+
         data = {
             "id": f"e_{page.slug}",
             "type": page.type,
@@ -153,13 +160,35 @@ def _strip_banner(body: str) -> str:
 
 def _split_related(body: str) -> tuple[str, list[str]]:
     text = _strip_banner(body)
-    if RELATED_OPEN not in text:
+    lines = text.splitlines()
+
+    # Find indices of marker lines (must be complete lines, not substring matches)
+    open_idx = None
+    close_idx = None
+    for i, line in enumerate(lines):
+        if line.strip() == RELATED_OPEN:
+            open_idx = i
+        elif line.strip() == RELATED_CLOSE:
+            close_idx = i
+
+    # No markers found
+    if open_idx is None:
         return text.strip(), []
-    description, _, remainder = text.partition(RELATED_OPEN)
-    block, _, _ = remainder.partition(RELATED_CLOSE)
+
+    # Markers found - extract description (before open marker)
+    description = "\n".join(lines[:open_idx]).strip()
+
+    # Extract related block (between markers)
+    if close_idx is None:
+        # Malformed - marker open but not closed
+        related_lines = lines[open_idx + 1 :]
+    else:
+        related_lines = lines[open_idx + 1 : close_idx]
+
     related = [
         line.removeprefix("- ").strip()
-        for line in block.strip().splitlines()
+        for line in related_lines
         if line.strip()
     ]
-    return description.strip(), related
+
+    return description, related

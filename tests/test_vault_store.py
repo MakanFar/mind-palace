@@ -101,3 +101,58 @@ def test_retitling_a_report_does_not_leave_a_second_file(store):
         )
     assert len(list(store.paths.communities.glob("*.md"))) == 1
     assert store.read_report("g_01ab").title == "Second Title"
+
+
+def test_entity_page_with_empty_related_round_trips(store):
+    """An entity page with no related links should round-trip correctly."""
+    page = EntityPage(
+        slug="no-links",
+        type="concept",
+        description="A standalone concept.",
+        generated_from=["n_01hq"],
+        input_hash="sha256:abc",
+        stale=False,
+        user={},
+        related=[],
+    )
+    store.write_entity_page(page)
+    read_back = store.read_entity_page("no-links")
+    assert read_back == page
+    assert read_back.related == []
+
+
+def test_entity_page_description_can_quote_marker_text(store):
+    """Marker text in the middle of a line should not be treated as a boundary.
+
+    Regression test: the old partition()-based implementation would incorrectly
+    split on the first occurrence of the marker text anywhere, even mid-line.
+    """
+    page = EntityPage(
+        slug="test-page",
+        type="concept",
+        description='The doc mentions "<!-- mindpalace:related -->" but this is just text.',
+        generated_from=["n_01hq"],
+        input_hash="sha256:abc",
+        stale=False,
+        user={},
+        related=["actual-related-link"],
+    )
+    store.write_entity_page(page)
+    read_back = store.read_entity_page("test-page")
+    assert read_back == page
+    assert read_back.description == page.description
+    assert read_back.related == page.related
+
+
+def test_write_entity_page_rejects_marker_as_standalone_line(store):
+    """A description containing a marker as a complete line should raise ValueError."""
+    page = EntityPage(
+        slug="bad-page",
+        type="concept",
+        description="Some text\n<!-- mindpalace:related -->\nMore text",
+        generated_from=["n_01hq"],
+        input_hash="sha256:abc",
+        stale=False,
+    )
+    with pytest.raises(ValueError, match="mindpalace:related"):
+        store.write_entity_page(page)
