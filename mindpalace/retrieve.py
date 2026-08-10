@@ -160,6 +160,104 @@ def local_search(
     }
 
 
+REPORT_KIND = ("report",)
+# RRF relevance sits in [0, 2/(RRF_K+1)] ~= [0, 0.033), and the smallest gap
+# between adjacent candidates in a 40-deep ranking is ~1/(RRF_K+40)^2 ~= 1e-4
+# (see _fts_candidates/CANDIDATES). Impact rank is a 0-10 score; for it to act
+# as a genuine *tiebreak* rather than a second vote that can outrank real
+# relevance differences, its full 10-point spread must stay well under that
+# smallest gap. 1e-6 keeps the spread at 1e-5, an order of magnitude under it.
+RANK_TIEBREAK_WEIGHT = 0.000001
+
+
+def global_search(
+    conn: sqlite3.Connection,
+    store,
+    embedder: Embedder,
+    query: str,
+    config: Config,
+) -> dict:
+    """Rank community reports for the assistant to answer from.
+
+    At personal-vault scale ten to twenty reports fit in one context window, so
+    the paper's distributed map-reduce is unnecessary; the assistant answers
+    directly. Communities lacking a usable report are still returned with their
+    members so no region of the graph silently vanishes.
+    """
+    communities = conn.execute(
+        "SELECT lineage_id, level, members FROM communities ORDER BY level, lineage_id"
+    ).fetchall()
+    entity_count = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+    threshold = config.thresholds.cluster_activation_entities
+
+    if not communities:
+        return {
+            "available": False,
+            "entity_count": entity_count,
+            "threshold": threshold,
+            "communities": [],
+            "instructions": "",
+            "note": (
+                f"No communities exist yet ({entity_count} entities; clustering "
+                f"activates at {threshold}). Use local_search for this query."
+            ),
+        }
+
+    reports = {report.lineage_id: report for report in store.iter_reports()}
+
+    query_vector = embedder.embed([query])[0]
+    relevance = dict(
+        vectors.search(conn, query_vector, embedder.model_id, REPORT_KIND, CANDIDATES)
+    )
+    lexical = _fts_candidates(conn, query, REPORT_KIND, CANDIDATES)
+    ordering = {
+        doc_id: score
+        for doc_id, score in rrf([list(relevance), list(lexical)])
+    }
+
+    entries = []
+    for row in communities:
+        lineage_id = row["lineage_id"]
+        report = reports.get(lineage_id)
+        if report is None:
+            state = "missing"
+        elif report.stale:
+            state = "stale"
+        else:
+            state = "present"
+        entries.append(
+            {
+                "lineage_id": lineage_id,
+                "level": row["level"],
+                "members": row["members"].split(",") if row["members"] else [],
+                "report": state,
+                "title": report.title if report else None,
+                "summary": report.summary if report else None,
+                "rank": report.rank if report else 0.0,
+                "findings": report.findings if report else [],
+                "relevance": ordering.get(lineage_id, 0.0),
+            }
+        )
+
+    entries.sort(
+        key=lambda entry: (
+            -(entry["relevance"] + RANK_TIEBREAK_WEIGHT * entry["rank"]),
+            entry["lineage_id"],
+        )
+    )
+
+    return {
+        "available": True,
+        "entity_count": entity_count,
+        "threshold": threshold,
+        "communities": entries,
+        "instructions": config.templates.get("report_next", ""),
+        # Present (as None) on the unavailable path too via the branch above,
+        # so callers can read result["note"] unconditionally.
+        "note": None,
+    }
+
+
 def _expand(conn: sqlite3.Connection, hits: Sequence[Hit]) -> list[dict]:
     slugs = [hit.id.removeprefix("e_") for hit in hits if hit.kind == "entity"]
     if not slugs:
