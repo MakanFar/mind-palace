@@ -1,8 +1,11 @@
 import asyncio
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from mindpalace import tools
 from mindpalace.embed import StubEmbedder
 from mindpalace.server import TOOL_NAMES, build_server, main
 from mindpalace.session import Session
@@ -76,3 +79,85 @@ def test_local_search_round_trips_through_the_real_server(session):
     payload = call(session, "local_search", {"query": "anything", "k": 3})
     assert payload["hits"] == []
     assert "note" in payload
+
+
+def test_concurrent_tool_calls_do_not_corrupt_the_session(session):
+    """Two `tools/call` requests pipelined by one client are not processed
+    inline (see `session.lock`'s docstring) -- `anyio.to_thread.run_sync`
+    can genuinely run two tool bodies on two different worker threads at the
+    same time, both sharing the one `sqlite3.Connection` on `session.conn`.
+
+    This does not try to catch the race in the act (that would be flaky by
+    construction); it drives real contention through real threads via the
+    real `MCPServer` object and then checks the vault landed in a fully
+    consistent state -- every concurrent write present exactly once, cache
+    and filesystem in agreement. Without `session.lock` serialising access in
+    `server.py`'s `_run`, `save_capture`'s unwrapped `write_capture` +
+    `resync()` sequence (see `tools.save_capture`) is exactly the kind of
+    multi-statement operation the review flagged as vulnerable to another
+    thread's implicit transaction committing it early or interleaving with
+    it -- so a lost or duplicated capture here is a real signal, not noise.
+    """
+    server = build_server(session)
+
+    def write(i: int):
+        return asyncio.run(
+            server.call_tool("save_capture", {"text": f"concurrent capture {i}"})
+        )
+
+    def read():
+        return asyncio.run(server.call_tool("graph_stats", {}))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(write, i) for i in range(12)]
+        futures += [pool.submit(read) for _ in range(12)]
+        results = [future.result(timeout=30) for future in futures]
+
+    assert all(result.is_error is not True for result in results), results
+
+    capture_files = list(session.paths.captures.glob("*.md"))
+    assert len(capture_files) == 12
+    doc_count = session.conn.execute(
+        "SELECT COUNT(*) FROM docs WHERE kind = 'capture'"
+    ).fetchone()[0]
+    assert doc_count == 12
+    assert session.oplog.pending() == []
+
+
+def test_the_session_lock_is_held_for_a_tool_calls_full_duration(session, monkeypatch):
+    """Assert the lock's actual behaviour -- held while a tool body runs,
+    released once it returns -- using `threading.Event`s to make the timing
+    deterministic instead of racing on `sleep`.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    original = tools.graph_stats
+
+    def slow_graph_stats(session_arg):
+        started.set()
+        assert release.wait(timeout=5), "test deadlocked waiting to be released"
+        return original(session_arg)
+
+    monkeypatch.setattr(tools, "graph_stats", slow_graph_stats)
+    server = build_server(session)
+
+    def call_in_background():
+        return asyncio.run(server.call_tool("graph_stats", {}))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(call_in_background)
+        assert started.wait(timeout=5), "tool body never started"
+
+        # The tool body is mid-flight in the pool's worker thread; the lock
+        # it took in `_run` must still be held, so a non-blocking acquire
+        # attempt from this thread must fail.
+        assert session.lock.acquire(blocking=False) is False
+
+        release.set()
+        result = future.result(timeout=5)
+
+    assert result.is_error is not True
+
+    # And now that the call has returned, the lock must be free again.
+    assert session.lock.acquire(blocking=False) is True
+    session.lock.release()

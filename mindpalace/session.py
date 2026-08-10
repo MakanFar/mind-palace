@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -33,6 +34,18 @@ class Session:
         self.store: VaultStore
         self.embedder: Embedder
         self.opened = False
+        # Guards the shared sqlite3.Connection against concurrent tool
+        # invocations. The vault's `flock` (see `_acquire_lock`) excludes a
+        # second *process*; it says nothing about threads inside this one,
+        # and the MCP runtime dispatches every synchronous tool call onto an
+        # anyio worker thread (see mindpalace/index/db.py's
+        # check_same_thread=False), so two `tools/call` requests pipelined by
+        # one client can legitimately run concurrently on two different
+        # threads. `server.py` is the sole place transport-originated calls
+        # enter the vault, and takes this lock around every tool dispatch.
+        # Created here rather than in `open()` so it exists even if `open()`
+        # never succeeds.
+        self.lock = threading.RLock()
 
     # ---- lifecycle ----------------------------------------------------
 

@@ -123,17 +123,26 @@ CREATE INDEX IF NOT EXISTS idx_assertions_note ON assertions(note_id);
 
 def connect(path: Path) -> sqlite3.Connection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    # check_same_thread=False: the MCP server dispatches every synchronous tool
-    # body through anyio.to_thread.run_sync, so a call executes on a worker
-    # thread distinct from whichever thread opened the Session (see
-    # mindpalace/server.py). A connection created with the sqlite3 default would
-    # raise "SQLite objects created in a thread can only be used in that same
-    # thread" on the very first real tool call. The vault's own concurrency
-    # story (Session.py's flock, one open session per process, stdio transport
-    # processing one request at a time) already guarantees this connection is
-    # never touched by two threads at once -- only ever a *different* thread
-    # each call, sequentially -- so disabling sqlite3's same-thread check
-    # (rather than adding a lock) is a correct fit, not just a workaround.
+    # check_same_thread=False: the MCP runtime dispatches every synchronous
+    # tool body through anyio.to_thread.run_sync (see
+    # mcp/server/mcpserver/utilities/func_metadata.py), and `tools/call` is
+    # not one of jsonrpc_dispatcher's inline_methods -- it is handled via
+    # `task_group.start_soon`, so two pipelined `tools/call` requests can be
+    # mid-flight on two different worker threads at once. A connection
+    # created with the sqlite3 default would raise "SQLite objects created in
+    # a thread can only be used in that same thread" on the very first real
+    # tool call, since the connection is always created on whichever thread
+    # opened the Session, never on a worker thread.
+    #
+    # This flag only stops that crash; it does not make concurrent use safe
+    # by itself -- sqlite3.threadsafety is 3 here, so two threads sharing
+    # this connection cannot corrupt its memory, but they *can* interleave
+    # statements within its one shared implicit transaction (an unwrapped
+    # multi-statement write racing a read, or one thread's transaction
+    # committing another thread's in-flight write early). Mutual exclusion
+    # across threads is `session.lock` (see Session.__init__), taken around
+    # every tool dispatch in `server.py` -- the vault's `flock` only excludes
+    # a second *process* and provides no help here.
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
