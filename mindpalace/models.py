@@ -64,6 +64,16 @@ class EntityPage:
     stale: bool = True
     user: dict = field(default_factory=dict)
     related: list[str] = field(default_factory=list)
+    # Anything a human wrote below the `mindpalace:related` block -- durable
+    # prose that `write_entity_page` must re-emit rather than discard.
+    trailing: str = ""
+    # The content hash of the file as it was on disk at read time, so a
+    # read-then-write round trip can CAS-check before overwriting (spec
+    # §9.2). Not part of equality: two pages with the same data are equal
+    # regardless of which read produced them, and most callers build a
+    # fresh EntityPage without ever reading one, which must not be treated
+    # as "matches an empty file."
+    source_hash: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -80,6 +90,8 @@ class CommunityReport:
     generated_from: list[str] = field(default_factory=list)
     input_hash: str = ""
     stale: bool = False
+    # See EntityPage.source_hash.
+    source_hash: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)

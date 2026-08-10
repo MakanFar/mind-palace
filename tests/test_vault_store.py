@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from mindpalace.atomic import ConflictError
+from mindpalace.frontmatter import FrontMatterError
 from mindpalace.models import Capture, CommunityReport, EntityPage, Note
 from mindpalace.vault.paths import VaultPaths
 from mindpalace.vault.store import VaultStore
@@ -156,3 +157,151 @@ def test_write_entity_page_rejects_marker_as_standalone_line(store):
     )
     with pytest.raises(ValueError, match="mindpalace:related"):
         store.write_entity_page(page)
+
+
+# ---- IMPORTANT 3: content below the related block must survive ------------
+
+
+def test_a_hand_written_section_below_the_related_block_round_trips(store):
+    """`_split_related` used to return only `lines[:open_idx]` as the
+    description and drop everything after the close marker -- so a section
+    a human appended below the machine-owned block vanished the next time
+    `write_entity_page` rebuilt the file (which every write tool's rebuild
+    call does)."""
+    page = EntityPage(
+        slug="scaling-laws",
+        type="concept",
+        description="Compute, data, and loss.",
+        related=["contradicts [[data-exhaustion]]"],
+    )
+    store.write_entity_page(page)
+    path = store.paths.entity_path("scaling-laws")
+    path.write_text(
+        path.read_text() + "\n## My own notes\n\nHand written, must survive.\n"
+    )
+
+    read_back = store.read_entity_page("scaling-laws")
+    assert "Hand written, must survive." in read_back.trailing
+
+
+def test_regenerating_an_entity_page_preserves_the_trailing_section(store):
+    """The regression itself: read a page with a hand-written trailing
+    section, change something machine-owned, write it back -- the trailing
+    section must still be there afterwards."""
+    store.write_entity_page(
+        EntityPage(slug="scaling-laws", type="concept", description="Original.")
+    )
+    path = store.paths.entity_path("scaling-laws")
+    path.write_text(
+        path.read_text() + "\n## My own notes\n\nHand written, must survive.\n"
+    )
+
+    page = store.read_entity_page("scaling-laws")
+    page.description = "Updated by rebuild."
+    store.write_entity_page(page)
+
+    survivor = store.read_entity_page("scaling-laws")
+    assert "Hand written, must survive." in survivor.trailing
+    assert survivor.description == "Updated by rebuild."
+
+
+# ---- CRITICAL 2: malformed Tier-2 files must degrade, not raise bare ------
+
+
+def test_read_entity_page_raises_frontmattererror_on_bad_yaml(store):
+    path = store.paths.entity_path("broken")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("---\nnot: [closed\n")
+    with pytest.raises(FrontMatterError):
+        store.read_entity_page("broken")
+
+
+def test_read_entity_page_raises_frontmattererror_on_valid_yaml_missing_type(store):
+    """Reproduces the finding's exact example: dropping a page containing
+    only `---\\ntitle: oops\\n---` used to die with a bare `KeyError:
+    'type'`, not an actionable, catchable error."""
+    path = store.paths.entity_path("hand-made")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("---\ntitle: oops\n---\n")
+    with pytest.raises(FrontMatterError, match="type"):
+        store.read_entity_page("hand-made")
+
+
+def test_iter_entity_pages_skips_a_malformed_page_instead_of_raising(store):
+    store.write_entity_page(
+        EntityPage(slug="good", type="concept", description="Fine.")
+    )
+    bad_path = store.paths.entity_path("bad")
+    bad_path.write_text("---\ntitle: oops\n---\n")
+
+    pages = list(store.iter_entity_pages())
+    assert [page.slug for page in pages] == ["good"]
+
+
+def test_read_report_raises_frontmattererror_on_missing_required_key(store):
+    path = store.paths.community_path("g_bad")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("---\ntitle: oops\n---\n")
+    with pytest.raises(FrontMatterError):
+        store.read_report("g_bad")
+
+
+def test_iter_reports_skips_a_malformed_report_instead_of_raising(store):
+    store.write_report(
+        CommunityReport(lineage_id="g_good", level=0, title="T", summary="S", rank=1.0)
+    )
+    bad_path = store.paths.community_path("g_bad")
+    bad_path.write_text("---\ntitle: oops\n---\n")
+
+    reports = list(store.iter_reports())
+    assert [report.lineage_id for report in reports] == ["g_good"]
+
+
+# ---- IMPORTANT 5: Tier-2 writes must CAS-check like Tier-1 writes do ------
+
+
+def test_write_entity_page_detects_a_concurrent_edit(store):
+    """write_entity_page used plain atomic_write after a read-modify-write:
+    a concurrent Obsidian save between the read and the write was silently
+    clobbered instead of surfaced as a conflict (spec §9.2)."""
+    store.write_entity_page(
+        EntityPage(slug="scaling-laws", type="concept", description="Original.")
+    )
+    read_for_edit = store.read_entity_page("scaling-laws")
+
+    concurrent = store.read_entity_page("scaling-laws")
+    concurrent.description = "Edited concurrently in Obsidian."
+    store.write_entity_page(concurrent)
+
+    read_for_edit.description = "My conflicting edit."
+    with pytest.raises(ConflictError):
+        store.write_entity_page(read_for_edit)
+
+
+def test_write_entity_page_without_a_prior_read_is_unconditional(store):
+    """A page built fresh (not obtained via `read_entity_page`) was never
+    part of a read-then-write sequence, so it must keep working
+    unconditionally -- this is how every test (and `rebuild`'s
+    create-a-missing-page path) seeds or replaces a page today."""
+    store.write_entity_page(
+        EntityPage(slug="scaling-laws", type="concept", description="First.")
+    )
+    store.write_entity_page(
+        EntityPage(slug="scaling-laws", type="concept", description="Second.")
+    )
+    assert store.read_entity_page("scaling-laws").description == "Second."
+
+
+def test_write_report_detects_a_concurrent_edit(store):
+    store.write_report(
+        CommunityReport(lineage_id="g_01", level=0, title="T", summary="S", rank=5.0)
+    )
+    read_for_edit = store.read_report("g_01")
+
+    concurrent = store.read_report("g_01")
+    concurrent.summary = "Edited concurrently."
+    store.write_report(concurrent)
+
+    read_for_edit.summary = "My conflicting edit."
+    with pytest.raises(ConflictError):
+        store.write_report(read_for_edit)
