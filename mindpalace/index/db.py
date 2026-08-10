@@ -123,7 +123,18 @@ CREATE INDEX IF NOT EXISTS idx_assertions_note ON assertions(note_id);
 
 def connect(path: Path) -> sqlite3.Connection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # check_same_thread=False: the MCP server dispatches every synchronous tool
+    # body through anyio.to_thread.run_sync, so a call executes on a worker
+    # thread distinct from whichever thread opened the Session (see
+    # mindpalace/server.py). A connection created with the sqlite3 default would
+    # raise "SQLite objects created in a thread can only be used in that same
+    # thread" on the very first real tool call. The vault's own concurrency
+    # story (Session.py's flock, one open session per process, stdio transport
+    # processing one request at a time) already guarantees this connection is
+    # never touched by two threads at once -- only ever a *different* thread
+    # each call, sequentially -- so disabling sqlite3's same-thread check
+    # (rather than adding a lock) is a correct fit, not just a workaround.
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
