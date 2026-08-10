@@ -2380,18 +2380,17 @@ def test_local_embedder_produces_real_vectors():
     assert float(vectors[0] @ vectors[1]) < 0.9
 ```
 
-`tests/conftest.py`:
+`tests/conftest.py` — create the file with only the network-marker guard. Tests
+construct `StubEmbedder()` directly where they need one, so no shared embedder
+fixture is defined; an unused fixture is dead code.
 
 ```python
-import pytest
+"""Shared pytest configuration.
 
-from mindpalace.embed import StubEmbedder
-
-
-@pytest.fixture
-def embedder():
-    """Every test uses the stub: no downloads, no network, fully deterministic."""
-    return StubEmbedder(dim=64)
+Every test uses StubEmbedder: no downloads, no network, fully deterministic.
+The one test that exercises the real model is marked `network` and deselected
+by default via `addopts` in pyproject.toml.
+"""
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -2717,7 +2716,6 @@ def test_editing_a_note_retracts_its_old_assertions(config):
     after = fold([version_two], {"x_2": "confirm"}, config)
     assert "x_1" not in after.assertions
     assert len(after.aggregates) == 1
-    assert after.entities["b"].rank == 0 if "b" in after.entities else True
     assert "b" not in after.entities
 
 
