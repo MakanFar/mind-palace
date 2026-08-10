@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 from mindpalace.citations import extract_ids, unresolvable
 from mindpalace.cluster import Community, match_lineages, partition, should_cluster
+from mindpalace.frontmatter import FrontMatterError
 from mindpalace.ids import UnknownIdError, id_kind, new_id, slugify
 from mindpalace.models import (
     Capture,
@@ -19,7 +20,7 @@ from mindpalace.models import (
     Note,
     RelationshipAssertion,
 )
-from mindpalace.graph.fold import fold
+from mindpalace.index.sync import fold_notes_with_quarantine
 from mindpalace.rebuild import (
     community_input_hash,
     entity_input_hash,
@@ -86,7 +87,12 @@ def _known_entities(session: Session, limit: int = 40) -> list[dict]:
     ).fetchall()
     entities = []
     for row in rows:
-        page = session.store.read_entity_page(row["slug"])
+        try:
+            page = session.store.read_entity_page(row["slug"])
+        except FrontMatterError:
+            # A malformed page must not break every other entity's listing
+            # here (spec §10); it is already surfaced via vault_issues.
+            page = None
         entities.append(
             {
                 "name": row["slug"],
@@ -259,11 +265,17 @@ def write_note(
 
 
 def _tables(session: Session):
-    """Fold the current source set. Several tools need it for evidence hashing."""
-    notes = list(session.store.iter_notes())
-    return notes, {note.id: note for note in notes}, fold(
-        notes, session.statuses(), session.config
+    """Fold the current source set. Several tools need it for evidence hashing.
+
+    Quarantine-aware: a note `fold` rejects (unknown edge type, duplicate
+    assertion id) must not take `cluster`, `write_entity_description`, or
+    `write_community_report` down with it (spec §10). See
+    `mindpalace.index.sync.fold_notes_with_quarantine`.
+    """
+    notes, notes_by_id, tables, _issues = fold_notes_with_quarantine(
+        session.store, session.config, session.statuses()
     )
+    return notes, notes_by_id, tables
 
 
 def read(session: Session, identifier: str) -> dict:
@@ -281,7 +293,13 @@ def read(session: Session, identifier: str) -> dict:
             if note.id == identifier:
                 return {"id": identifier, "kind": "note", "text": note.body}
     elif kind == "entity":
-        page = session.store.read_entity_page(identifier.removeprefix("e_"))
+        try:
+            page = session.store.read_entity_page(identifier.removeprefix("e_"))
+        except FrontMatterError as exc:
+            # A malformed page must surface as a ToolError the assistant can
+            # act on, not an uncaught traceback out of the tool boundary
+            # (spec §10); it is also already recorded as a vault_issue.
+            raise ToolError(f"{identifier}: entity page is malformed: {exc}") from exc
         if page is not None:
             return {
                 "id": identifier,
@@ -292,7 +310,12 @@ def read(session: Session, identifier: str) -> dict:
                 "user": page.user,
             }
     elif kind == "community":
-        report = session.store.read_report(identifier)
+        try:
+            report = session.store.read_report(identifier)
+        except FrontMatterError as exc:
+            raise ToolError(
+                f"{identifier}: community report is malformed: {exc}"
+            ) from exc
         if report is not None:
             return {
                 "id": identifier,
@@ -384,7 +407,13 @@ def get_entity(session: Session, name: str) -> dict:
     if slug is None:
         raise ToolError(f"no entity matching {name!r}")
 
-    page = session.store.read_entity_page(slug)
+    try:
+        page = session.store.read_entity_page(slug)
+    except FrontMatterError:
+        # A malformed page must not stop `get_entity` from returning what
+        # the graph still knows (type, rank, neighbours) -- it degrades to
+        # the same shape as "no page written yet" (spec §10).
+        page = None
     row = session.conn.execute(
         "SELECT type, rank FROM entities WHERE slug = ?", (slug,)
     ).fetchone()
@@ -542,7 +571,10 @@ def resolve_assertion(
 
 def _endpoint_snippet(session: Session, slug: str) -> str:
     """One line describing an entity, so a reviewer needs no extra `read` call."""
-    page = session.store.read_entity_page(slug)
+    try:
+        page = session.store.read_entity_page(slug)
+    except FrontMatterError:
+        page = None
     if page is not None and page.description.strip():
         return page.description.strip().splitlines()[0][:200]
     row = session.conn.execute(
@@ -671,14 +703,29 @@ def cluster_tool(session: Session, force: bool = False) -> dict:
 
     payload = []
     for community in matched:
-        report = session.store.read_report(community.lineage_id)
+        try:
+            report = session.store.read_report(community.lineage_id)
+        except FrontMatterError:
+            # A malformed report is treated the same as no report: it needs
+            # rewriting either way, and `write_community_report` always
+            # replaces the file wholesale, so this cannot destroy anything
+            # a fresh write wasn't already about to replace.
+            report = None
         expected = community_input_hash(sorted(community.members), tables, notes_by_id)
         payload.append(
             {
                 "lineage_id": community.lineage_id,
                 "level": community.level,
                 "members": sorted(community.members),
-                "needs_report": report is None or report.input_hash != expected,
+                # `report.stale` too, not just a hash mismatch: `rebuild`
+                # sets both `stale=True` AND `input_hash=expected` together
+                # when evidence moves (mark_stale_reports), so a hash-only
+                # comparison here reads `stale: True` but `needs_report:
+                # False` for a report that flipped stale and never
+                # recovers (Important 4).
+                "needs_report": (
+                    report is None or report.stale or report.input_hash != expected
+                ),
                 "aggregates": [
                     {
                         "pair": f"{a.source}|{a.type}|{a.target}",
@@ -786,7 +833,19 @@ def write_community_report(
 
 def write_entity_description(session: Session, slug: str, description: str) -> dict:
     slug = slugify(slug)
-    page = session.store.read_entity_page(slug)
+    try:
+        page = session.store.read_entity_page(slug)
+    except FrontMatterError as exc:
+        # Unlike a report, an entity page carries `user:` overrides that a
+        # blind overwrite could destroy -- there is nothing safe to
+        # read-modify-write here, so this must surface as an actionable
+        # error rather than silently replace the file (spec §10: Tier 2 is
+        # never deleted by rebuild, and a malformed page is not "deleted",
+        # so a human has to fix the front-matter by hand).
+        raise ToolError(
+            f"entity page for {slug!r} is malformed and cannot be updated: "
+            f"{exc}; fix its front-matter by hand (see review_queue)"
+        ) from exc
     if page is None:
         raise ToolError(f"no entity page for {slug!r}; run rebuild first")
 

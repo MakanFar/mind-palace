@@ -253,3 +253,86 @@ def test_graph_stats_answers_is_global_search_worth_trying(session):
     assert stats["clustering"]["active"] is False
     assert stats["clustering"]["remaining"] > 0
     assert search_global(session, "themes?")["available"] is False
+
+
+# ---- CRITICAL 1 / 2: one bad file must never render the vault unusable ---
+#
+# `test_a_malformed_file_does_not_disable_the_vault` above only covers the
+# one path that already worked: `sync`/`resync` quarantining an unparseable
+# *note*. `rebuild()` (called by every write tool) used to call `fold()`
+# bare -- defeating that quarantine one layer up -- and `VaultStore` used to
+# raise bare on a malformed *entity page* too. These pin both gaps at the
+# tool surface: the whole write path, not just `resync`, must keep working.
+
+
+def test_a_hand_written_note_that_fold_rejects_does_not_disable_the_vault(session):
+    """CRITICAL 1: a note with a typo'd edge type (or a duplicate assertion
+    id from a git merge, or an edge type MINDPALACE.md stopped declaring)
+    parses fine but makes `fold()` raise. `sync`/`resync` already
+    quarantined this correctly; `rebuild()` -- and therefore every write
+    tool -- used to call `fold()` a second time, bare, and take the whole
+    tool surface down with it."""
+    seed(session)
+    (session.paths.notes / "n_badedge-hand.md").write_text(
+        "---\n"
+        "id: n_badedge\n"
+        "derived_from: c_none\n"
+        "created: '2026-08-01T00:00:00Z'\n"
+        "author: llm\n"
+        "relationship_assertions:\n"
+        "  - id: x_bad\n"
+        "    source: scaling-laws\n"
+        "    target: data-exhaustion\n"
+        "    type: nonsense-type\n"
+        "    strength: 5\n"
+        "    description: bad edge type\n"
+        "---\n\n"
+        "Body text.\n"
+    )
+
+    # The write surface -- not just resync -- must still respond.
+    second = save_capture(session, "A completely unrelated capture about tomatoes.")
+    write_note(session, derived_from=second["id"], content="Unrelated analysis.")
+
+    assert any(
+        issue["kind"] == "unknown_edge_type"
+        for issue in review_queue(session)["vault_issues"]
+    )
+
+
+def test_a_hand_written_bad_entity_page_does_not_disable_the_vault(session):
+    """CRITICAL 2: dropping a malformed `entities/*.md` file into the vault
+    -- bad YAML, or valid YAML missing a required key like `type` -- used to
+    raise straight out of `VaultStore`, bare, into `sync`/`resync` and
+    therefore into `rebuild`. Every write tool then failed too."""
+    seed(session)
+    (session.paths.entities / "hand-made.md").write_text("---\ntitle: oops\n---\n")
+
+    session.resync()
+    assert any(
+        issue["kind"] == "malformed_entity_page"
+        for issue in review_queue(session)["vault_issues"]
+    )
+
+    # The write surface must still respond, not raise.
+    second = save_capture(session, "Another unrelated capture about bicycles.")
+    write_note(session, derived_from=second["id"], content="More analysis.")
+    assert search_local(session, "data exhaustion")["hits"]
+
+
+# ---- IMPORTANT 3: hand-written content below the related block survives --
+
+
+def test_rebuild_preserves_a_hand_written_section_below_the_related_block(session):
+    """The finding's exact reproduction: append a section below the
+    machine-owned block, call rebuild, and it used to be gone -- `rebuild`
+    runs on every write tool, so this was a live trap, not a corner case."""
+    seed(session)
+    page_path = next(session.paths.entities.glob("*.md"))
+    page_path.write_text(
+        page_path.read_text() + "\n## My own notes\n\nHand written, must survive.\n"
+    )
+
+    rebuild_tool(session, "all")
+
+    assert "Hand written, must survive." in page_path.read_text()

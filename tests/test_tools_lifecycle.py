@@ -414,3 +414,139 @@ def test_rebuild_tool_reports_what_it_did(with_assertion):
     result = rebuild_tool(session)
     assert result["scope"] == "all"
     assert result["notes_synced"] == 1
+
+
+# ---- CRITICAL 1 / 2: `_tables` must not raise on a bad Tier 1/2 file -------
+
+
+def test_cluster_and_write_entity_description_survive_a_hand_written_bad_note(
+    with_assertion,
+):
+    """`_tables` (used by `cluster_tool` and `write_entity_description`) used
+    to call `fold()` bare -- exactly the same defect as `rebuild()`, so a
+    note `fold()` rejects took these tools down too, not just `rebuild`."""
+    session, assertion_id = with_assertion
+    resolve_assertion(session, assertion_id, "confirm")
+    (session.paths.notes / "n_badedge-hand.md").write_text(
+        "---\n"
+        "id: n_badedge\n"
+        "derived_from: c_none\n"
+        "created: '2026-08-01T00:00:00Z'\n"
+        "author: llm\n"
+        "relationship_assertions:\n"
+        "  - id: x_bad\n"
+        "    source: scaling-laws\n"
+        "    target: data-exhaustion\n"
+        "    type: nonsense-type\n"
+        "    strength: 5\n"
+        "    description: bad edge type\n"
+        "---\n\n"
+        "Body text.\n"
+    )
+
+    result = cluster_tool(session, force=True)
+    assert result["clustered"] is True
+
+    write_entity_description(session, "scaling-laws", "Written despite the bad note.")
+    assert (
+        session.store.read_entity_page("scaling-laws").description
+        == "Written despite the bad note."
+    )
+
+
+def test_cluster_and_write_entity_description_survive_a_hand_written_bad_entity_page(
+    with_assertion,
+):
+    """The Tier-2 counterpart: `_resolve_slug`/`_tables`'s callers used to
+    raise on a malformed *entity page* too, not just a malformed note."""
+    session, assertion_id = with_assertion
+    resolve_assertion(session, assertion_id, "confirm")
+    (session.paths.entities / "hand-made.md").write_text("---\ntitle: oops\n---\n")
+
+    result = cluster_tool(session, force=True)
+    assert result["clustered"] is True
+
+    write_entity_description(session, "scaling-laws", "Still writable.")
+    assert (
+        session.store.read_entity_page("scaling-laws").description == "Still writable."
+    )
+
+
+# ---- IMPORTANT 4: needs_report must not compare against a hash that was ---
+# ---- just overwritten to match --------------------------------------------
+
+
+def test_cluster_needs_report_reflects_a_report_marked_stale_by_moved_evidence(
+    session,
+):
+    """`mark_stale_reports` sets `report.stale = True` *and*
+    `report.input_hash = expected` together. `cluster_tool`'s `needs_report`
+    used to compare only the hash -- against the hash `mark_stale_reports`
+    had just overwritten inside this very same call -- so a report that was
+    correctly flipped `stale: True` read `needs_report: False` and never got
+    re-offered for rewrite."""
+    capture = save_capture(session, "The plateau is about data exhaustion.")
+    note = write_note(
+        session,
+        derived_from=capture["id"],
+        content="Data supply binds scaling.",
+        relationship_assertions=[
+            {
+                "source": "scaling-laws",
+                "target": "data-exhaustion",
+                "type": "contradicts",
+                "description": "Supply, not architecture.",
+            }
+        ],
+    )
+    assertion_id = note["relationship_assertions"][0]["id"]
+    resolve_assertion(session, assertion_id, "confirm")
+    clustered = cluster_tool(session, force=True)
+    lineage_id = clustered["communities"][0]["lineage_id"]
+    write_community_report(
+        session,
+        lineage_id,
+        title="Scaling Debate",
+        summary="Initial report.",
+        rank=5.0,
+        findings=[],
+        cites=["e_scaling-laws"],
+    )
+    assert session.store.read_report(lineage_id).stale is False
+
+    # Move the evidence without changing membership: edit the assertion's
+    # rationale in place (same technique as test_rebuild.py's
+    # community_input_hash coverage).
+    note_path = next(session.paths.notes.glob("*.md"))
+    note_path.write_text(
+        note_path.read_text().replace(
+            "Supply, not architecture.", "A materially different rationale."
+        )
+    )
+    session.resync()
+
+    result = cluster_tool(session, force=True)
+
+    assert session.store.read_report(lineage_id).stale is True
+    community = next(
+        c for c in result["communities"] if c["lineage_id"] == lineage_id
+    )
+    assert community["needs_report"] is True
+
+
+# ---- IMPORTANT 6: rebuild_tool must not rewrite a stable entity page ------
+
+
+def test_rebuild_tool_does_not_rewrite_an_unchanged_entity_page(with_assertion):
+    session, assertion_id = with_assertion
+    resolve_assertion(session, assertion_id, "confirm")  # already ran rebuild()
+
+    page_path = next(session.paths.entities.glob("*.md"))
+    before_text = page_path.read_text()
+    before_mtime = page_path.stat().st_mtime_ns
+
+    report = rebuild_tool(session, "all")
+
+    assert report["pages_written"] == 0
+    assert page_path.read_text() == before_text
+    assert page_path.stat().st_mtime_ns == before_mtime
