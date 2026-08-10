@@ -387,12 +387,18 @@ def parse(text: str) -> tuple[dict, str]:
         raw = "".join(lines[1:cursor])
         body = "".join(lines[cursor + 1 :])
         try:
-            data = yaml.safe_load(raw) or {}
+            loaded = yaml.safe_load(raw)
         except yaml.YAMLError as exc:
             raise FrontMatterError(f"invalid YAML front-matter: {exc}") from exc
+        # Default only None to empty. `or {}` here would coerce every falsy
+        # non-mapping (False, 0, "", []) into {} *before* the type check, so a
+        # malformed document would be silently accepted as having no front-matter.
+        data = {} if loaded is None else loaded
         if not isinstance(data, dict):
             raise FrontMatterError("front-matter must be a mapping")
-        return data, body.lstrip("\n")
+        # Strip exactly the one separator newline `render` writes, not every
+        # leading newline — a body may legitimately begin with a blank line.
+        return data, body[1:] if body.startswith("\n") else body
 
     raise FrontMatterError("unterminated front-matter block")
 
