@@ -128,6 +128,60 @@ def session_paths_mindpalace_md(root):
     return VaultPaths(root).mindpalace_md
 
 
+# ---- CRITICAL regression: a scalar `user:` value must not block open -----
+
+
+def test_a_scalar_user_value_in_an_entity_page_does_not_block_open(tmp_path):
+    """A regression introduced by this very fix wave's interaction between
+    Important 8 and the unguarded `page.user.get(...)` call sites: adding
+    `entities/` to the drift set means `Session.open()` -> `heal()` ->
+    `resync()` now runs `sync()` over a hand-edited entity page during
+    *open*, not only on the next write tool call. `sync`'s
+    `_ambiguous_alias_issues` calls `page.user.get("aliases", [])`
+    unguarded, so a scalar `user:` value -- exactly what the generated
+    banner's own instruction ("put durable changes under `user:` in the
+    front-matter") invites a human to type -- raised `AttributeError:
+    'str' object has no attribute 'get'` straight out of `resync()`, and
+    `main()`'s `except (ConfigError, VaultLockedError, EmbedderError)`
+    doesn't cover it: the server would not start at all. Confirmed as a
+    genuine delta between commits by the scoped re-review (vault opened,
+    with writes broken, before this branch; refused to open at all after).
+
+    Assert both halves: the vault still opens, and the assistant is told
+    which file is wrong via review_queue -- not left to guess why startup
+    silently produced an empty-looking vault.
+    """
+    with open_session(tmp_path) as session:
+        entities_dir = session.paths.entities
+
+    entities_dir.mkdir(parents=True, exist_ok=True)
+    (entities_dir / "scalar-user.md").write_text(
+        "---\n"
+        "id: e_scalar-user\n"
+        "type: concept\n"
+        "generated_from: []\n"
+        "input_hash: ''\n"
+        "stale: false\n"
+        "user: reviewed by me on tuesday\n"
+        "---\n\n"
+        "Some description a human wrote by hand.\n\n"
+        "<!-- mindpalace:related -->\n"
+        "<!-- /mindpalace:related -->\n"
+    )
+
+    from mindpalace.tools import review_queue
+
+    with open_session(tmp_path) as session:
+        assert session.opened is True
+
+        issues = review_queue(session)["vault_issues"]
+        assert any(
+            issue["kind"] == "malformed_entity_page"
+            and "scalar-user.md" in issue["path"]
+            for issue in issues
+        )
+
+
 # ---- IMPORTANT 7: corrupt SQLite must be recovered, not raised ------------
 
 

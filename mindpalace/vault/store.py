@@ -126,6 +126,22 @@ class VaultStore:
             raise FrontMatterError(
                 f"{path.name}: missing required front-matter key 'type'"
             ) from exc
+        user = data.get("user", {})
+        if not isinstance(user, dict):
+            # `user:` is documented (in the generated banner itself!) as the
+            # place for durable hand-edits, so a plain scalar here --
+            # `user: reviewed by me on tuesday` -- is exactly the kind of
+            # thing a human following that instruction literally will type.
+            # Every consumer of `page.user` (`_ambiguous_alias_issues`,
+            # `_resolve_slug`, `_known_entities`, rebuild's `existing.user`)
+            # calls `.get(...)` on it unguarded, so a non-mapping value must
+            # be treated as malformed front-matter here -- not let a bare
+            # AttributeError propagate out of whichever caller happens to
+            # touch it first.
+            raise FrontMatterError(
+                f"{path.name}: 'user' must be a mapping, got "
+                f"{type(user).__name__}"
+            )
         description, related, trailing = _split_related(body)
         return EntityPage(
             slug=slug,
@@ -134,7 +150,7 @@ class VaultStore:
             generated_from=data.get("generated_from", []),
             input_hash=data.get("input_hash", ""),
             stale=data.get("stale", True),
-            user=data.get("user", {}),
+            user=user,
             related=related,
             trailing=trailing,
             source_hash=content_hash(raw),

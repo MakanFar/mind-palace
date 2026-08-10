@@ -227,6 +227,44 @@ def test_read_entity_page_raises_frontmattererror_on_valid_yaml_missing_type(sto
         store.read_entity_page("hand-made")
 
 
+def test_read_entity_page_raises_frontmattererror_on_a_scalar_user_value(store):
+    """CRITICAL regression from the fix wave itself: the generated banner's
+    own instruction -- "put durable changes under `user:` in the
+    front-matter" -- invites exactly this. `user: reviewed by me on
+    tuesday` is valid YAML (a scalar, not a mapping), so it round-tripped
+    past `parse()` and into `EntityPage.user` untouched; every consumer
+    (`_ambiguous_alias_issues`, `_resolve_slug`, `_known_entities`,
+    `rebuild`'s `existing.user`) calls `.get(...)` on it unguarded and
+    raised `AttributeError: 'str' object has no attribute 'get'`. Adding
+    `entities/` to the drift set (Important 8) means `Session.open()` ->
+    `heal()` -> `resync()` now hits this on open, not just on the next
+    write -- so this used to make the vault refuse to open at all."""
+    path = store.paths.entity_path("scalar-user")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\n"
+        "id: e_scalar-user\n"
+        "type: concept\n"
+        "user: reviewed by me on tuesday\n"
+        "---\n\nSome description.\n"
+    )
+    with pytest.raises(FrontMatterError, match="mapping"):
+        store.read_entity_page("scalar-user")
+
+
+def test_iter_entity_pages_skips_a_page_with_a_scalar_user_value(store):
+    store.write_entity_page(
+        EntityPage(slug="good", type="concept", description="Fine.")
+    )
+    bad_path = store.paths.entity_path("bad")
+    bad_path.write_text(
+        "---\nid: e_bad\ntype: concept\nuser: reviewed by me on tuesday\n---\n\nBad.\n"
+    )
+
+    pages = list(store.iter_entity_pages())
+    assert [page.slug for page in pages] == ["good"]
+
+
 def test_iter_entity_pages_skips_a_malformed_page_instead_of_raising(store):
     store.write_entity_page(
         EntityPage(slug="good", type="concept", description="Fine.")

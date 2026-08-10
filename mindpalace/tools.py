@@ -390,7 +390,13 @@ def _resolve_slug(session: Session, name: str) -> str | None:
         return row["slug"]
     matches: list[str] = []
     for page in session.store.iter_entity_pages():
-        aliases = {slugify(alias) for alias in page.user.get("aliases", [])}
+        # `iter_entity_pages` already skips a page whose `user:` isn't a
+        # mapping (`read_entity_page` raises `FrontMatterError` for that,
+        # caught there) -- this is defence in depth against the same
+        # unguarded `.get` that bricked `sync` (spec §10 regression), not a
+        # path that should be reachable in practice.
+        user = page.user if isinstance(page.user, dict) else {}
+        aliases = {slugify(alias) for alias in user.get("aliases", [])}
         if slug in aliases:
             matches.append(page.slug)
     if len(matches) > 1:
