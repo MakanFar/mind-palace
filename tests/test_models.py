@@ -63,6 +63,17 @@ def test_note_round_trips_with_no_assertions():
     assert note_from_markdown(note_to_markdown(bare)) == bare
 
 
+def test_note_round_trips_without_a_source_capture():
+    synthesis = Note(
+        id="n_03",
+        derived_from=None,
+        created="2026-08-08T17:00:00Z",
+        author="user",
+        body="A link I spotted myself.",
+    )
+    assert note_from_markdown(note_to_markdown(synthesis)) == synthesis
+
+
 def test_capture_round_trips_through_markdown():
     capture = Capture(
         id="c_01hq",

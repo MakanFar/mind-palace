@@ -1,0 +1,153 @@
+import pytest
+
+from mindpalace.embed import StubEmbedder
+from mindpalace.session import Session
+from mindpalace.tools import (
+    ToolError,
+    get_entity,
+    graph_stats,
+    neighbors,
+    read,
+    resolve_assertion,
+    save_capture,
+    search_global,
+    search_local,
+    write_note,
+)
+
+
+@pytest.fixture
+def session(tmp_path):
+    with Session(tmp_path, init=True, embedder=StubEmbedder()) as opened:
+        yield opened
+
+
+@pytest.fixture
+def populated(session):
+    capture = save_capture(session, "The plateau is about data exhaustion.")
+    note = write_note(
+        session,
+        derived_from=capture["id"],
+        content="Data supply binds scaling, not architecture.",
+        entities=[
+            {"name": "scaling-laws", "type": "concept", "description": "Compute vs loss."},
+            {"name": "data-exhaustion", "type": "concept", "description": "Running out."},
+        ],
+        relationship_assertions=[
+            {
+                "source": "scaling-laws",
+                "target": "data-exhaustion",
+                "type": "contradicts",
+                "strength": 8,
+                "description": "because.",
+            }
+        ],
+    )
+    return session, capture, note
+
+
+def test_read_dispatches_on_prefix(populated):
+    session, capture, note = populated
+    assert "data exhaustion" in read(session, capture["id"])["text"]
+    assert "Data supply" in read(session, note["id"])["text"]
+    assert read(session, "e_scaling-laws")["kind"] == "entity"
+
+
+def test_read_rejects_an_unknown_id(populated):
+    session, _, _ = populated
+    with pytest.raises(ToolError, match="not found"):
+        read(session, "n_missing")
+
+
+def test_neighbors_are_empty_until_confirmation(populated):
+    session, _, _ = populated
+    assert neighbors(session, "e_scaling-laws")["neighbours"] == []
+
+
+def test_neighbors_appear_once_confirmed(populated):
+    session, _, note = populated
+    resolve_assertion(session, note["relationship_assertions"][0]["id"], "confirm")
+    result = neighbors(session, "e_scaling-laws")
+    assert result["neighbours"][0]["slug"] == "data-exhaustion"
+    assert result["neighbours"][0]["type"] == "contradicts"
+
+
+def test_neighbors_filter_by_edge_type(populated):
+    session, _, note = populated
+    resolve_assertion(session, note["relationship_assertions"][0]["id"], "confirm")
+    assert neighbors(session, "e_scaling-laws", edge_types=["supports"])["neighbours"] == []
+
+
+def test_get_entity_resolves_through_aliases(populated):
+    session, _, _ = populated
+    page = session.store.read_entity_page("scaling-laws")
+    page.user = {"aliases": ["scaling law"]}
+    session.store.write_entity_page(page)
+    assert get_entity(session, "Scaling Law")["slug"] == "scaling-laws"
+
+
+def test_get_entity_rejects_an_unknown_name(populated):
+    session, _, _ = populated
+    with pytest.raises(ToolError, match="no entity"):
+        get_entity(session, "nonexistent")
+
+
+def test_graph_stats_reports_distance_to_the_threshold(populated):
+    session, _, _ = populated
+    stats = graph_stats(session)
+    assert stats["clustering"]["active"] is False
+    assert stats["clustering"]["threshold"] == 150
+    assert stats["clustering"]["remaining"] == 150 - stats["entities"]
+
+
+def test_graph_stats_names_the_active_embedder(populated):
+    session, _, _ = populated
+    stats = graph_stats(session)
+    assert stats["embedder"]["model_id"] == "stub-64"
+    assert stats["embedder"]["sends_data_off_machine"] is False
+
+
+def test_graph_stats_counts_orphans(populated):
+    session, _, _ = populated
+    assert graph_stats(session)["orphans"] == 2  # nothing confirmed yet
+
+
+def test_search_local_wraps_retrieval(populated):
+    # SQLite FTS5's bm25() uses the unsmoothed idf = ln((N - df + 0.5) /
+    # (df + 0.5)); with only the two `populated` documents and one matching,
+    # idf is exactly 0 and the match scores ~0 regardless of match quality --
+    # a degenerate corpus, not a degenerate query (see the identical note in
+    # tests/test_retrieve.py::test_local_search_returns_lexical_matches,
+    # which is where this fixture's brief-supplied original version was
+    # copied from without the distractors that make it exercise anything).
+    # A handful of unrelated captures keeps idf non-zero so this test
+    # actually exercises search_local's evidence gate instead of always
+    # tripping the abstain path.
+    session, _, _ = populated
+    for text in (
+        "sourdough starter hydration",
+        "cold front moving through tonight",
+        "tomatoes need staking this week",
+        "the train was delayed again",
+        "simmer the stock for two hours",
+        "remember to renew the passport",
+        "the new album drops on friday",
+        "the bike chain keeps slipping",
+        "book the ferry crossing early",
+    ):
+        save_capture(session, text)
+
+    result = search_local(session, "data exhaustion")
+    assert result["hits"]
+
+
+def test_search_global_wraps_retrieval(populated):
+    """The brief lists `search_global` among the interfaces this task
+    produces but did not include a test for it (unlike every other
+    function here). `mindpalace.retrieve.global_search` already has its
+    own dedicated test module; this only needs to confirm the tools.py
+    wrapper passes the session's pieces through correctly."""
+    session, _, _ = populated
+    result = search_global(session, "data exhaustion")
+    assert result["available"] is False
+    assert "No communities exist yet" in result["note"]

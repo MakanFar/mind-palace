@@ -43,7 +43,7 @@ class Capture:
 @dataclass(frozen=True)
 class Note:
     id: str
-    derived_from: str
+    derived_from: str | None
     created: str
     author: str
     body: str
@@ -111,12 +111,11 @@ def capture_from_markdown(text: str) -> Capture:
 
 
 def note_to_markdown(note: Note) -> str:
-    data: dict = {
-        "id": note.id,
-        "derived_from": note.derived_from,
-        "created": note.created,
-        "author": note.author,
-    }
+    data: dict = {"id": note.id}
+    if note.derived_from is not None:
+        data["derived_from"] = note.derived_from
+    data["created"] = note.created
+    data["author"] = note.author
     if note.entities:
         data["entities"] = [
             {"name": e.name, "type": e.type, "description": e.description}
@@ -146,7 +145,7 @@ def note_from_markdown(text: str) -> Note:
     data, body = parse(text)
     return Note(
         id=data["id"],
-        derived_from=data["derived_from"],
+        derived_from=data.get("derived_from"),
         created=data["created"],
         author=data["author"],
         body=body.rstrip("\n"),
