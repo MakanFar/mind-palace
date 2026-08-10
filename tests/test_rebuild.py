@@ -2,9 +2,17 @@ import pytest
 
 from mindpalace.config import Config, EdgeType, Thresholds
 from mindpalace.embed import StubEmbedder
+from mindpalace.graph.fold import fold
 from mindpalace.index import db
-from mindpalace.models import CommunityReport, EntityInstance, EntityPage, Note, RelationshipAssertion
-from mindpalace.rebuild import rebuild
+from mindpalace.models import (
+    ClaimAssertion,
+    CommunityReport,
+    EntityInstance,
+    EntityPage,
+    Note,
+    RelationshipAssertion,
+)
+from mindpalace.rebuild import community_input_hash, entity_input_hash, rebuild
 from mindpalace.vault.paths import VaultPaths
 from mindpalace.vault.store import VaultStore
 
@@ -50,6 +58,27 @@ def add_note(store, note_id="n_01", target="data-exhaustion"):
             RelationshipAssertion(
                 f"x_{note_id}", "scaling-laws", target, "contradicts", 8, "because."
             ),
+        ),
+    )
+    store.write_note(note, f"note-{note_id}")
+    return note
+
+
+def add_note_with_claim(store, note_id="n_01", target="data-exhaustion"):
+    note = Note(
+        id=note_id,
+        derived_from="c_01",
+        created="2026-08-01T00:00:00Z",
+        author="llm",
+        body="Analysis.",
+        entities=(EntityInstance("scaling-laws", "concept", "A concept."),),
+        relationship_assertions=(
+            RelationshipAssertion(
+                f"x_{note_id}", "scaling-laws", target, "contradicts", 8, "because."
+            ),
+        ),
+        claim_assertions=(
+            ClaimAssertion(f"k_{note_id}", "scaling-laws", "Scaling laws hold at large N."),
         ),
     )
     store.write_note(note, f"note-{note_id}")
@@ -211,3 +240,172 @@ def test_rebuild_marks_a_report_stale_when_membership_changes(conn, store, confi
     report = rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
     assert store.read_report("g_01").stale is True
     assert report.reports_marked_stale == 1
+
+
+# ---- entity_input_hash coverage pins ---------------------------------------
+#
+# These fields were already in entity_input_hash before this round of fixes;
+# they pin behaviour central enough to deserve its own regression test rather
+# than riding along inside a broader test.
+
+
+def test_editing_an_entity_instance_description_marks_the_page_stale(conn, store, config):
+    add_note(store)
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    page = store.read_entity_page("scaling-laws")
+    page.description = "Written from the original instance description."
+    page.stale = False
+    store.write_entity_page(page)
+
+    note_path = next(store.paths.notes.glob("*.md"))
+    note_path.write_text(
+        note_path.read_text().replace("A concept.", "A completely different concept.")
+    )
+
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    assert store.read_entity_page("scaling-laws").stale is True
+
+
+def test_editing_a_claim_text_marks_the_page_stale(conn, store, config):
+    add_note_with_claim(store)
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    page = store.read_entity_page("scaling-laws")
+    page.description = "Written from the original claim text."
+    page.stale = False
+    store.write_entity_page(page)
+
+    note_path = next(store.paths.notes.glob("*.md"))
+    note_path.write_text(
+        note_path.read_text().replace(
+            "Scaling laws hold at large N.", "Scaling laws break down past 10^26 FLOPs."
+        )
+    )
+
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    assert store.read_entity_page("scaling-laws").stale is True
+
+
+# ---- community_input_hash evidence-breadth fix -----------------------------
+#
+# community_input_hash must cover the same breadth of evidence as
+# entity_input_hash, scoped to a community's members: a report writer can
+# `read` a member's raw notes or `get_entity` a member's page before
+# composing the report, so entity-instance descriptions, assertion
+# rationale/strength regardless of confirmation status, and claim text
+# regardless of status are all reachable evidence. Each test below starts a
+# report at a correctly-computed, non-stale baseline, edits exactly one class
+# of evidence under an unchanged membership list, and checks the report
+# flips stale. Each fails against the pre-fix community_input_hash (verified
+# by hand -- see the task report).
+
+
+def test_community_report_flips_stale_when_a_members_instance_description_changes(
+    conn, store, config
+):
+    add_note(store)
+    conn.execute(
+        "INSERT INTO communities (lineage_id, level, parent, members) VALUES (?, 0, NULL, ?)",
+        ("g_01", "scaling-laws,data-exhaustion"),
+    )
+    conn.commit()
+    store.write_report(
+        CommunityReport(
+            lineage_id="g_01", level=0, title="Scaling Debate", summary="Summary.", rank=6.0
+        )
+    )
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    fresh = store.read_report("g_01")
+    fresh.stale = False
+    store.write_report(fresh)
+
+    note_path = next(store.paths.notes.glob("*.md"))
+    note_path.write_text(
+        note_path.read_text().replace("A concept.", "A completely different concept.")
+    )
+
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    assert store.read_report("g_01").stale is True
+
+
+def test_community_report_flips_stale_when_an_assertion_rationale_changes_under_a_member(
+    conn, store, config
+):
+    add_note(store)
+    conn.execute(
+        "INSERT INTO communities (lineage_id, level, parent, members) VALUES (?, 0, NULL, ?)",
+        ("g_01", "scaling-laws,data-exhaustion"),
+    )
+    conn.commit()
+    store.write_report(
+        CommunityReport(
+            lineage_id="g_01", level=0, title="Scaling Debate", summary="Summary.", rank=6.0
+        )
+    )
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    fresh = store.read_report("g_01")
+    fresh.stale = False
+    store.write_report(fresh)
+
+    # Strength (and therefore the aggregate's weight/mean_strength) is left
+    # untouched -- only the rationale text changes.
+    note_path = next(store.paths.notes.glob("*.md"))
+    note_path.write_text(note_path.read_text().replace("because.", "for a new reason."))
+
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    assert store.read_report("g_01").stale is True
+
+
+def test_community_report_flips_stale_when_an_unconfirmed_claims_text_changes(
+    conn, store, config
+):
+    add_note_with_claim(store)
+    conn.execute(
+        "INSERT INTO communities (lineage_id, level, parent, members) VALUES (?, 0, NULL, ?)",
+        ("g_01", "scaling-laws,data-exhaustion"),
+    )
+    conn.commit()
+    store.write_report(
+        CommunityReport(
+            lineage_id="g_01", level=0, title="Scaling Debate", summary="Summary.", rank=6.0
+        )
+    )
+    # k_n_01 is never confirmed -- statuses only confirms the relationship.
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    fresh = store.read_report("g_01")
+    fresh.stale = False
+    store.write_report(fresh)
+
+    note_path = next(store.paths.notes.glob("*.md"))
+    note_path.write_text(
+        note_path.read_text().replace(
+            "Scaling laws hold at large N.", "Scaling laws break down past 10^26 FLOPs."
+        )
+    )
+
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+    assert store.read_report("g_01").stale is True
+
+
+def test_community_input_hash_is_stable_across_runs(store, config):
+    add_note(store)
+    notes = list(store.iter_notes())
+    notes_by_id = {note.id: note for note in notes}
+    tables = fold(notes, {"x_n_01": "confirm"}, config)
+    members = ["scaling-laws", "data-exhaustion"]
+
+    first = community_input_hash(members, tables, notes_by_id)
+    second = community_input_hash(members, tables, notes_by_id)
+
+    assert first == second
+
+
+def test_entity_input_hash_is_stable_across_runs(store, config):
+    add_note(store)
+    notes = list(store.iter_notes())
+    notes_by_id = {note.id: note for note in notes}
+    tables = fold(notes, {"x_n_01": "confirm"}, config)
+
+    first = entity_input_hash(tables.entities["scaling-laws"], tables, notes_by_id)
+    second = entity_input_hash(tables.entities["scaling-laws"], tables, notes_by_id)
+
+    assert first == second

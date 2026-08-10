@@ -77,11 +77,25 @@ def entity_input_hash(
     return content_hash("\n".join(parts))
 
 
-def community_input_hash(members: Iterable[str], tables: GraphTables) -> str:
+def community_input_hash(
+    members: Iterable[str], tables: GraphTables, notes_by_id: dict[str, Note]
+) -> str:
     """Hash the community's evidence, not just its member slugs.
 
     Membership can hold steady while every description, weight, and claim under
     it changes -- a report hashed on slugs alone would never notice.
+
+    Mirrors `entity_input_hash`'s coverage, scoped to the community's members:
+    a report writer can read a member's raw notes (entity-instance
+    descriptions, assertion rationale, claim text) exactly as freely as it can
+    read the member's own entity page -- via `read` or `get_entity` on any
+    member before composing the report. So this covers, for every member:
+    note bodies and entity-instance descriptions; every assertion touching
+    that member regardless of confirmation status (status, strength,
+    description); and every claim whose subject is that member regardless of
+    status. The confirmed-only, both-endpoints-inside aggregate summary is
+    kept alongside as the community's internal-structure signal, not as a
+    substitute for the assertion-level evidence above.
     """
     membership = set(members)
     parts = []
@@ -90,6 +104,24 @@ def community_input_hash(members: Iterable[str], tables: GraphTables) -> str:
         entity = tables.entities.get(slug)
         parts.append(
             f"entity={slug}" if entity is None else f"entity={slug}:{entity.type}:{entity.rank}"
+        )
+        if entity is None:
+            continue
+        for note_id in sorted(entity.note_ids):
+            note = notes_by_id.get(note_id)
+            if note is None:
+                continue
+            parts.append(f"note={slug}:{note_id}:{content_hash(note.body)}")
+            for instance in note.entities:
+                if slugify(instance.name) == slug:
+                    parts.append(f"instance={slug}:{content_hash(instance.description)}")
+
+    for assertion in sorted(tables.assertions.values(), key=lambda item: item.id):
+        if membership.isdisjoint((assertion.source, assertion.target)):
+            continue
+        parts.append(
+            f"assertion={assertion.id}:{assertion.status}:{assertion.strength}:"
+            f"{content_hash(assertion.description)}"
         )
 
     for aggregate in sorted(tables.aggregates.values(), key=lambda item: item.key):
@@ -103,8 +135,8 @@ def community_input_hash(members: Iterable[str], tables: GraphTables) -> str:
             )
 
     for claim in sorted(tables.claims.values(), key=lambda item: item.id):
-        if claim.subject in membership and claim.status == "confirmed":
-            parts.append(f"claim={claim.id}:{content_hash(claim.text)}")
+        if claim.subject in membership:
+            parts.append(f"claim={claim.id}:{claim.status}:{content_hash(claim.text)}")
 
     return content_hash("\n".join(parts))
 
@@ -117,17 +149,23 @@ def mark_stale_reports(
     Shared by `rebuild` and `cluster_tool`: reclustering must not leave an
     obsolete report reading as `present` in global_search until some unrelated
     rebuild happens to run.
+
+    Its own signature stays `(conn, store, tables)` -- callers already built
+    against it must not need updating -- so the `notes_by_id` that
+    `community_input_hash` needs is built locally from `store`, which was
+    already a parameter here.
     """
     membership = {
         row["lineage_id"]: (row["members"].split(",") if row["members"] else [])
         for row in conn.execute("SELECT lineage_id, members FROM communities")
     }
+    notes_by_id = {note.id: note for note in store.iter_notes()}
     marked = 0
     for report in list(store.iter_reports()):
         members = membership.get(report.lineage_id)
         if members is None:
             continue
-        expected = community_input_hash(members, tables)
+        expected = community_input_hash(members, tables, notes_by_id)
         if report.input_hash != expected and not report.stale:
             report.stale = True
             report.input_hash = expected
