@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -54,8 +55,7 @@ class Session:
         self._acquire_lock()
         try:
             self.store = VaultStore(self.paths)
-            self.conn = db.connect(self.paths.graph_db)
-            db.create_schema(self.conn)
+            self._open_cache()
             self.oplog = OpLog(self.paths.op_log)
             self.decisions = DecisionLog(self.paths.decisions_log)
             self.embedder = self._explicit_embedder or get_embedder(self.config.embedder)
@@ -86,6 +86,30 @@ class Session:
 
     def __exit__(self, *_exc) -> None:
         self.close()
+
+    def _open_cache(self) -> None:
+        """Connect to `.graph/mindpalace.db`, recovering from corruption.
+
+        Tier 3 is delete-and-rebuild by construction (spec §10: "Corrupt
+        SQLite -- detected on open, rebuilt from Tier 1. Nothing is lost.").
+        `sqlite3` does not reject a corrupt file at `connect()` time -- the
+        error only surfaces on the first statement, which `create_schema`
+        issues -- so both are covered by the same `try`. Recovery just
+        deletes the file and starts over: `_verify_cache_model` (called
+        right after this, in `open()`) finds no `cache_meta` row in the
+        fresh database and calls `resync()`, which rebuilds everything from
+        Tier 1 with no further help needed here.
+        """
+        try:
+            self.conn = db.connect(self.paths.graph_db)
+            db.create_schema(self.conn)
+        except sqlite3.DatabaseError:
+            conn = getattr(self, "conn", None)
+            if conn is not None:
+                conn.close()
+            self.paths.graph_db.unlink(missing_ok=True)
+            self.conn = db.connect(self.paths.graph_db)
+            db.create_schema(self.conn)
 
     def _acquire_lock(self) -> None:
         """Exclusive advisory lock held for the session's lifetime.

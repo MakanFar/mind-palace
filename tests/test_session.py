@@ -126,3 +126,44 @@ def session_paths_mindpalace_md(root):
     from mindpalace.vault.paths import VaultPaths
 
     return VaultPaths(root).mindpalace_md
+
+
+# ---- IMPORTANT 7: corrupt SQLite must be recovered, not raised ------------
+
+
+def test_corrupt_sqlite_is_recovered_and_rebuilt_from_tier_1(tmp_path):
+    """Spec §10: 'Corrupt SQLite -- detected on open, rebuilt from Tier 1.
+    Nothing is lost.' A corrupted `.graph/mindpalace.db` used to raise
+    `sqlite3.DatabaseError` straight out of `Session.open()`; `main`'s
+    `except (ConfigError, VaultLockedError, EmbedderError)` does not cover
+    it, so the user got a traceback and had to know to delete `.graph/` by
+    hand. Tier 3 is delete-and-rebuild by construction, so recovery must be
+    silent and complete: the note written before the corruption must still
+    be there afterwards."""
+    from mindpalace.tools import save_capture, write_note
+
+    with open_session(tmp_path) as session:
+        capture = save_capture(session, "Something worth remembering.")
+        write_note(session, derived_from=capture["id"], content="Analysis text.")
+        graph_db_path = session.paths.graph_db
+
+    graph_db_path.write_bytes(b"not a sqlite database at all")
+
+    with open_session(tmp_path) as session:
+        assert session.opened is True
+        note_count = session.conn.execute(
+            "SELECT COUNT(*) FROM docs WHERE kind = 'note'"
+        ).fetchone()[0]
+        assert note_count == 1
+
+
+def test_corrupt_sqlite_does_not_leak_the_lock(tmp_path):
+    """Recovery must not bypass the same lock-safety guarantee every other
+    open-time failure has (see test_a_failed_open_does_not_leak_the_lock)."""
+    with open_session(tmp_path) as session:
+        graph_db_path = session.paths.graph_db
+
+    graph_db_path.write_bytes(b"not a sqlite database at all")
+
+    with open_session(tmp_path) as session:
+        assert session.opened is True
