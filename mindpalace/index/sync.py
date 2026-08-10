@@ -45,45 +45,44 @@ def _iter_source_files(store: VaultStore) -> Iterator[Path]:
     determine assertion status, config determines how the fold groups edges — so
     omitting them means an external edit to either leaves the cache silently
     stale with nothing able to notice.
+
+    Also includes `entities/` and `communities/`: they are Tier 2 (generated
+    prose, not source truth), but their description/summary text is indexed
+    into `docs`/`vectors` same as a note body, so an Obsidian edit to either
+    -- or a hand-added `user.aliases` -- is a change this cache depends on
+    exactly as much as a note edit is. Omitting them left such an edit
+    invisible to `has_drift`, so `heal()` could never notice it (spec §10).
     """
     yield from sorted(store.paths.captures.glob("*.md"))
     yield from sorted(store.paths.notes.glob("*.md"))
+    yield from sorted(store.paths.entities.glob("*.md"))
+    yield from sorted(store.paths.communities.glob("*.md"))
     for dependency in (store.paths.decisions_log, store.paths.mindpalace_md):
         if dependency.exists():
             yield dependency
 
 
-def _load_sources(
+def _load_notes(
     store: VaultStore,
 ) -> tuple[
-    list[Capture],
     list[Note],
     list[tuple[str, str, str]],
     list[tuple[str, str]],
     dict[str, tuple[str, str]],
 ]:
-    """Parse every source file, degrading rather than dropping on failure.
+    """Parse every note file, degrading rather than raising on failure.
 
-    Returns captures, successfully-parsed notes, issues recorded so far,
-    (path, raw_text) pairs for files that failed to parse at all, and a
-    note_id -> (path, raw_text) map for every note that DID parse -- kept
-    around so that a note `fold` later rejects (see `_fold_with_quarantine`)
-    can still be indexed as a degraded document by its path, without
-    re-reading the file from disk.
+    Returns successfully-parsed notes, issues recorded so far, (path,
+    raw_text) pairs for files that failed to parse at all, and a note_id ->
+    (path, raw_text) map for every note that DID parse -- kept around so
+    that a note `fold` later rejects (see `_fold_with_quarantine`) can still
+    be indexed as a degraded document by its path, without re-reading the
+    file from disk.
     """
-    captures: list[Capture] = []
     notes: list[Note] = []
     issues: list[tuple[str, str, str]] = []
     degraded: list[tuple[str, str]] = []
     note_sources: dict[str, tuple[str, str]] = {}
-
-    for path in sorted(store.paths.captures.glob("*.md")):
-        raw = path.read_text(encoding="utf-8")
-        try:
-            captures.append(capture_from_markdown(raw))
-        except Exception as exc:
-            issues.append((_relative(store, path), "malformed_capture", str(exc)))
-            degraded.append((_relative(store, path), raw))
 
     for path in sorted(store.paths.notes.glob("*.md")):
         raw = path.read_text(encoding="utf-8")
@@ -96,7 +95,82 @@ def _load_sources(
         notes.append(note)
         note_sources[note.id] = (_relative(store, path), raw)
 
+    return notes, issues, degraded, note_sources
+
+
+def _load_sources(
+    store: VaultStore,
+) -> tuple[
+    list[Capture],
+    list[Note],
+    list[tuple[str, str, str]],
+    list[tuple[str, str]],
+    dict[str, tuple[str, str]],
+]:
+    """Parse every Tier 1 source file, degrading rather than dropping on
+    failure. See `_load_notes` for the notes half of this."""
+    captures: list[Capture] = []
+    issues: list[tuple[str, str, str]] = []
+    degraded: list[tuple[str, str]] = []
+
+    for path in sorted(store.paths.captures.glob("*.md")):
+        raw = path.read_text(encoding="utf-8")
+        try:
+            captures.append(capture_from_markdown(raw))
+        except Exception as exc:
+            issues.append((_relative(store, path), "malformed_capture", str(exc)))
+            degraded.append((_relative(store, path), raw))
+
+    notes, note_issues, note_degraded, note_sources = _load_notes(store)
+    issues.extend(note_issues)
+    degraded.extend(note_degraded)
+
     return captures, notes, issues, degraded, note_sources
+
+
+def _load_entity_pages(
+    store: VaultStore,
+) -> tuple[list, list[tuple[str, str, str]], list[tuple[str, str]]]:
+    """Parse every entity page, degrading rather than raising on failure --
+    the Tier 2 counterpart of `_load_notes` (spec §10: one bad file must
+    never render the vault unusable, and that applies to hand-edited Tier 2
+    exactly as it does to Tier 1). `VaultStore.iter_entity_pages` already
+    skips a page it cannot parse; this wraps the same read but also records
+    *which* file was skipped, as a `vault_issue`, and keeps its raw text
+    around so it can still be indexed as an `unparsed` document.
+    """
+    pages = []
+    issues: list[tuple[str, str, str]] = []
+    degraded: list[tuple[str, str]] = []
+    for path in sorted(store.paths.entities.glob("*.md")):
+        try:
+            page = store.read_entity_page(path.stem)
+        except Exception as exc:
+            issues.append((_relative(store, path), "malformed_entity_page", str(exc)))
+            degraded.append((_relative(store, path), path.read_text(encoding="utf-8")))
+            continue
+        if page is not None:
+            pages.append(page)
+    return pages, issues, degraded
+
+
+def _load_reports(
+    store: VaultStore,
+) -> tuple[list, list[tuple[str, str, str]], list[tuple[str, str]]]:
+    """The community-report counterpart of `_load_entity_pages`."""
+    reports = []
+    issues: list[tuple[str, str, str]] = []
+    degraded: list[tuple[str, str]] = []
+    for path in sorted(store.paths.communities.glob("*.md")):
+        try:
+            report = store.read_report(path.stem)
+        except Exception as exc:
+            issues.append((_relative(store, path), "malformed_report", str(exc)))
+            degraded.append((_relative(store, path), path.read_text(encoding="utf-8")))
+            continue
+        if report is not None:
+            reports.append(report)
+    return reports, issues, degraded
 
 
 def _fold_with_quarantine(
@@ -184,6 +258,37 @@ def _fold_with_quarantine(
         "something the loop cannot shrink on. This is an internal bug, not "
         "a vault problem."
     )
+
+
+def fold_notes_with_quarantine(
+    store: VaultStore, config: Config, statuses: dict[str, str]
+) -> tuple[list[Note], dict[str, Note], GraphTables, list[tuple[str, str, str]]]:
+    """Parse and fold every note currently on disk, quarantining anything
+    `fold` rejects instead of raising.
+
+    This is the ONE shared entry point every caller that needs the folded
+    graph must use -- not `fold` directly. `rebuild()` and `tools._tables()`
+    both used to call `fold(notes, statuses, config)` bare, which defeats
+    `sync`'s quarantine: a note with a typo'd edge type (or a duplicate
+    assertion id from a git merge, or an edge type MINDPALACE.md stopped
+    declaring) makes `fold` raise a typed `FoldError`, and a bare call lets
+    that propagate straight out of `write_note`, `propose_relationship`,
+    `resolve_assertion`, `rebuild`, `cluster`, `write_entity_description`,
+    and `write_community_report` -- the entire write surface goes dead over
+    one bad note, which is exactly what spec §10 says must never happen.
+
+    Returns the notes that survived quarantine, a note_id -> Note map of the
+    same, the folded tables, and every issue recorded along the way
+    (including a raw parse failure -- reused from `_load_notes` -- so a note
+    that isn't even valid YAML is quarantined the same way as one `fold`
+    itself rejects).
+    """
+    notes, issues, _degraded, note_sources = _load_notes(store)
+    note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
+    tables, excluded = _fold_with_quarantine(notes, statuses, config, issues, note_paths)
+    folded_notes = [note for note in notes if note.id not in excluded]
+    notes_by_id = {note.id: note for note in folded_notes}
+    return folded_notes, notes_by_id, tables, issues
 
 
 def _first_line(text: str) -> str:
@@ -288,11 +393,22 @@ def sync(
         claim_text = " ".join(c.text for c in note.claim_assertions)
         searchable = "\n".join(filter(None, [note.body, assertion_text, claim_text]))
         documents.append((note.id, "note", _first_line(note.body), searchable))
-    entity_pages = list(store.iter_entity_pages())
+    # Tier 2 gets the same degrade-and-record treatment as Tier 1 notes: a
+    # page that fails to parse is skipped, recorded as a vault_issue, and
+    # kept searchable via `degraded` rather than taking `sync` down (spec
+    # §10 applies to a hand-edited entity page exactly as it does to a
+    # hand-edited note).
+    entity_pages, entity_issues, entity_degraded = _load_entity_pages(store)
+    issues.extend(entity_issues)
+    degraded.extend(entity_degraded)
     for page in entity_pages:
         documents.append((f"e_{page.slug}", "entity", page.slug, page.description))
     issues.extend(_ambiguous_alias_issues(store, entity_pages))
-    for report in store.iter_reports():
+
+    reports, report_issues, report_degraded = _load_reports(store)
+    issues.extend(report_issues)
+    degraded.extend(report_degraded)
+    for report in reports:
         documents.append(
             (report.lineage_id, "report", report.title, f"{report.summary}\n{report.findings}")
         )

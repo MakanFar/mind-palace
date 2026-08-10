@@ -8,6 +8,7 @@ from mindpalace.index import sync as sync_module
 from mindpalace.index.sync import has_drift, sync
 from mindpalace.models import (
     Capture,
+    CommunityReport,
     EntityInstance,
     EntityPage,
     Note,
@@ -446,3 +447,96 @@ def test_fold_quarantine_loop_raises_internal_error_if_it_cannot_shrink(
         sync_module._fold_with_quarantine(
             [note], {}, config, [], {"n_01": "notes/n_01-scaling-laws.md"}
         )
+
+
+# --- CRITICAL 2: malformed Tier 2 files must degrade like Tier 1 does ------
+#
+# `iter_entity_pages`/`iter_reports` used to raise (FrontMatterError for bad
+# YAML, a bare KeyError for valid YAML missing a required key) straight out
+# of `sync`, exactly the failure mode Task 9's quarantine was built to
+# prevent for notes. These pin the Tier-2 counterpart of the tests above.
+
+
+def test_a_malformed_entity_page_becomes_an_issue_and_stays_searchable(
+    conn, vault, config
+):
+    """Spec §10 applies to a hand-edited entity page exactly as it does to
+    a hand-edited note."""
+    paths, store = vault
+    (paths.entities / "hand-made.md").write_text(
+        "---\nnot: [closed\n\nlithium niobate photonics\n"
+    )
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    assert any(issue[1] == "malformed_entity_page" for issue in report.issues)
+    hits = [
+        row[0]
+        for row in conn.execute("SELECT doc_id FROM docs WHERE docs MATCH ?", ("niobate",))
+    ]
+    assert hits == ["entities/hand-made.md"]
+
+
+def test_an_entity_page_missing_a_required_key_becomes_an_issue(conn, vault, config):
+    """The exact reproduction from the finding: valid YAML, but missing
+    'type', used to die with a bare `KeyError: 'type'` rather than being
+    recorded and skipped."""
+    paths, store = vault
+    (paths.entities / "hand-made.md").write_text("---\ntitle: oops\n---\n")
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    assert any(issue[1] == "malformed_entity_page" for issue in report.issues)
+
+
+def test_a_malformed_community_report_becomes_an_issue_and_stays_searchable(
+    conn, vault, config
+):
+    paths, store = vault
+    (paths.communities / "g_bad.md").write_text(
+        "---\nnot: [closed\n\nlithium niobate photonics\n"
+    )
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    assert any(issue[1] == "malformed_report" for issue in report.issues)
+    hits = [
+        row[0]
+        for row in conn.execute("SELECT doc_id FROM docs WHERE docs MATCH ?", ("niobate",))
+    ]
+    assert hits == ["communities/g_bad.md"]
+
+
+# --- IMPORTANT 8: has_drift must cover Tier-2 files feeding the cache -----
+
+
+def test_has_drift_detects_an_edit_to_an_entity_page(conn, vault, config):
+    """`entities/` fed `docs`/`vectors` but was never in
+    `_iter_source_files`, so an Obsidian edit to an entity description --
+    or a hand-added `user.aliases` -- was invisible to `has_drift`, and
+    `heal()` could never notice it."""
+    _, store = vault
+    add_note(store, "n_01", "scaling-laws")
+    store.write_entity_page(
+        EntityPage(slug="scaling-laws", type="concept", description="Original.")
+    )
+    sync(conn, store, config, StubEmbedder(), {})
+    assert has_drift(conn, store) is False
+
+    page_path = next(store.paths.entities.glob("*.md"))
+    page_path.write_text(page_path.read_text() + "\nEdited in Obsidian.\n")
+    assert has_drift(conn, store) is True
+
+
+def test_has_drift_detects_an_edit_to_a_community_report(conn, vault, config):
+    _, store = vault
+    add_note(store, "n_01", "scaling-laws")
+    store.write_report(
+        CommunityReport(lineage_id="g_01", level=0, title="T", summary="S", rank=5.0)
+    )
+    sync(conn, store, config, StubEmbedder(), {})
+    assert has_drift(conn, store) is False
+
+    report_path = next(store.paths.communities.glob("*.md"))
+    report_path.write_text(report_path.read_text() + "\nEdited in Obsidian.\n")
+    assert has_drift(conn, store) is True
