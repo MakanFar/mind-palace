@@ -91,6 +91,12 @@ def load_config(path: Path) -> Config:
             f"(supported: {sorted(SUPPORTED_SCHEMA_VERSIONS)})"
         )
 
+    # Validate entity_types is a list, not a scalar
+    if not isinstance(data["entity_types"], list):
+        raise ConfigError(
+            f"{path.name}: entity_types must be a list, got {type(data['entity_types']).__name__!r}"
+        )
+
     edge_types = {}
     for name, spec in data["edge_types"].items():
         for field in ("directed", "cluster_weight"):
@@ -98,10 +104,32 @@ def load_config(path: Path) -> Config:
                 raise ConfigError(
                     f"{path.name}: edge type {name!r} is missing {field!r}"
                 )
+
+        # Check for unknown keys in edge type spec
+        unknown_edge_fields = spec.keys() - {"directed", "cluster_weight"}
+        if unknown_edge_fields:
+            raise ConfigError(
+                f"{path.name}: edge type {name!r} has unknown key(s) {sorted(unknown_edge_fields)}"
+            )
+
+        # Validate directed is a bool, not a coercible value
+        if not isinstance(spec["directed"], bool):
+            raise ConfigError(
+                f"{path.name}: edge type {name!r} field 'directed' must be a boolean, got {type(spec['directed']).__name__!r}"
+            )
+
+        # Wrap cluster_weight coercion
+        try:
+            cluster_weight = float(spec["cluster_weight"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"{path.name}: edge type {name!r} field 'cluster_weight' must be a float: {exc}"
+            ) from exc
+
         edge_types[name] = EdgeType(
             name=name,
-            directed=bool(spec["directed"]),
-            cluster_weight=float(spec["cluster_weight"]),
+            directed=spec["directed"],
+            cluster_weight=cluster_weight,
         )
 
     raw_thresholds = data["thresholds"]
@@ -109,6 +137,13 @@ def load_config(path: Path) -> Config:
     if missing_thresholds:
         raise ConfigError(
             f"{path.name}: thresholds missing {sorted(missing_thresholds)}"
+        )
+
+    # Check for unknown keys in thresholds
+    unknown_threshold_fields = raw_thresholds.keys() - REQUIRED_THRESHOLDS
+    if unknown_threshold_fields:
+        raise ConfigError(
+            f"{path.name}: thresholds has unknown key(s) {sorted(unknown_threshold_fields)}"
         )
 
     return Config(
@@ -139,17 +174,26 @@ def scaffold(paths: VaultPaths) -> None:
 
 def open_vault(root: Path, *, init: bool = False) -> tuple[VaultPaths, Config]:
     root = Path(root).expanduser().resolve()
-    if root == Path.home() or root == Path(root.anchor):
+    # Resolve both sides to catch symlinked paths (common on macOS)
+    if root == Path.home().resolve() or root == Path(root.anchor).resolve():
         raise ConfigError(f"refusing to use {root} as a vault root")
 
     paths = VaultPaths(root)
     if paths.mindpalace_md.exists():
         return paths, load_config(paths.mindpalace_md)
 
-    if not init:
-        raise ConfigError(f"{root} has no MINDPALACE.md; re-run with --init")
+    # Check non-emptiness first to tailor the error message
+    is_empty = not root.exists() or not any(root.iterdir())
 
-    if root.exists() and any(root.iterdir()):
+    if not init:
+        if is_empty:
+            raise ConfigError(f"{root} has no MINDPALACE.md; re-run with --init")
+        else:
+            raise ConfigError(
+                f"{root} is not a Mind Palace vault and is not empty; re-run with --init"
+            )
+
+    if not is_empty:
         raise ConfigError(
             f"{root} is not a Mind Palace vault and is not empty; refusing to --init"
         )

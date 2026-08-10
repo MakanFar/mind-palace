@@ -126,3 +126,116 @@ def test_open_vault_refuses_home_and_root(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     with pytest.raises(ConfigError, match="refusing"):
         open_vault(tmp_path, init=True)
+
+
+# Regression tests for fixes (CRITICAL and IMPORTANT 1-4 plus Minor)
+
+def test_open_vault_home_guard_with_symlinked_path(tmp_path, monkeypatch):
+    """
+    CRITICAL: $HOME guard must work even when path contains symlinks.
+    On macOS, /var -> /private/var, so Path.home() might have symlinks.
+    Both sides must be resolved before comparison.
+    """
+    import tempfile
+    import os
+
+    # Create a real directory and a symlink to it
+    real_home = tmp_path / "real_home"
+    real_home.mkdir()
+    symlink_home = tmp_path / "symlink_home"
+    try:
+        symlink_home.symlink_to(real_home)
+    except (OSError, NotImplementedError):
+        # Skip on systems that don't support symlinks
+        pytest.skip("symlinks not supported")
+
+    # Set HOME to the symlinked path
+    monkeypatch.setenv("HOME", str(symlink_home))
+
+    # Verify that attempting to open the symlinked home directory still refuses
+    with pytest.raises(ConfigError) as excinfo:
+        open_vault(symlink_home, init=True)
+    assert "refusing" in str(excinfo.value)
+
+    # Verify no files were created
+    assert not (real_home / "MINDPALACE.md").exists()
+    assert not (real_home / "index.md").exists()
+
+
+def test_edge_type_unknown_key_rejected(tmp_path):
+    """IMPORTANT 1: unknown keys in edge_types specs are rejected, not silently dropped."""
+    broken = MINIMAL.replace(
+        "relates-to: {directed: false, cluster_weight: 1.0}",
+        "relates-to: {directed: false, cluster_weight: 1.0, deprecated: true}",
+    )
+    path = write_config(tmp_path, broken)
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert "deprecated" in str(excinfo.value)
+    assert "MINDPALACE.md" in str(excinfo.value)
+
+
+def test_thresholds_unknown_key_rejected(tmp_path):
+    """IMPORTANT 1: unknown keys in thresholds are rejected, not silently dropped."""
+    broken = MINIMAL.replace(
+        "community_lineage_jaccard: 0.5",
+        "community_lineage_jaccard: 0.5\n  experimental_threshold: 0.8",
+    )
+    path = write_config(tmp_path, broken)
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert "experimental_threshold" in str(excinfo.value)
+    assert "MINDPALACE.md" in str(excinfo.value)
+
+
+def test_edge_type_directed_must_be_bool_not_string(tmp_path):
+    """IMPORTANT 2: directed must be a bool, not a coercible value like a string."""
+    # YAML parses directed: "false" as a string "false", not boolean False
+    broken = MINIMAL.replace(
+        'relates-to: {directed: false, cluster_weight: 1.0}',
+        'relates-to: {directed: "false", cluster_weight: 1.0}',
+    )
+    path = write_config(tmp_path, broken)
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert "directed" in str(excinfo.value)
+    assert "relates-to" in str(excinfo.value)
+    assert "MINDPALACE.md" in str(excinfo.value)
+
+
+def test_edge_type_cluster_weight_invalid_float_wrapped(tmp_path):
+    """IMPORTANT 3: invalid cluster_weight values raise ConfigError, not bare ValueError."""
+    broken = MINIMAL.replace(
+        "relates-to: {directed: false, cluster_weight: 1.0}",
+        "relates-to: {directed: false, cluster_weight: not-a-number}",
+    )
+    path = write_config(tmp_path, broken)
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert "cluster_weight" in str(excinfo.value)
+    assert "relates-to" in str(excinfo.value)
+    assert "MINDPALACE.md" in str(excinfo.value)
+
+
+def test_entity_types_must_be_list_not_scalar(tmp_path):
+    """IMPORTANT 4: entity_types must be a list, not a scalar that gets iterated."""
+    broken = MINIMAL.replace(
+        "entity_types: [concept]",
+        "entity_types: concept",  # scalar instead of list
+    )
+    path = write_config(tmp_path, broken)
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert "entity_types" in str(excinfo.value)
+    assert "MINDPALACE.md" in str(excinfo.value)
+
+
+def test_open_vault_error_message_tailored_for_non_empty_dir_without_init(tmp_path):
+    """Minor: error message should be tailored based on whether directory is empty."""
+    (tmp_path / "unrelated.txt").write_text("hello")
+    # Without init, error should mention the directory is not a vault
+    with pytest.raises(ConfigError) as excinfo:
+        open_vault(tmp_path, init=False)
+    assert "not a Mind Palace vault" in str(excinfo.value) or "no MINDPALACE.md" in str(
+        excinfo.value
+    )
