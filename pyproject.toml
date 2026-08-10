@@ -1,0 +1,26 @@
+[project]
+name = "mindpalace"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.2.0",
+    "pyyaml>=6.0",
+    "python-ulid>=2.7",
+    "numpy>=1.26",
+    "fastembed>=0.4",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+mindpalace = "mindpalace.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not network'"
+markers = ["network: requires network access (model download)"]
