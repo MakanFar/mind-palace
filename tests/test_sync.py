@@ -480,13 +480,25 @@ def test_a_malformed_entity_page_becomes_an_issue_and_stays_searchable(
 def test_an_entity_page_missing_a_required_key_becomes_an_issue(conn, vault, config):
     """The exact reproduction from the finding: valid YAML, but missing
     'type', used to die with a bare `KeyError: 'type'` rather than being
-    recorded and skipped."""
+    recorded and skipped.
+
+    `_load_entity_pages` deliberately catches broad `Exception` (so a
+    future, unanticipated failure mode still degrades rather than raising),
+    which means asserting only the issue *kind* here doesn't pin the
+    contract this finding is actually about: `str(KeyError('type'))` is
+    `"'type'"`, which still contains the substring "type", so a plain
+    `"type" in detail` check -- or no check on the detail at all -- would
+    keep passing even if the bare `KeyError` this finding names were
+    reinstated. Assert the specific message `read_entity_page` raises
+    instead, which only the `FrontMatterError` path produces.
+    """
     paths, store = vault
     (paths.entities / "hand-made.md").write_text("---\ntitle: oops\n---\n")
 
     report = sync(conn, store, config, StubEmbedder(), {})
 
-    assert any(issue[1] == "malformed_entity_page" for issue in report.issues)
+    issue = next(i for i in report.issues if i[1] == "malformed_entity_page")
+    assert "missing required front-matter key 'type'" in issue[2]
 
 
 def test_a_malformed_community_report_becomes_an_issue_and_stays_searchable(

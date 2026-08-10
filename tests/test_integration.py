@@ -326,13 +326,34 @@ def test_a_hand_written_bad_entity_page_does_not_disable_the_vault(session):
 def test_rebuild_preserves_a_hand_written_section_below_the_related_block(session):
     """The finding's exact reproduction: append a section below the
     machine-owned block, call rebuild, and it used to be gone -- `rebuild`
-    runs on every write tool, so this was a live trap, not a corner case."""
+    runs on every write tool, so this was a live trap, not a corner case.
+
+    Important 6's unchanged-page skip means `rebuild` never rewrites a page
+    whose type/generated_from/input_hash/stale/related haven't moved -- so
+    appending trailing text alone (which affects none of those) makes
+    `rebuild` skip the page entirely, and the trailing text would trivially
+    "survive" by never being touched at all. That made this test pass even
+    with the trailing re-emit deleted (confirmed by the scoped re-review's
+    mutation testing). Editing the note's assertion rationale in place moves
+    this entity's `input_hash`, which IS one of the fields the unchanged-check
+    compares, forcing an actual rewrite -- and asserting `pages_written >= 1`
+    pins that the rewrite really happened rather than being skipped again.
+    """
     seed(session)
     page_path = next(session.paths.entities.glob("*.md"))
     page_path.write_text(
         page_path.read_text() + "\n## My own notes\n\nHand written, must survive.\n"
     )
 
-    rebuild_tool(session, "all")
+    note_path = next(session.paths.notes.glob("*.md"))
+    note_path.write_text(
+        note_path.read_text().replace(
+            "Plateau is a supply constraint, not a ceiling.",
+            "A materially different rationale that moves the input hash.",
+        )
+    )
 
+    report = rebuild_tool(session, "all")
+
+    assert report["pages_written"] >= 1
     assert "Hand written, must survive." in page_path.read_text()
