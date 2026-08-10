@@ -1,5 +1,36 @@
 # Mind Palace MCP Server Implementation Plan
 
+> ## ⚠️ SUPERSEDED — executed 2026-08-09/10. The shipped code is authoritative.
+>
+> All 17 tasks were implemented on `feat/mcp-server` (317 tests passing). **The
+> code blocks below are the plan's original illustrative code and were defective
+> in almost every task.** They are preserved as a record of intent and of the
+> review process, not as a source to copy from. Read `mindpalace/` for what the
+> system actually does, and the design spec for why.
+>
+> Material corrections made during execution, each caught by review rather than
+> by the plan:
+>
+> | Where | The plan said | What shipped, and why |
+> |---|---|---|
+> | `frontmatter.parse` | `yaml.safe_load(raw) or {}` | `or {}` coerced falsy non-mappings past the type check, silently accepting malformed front-matter. Also stripped *all* leading newlines, so a body starting with a blank line did not round-trip. |
+> | `atomic.cas_write` | `exists()` check then `replace` | Check-then-act. Exclusive creation is now `os.link`, which fails atomically — that is what makes "an immutable capture is never overwritten" a guarantee. |
+> | `config.open_vault` | `root == Path.home()` | Only one side was resolved, so the `$HOME` guard never fired where the home path traverses a symlink (routine on macOS). It would have scaffolded a vault into a real home directory. |
+> | `config.load_config` | presence checks only | Values were never type-checked: `directed: "false"` became `True`, `entity_types: concept` exploded into single characters, both loading "successfully". |
+> | `oplog._read_lines` | bare `json.loads` per line | The crash-recovery log could not be read after a crash. Now tolerates a torn final line, raises loudly on interior corruption. |
+> | `graph.fold` | silent overwrite on duplicate id | Double-counted the aggregate while publishing one assertion. Now a typed `FoldError` hierarchy with structured attributes so `sync` can quarantine and retry. |
+> | `graph.fold` | parsed the aggregate key back apart | An edge type containing `\|` silently corrupted `source`/`type`/`target` and therefore `rank`. The tuple is captured directly now. |
+> | `rebuild.*_input_hash` | hashed ids and edge *shape* | Identity, not evidence — rewriting a note left its page reading `stale: false` forever. Both hashes now cover note bodies, descriptions, strengths, claim texts and statuses. |
+> | `cluster.match_lineages` | greedy over `fresh` | Could orphan an *exactly identical* community's report because Leiden numbered a different cluster first. Now global highest-score-first. |
+> | `cluster.Community.parent` | `"{level-1}:{cluster}"` | Referred to an index nothing stored. Now the parent's lineage id, remapped through `match_lineages`. |
+> | `retrieve.RANK_TIEBREAK_WEIGHT` | `0.001` | Against RRF relevance of ~0.033 a 0–10 impact rank contributed up to 0.01 — it could override relevance, not break ties. Now `1e-6`. |
+> | `server.py` | `FastMCP` | Does not exist in `mcp` 2.x. More importantly, sync tool bodies run on anyio worker threads, so the SQLite connection needed `check_same_thread=False` **and** a session `RLock` — without both, every tool call crashed or interleaved transactions. |
+> | Several test fixtures | 2–4 document corpora | BM25's IDF is exactly zero at N=2, df=1, so tests asserting a retrieval hit could not pass. One RRF test was unsatisfiable at any `k`. |
+>
+> Two spec promises are **not** implemented and are marked as such in the design
+> spec: per-call read-path self-heal, and write-once (content-hash-keyed)
+> vectors. Remaining parked follow-ups are listed in the SDD ledger.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a standalone stdio MCP server that turns a plain-markdown vault into a GraphRAG-schema knowledge graph, with the calling assistant acting as the extraction and summarization intelligence.

@@ -523,6 +523,15 @@ would orphan a whole report.
 | community report | ✓ (summary) | ✓ (full content) | on `write_community_report` |
 | relationship assertion description | — | ✓ | on note write |
 
+> **Not yet implemented (v0.1).** The recompute-trigger column above describes
+> the intended design, not what ships. `sync` currently calls `vectors.clear()`
+> and re-embeds every document on every run, so a capture's vector is recomputed
+> on each write rather than written once. With the local model and a few hundred
+> notes this is seconds per save, growing linearly, in the tool used most. The
+> fix is to key vectors by content hash and re-embed only what changed; it was
+> deferred out of the final fix wave to avoid touching the sync hot path with a
+> single re-review remaining.
+
 Captures and notes being immutable means their vectors are write-once, which
 eliminates the most common source of embedding drift. Entity vectors are the only
 ones with a live update path, and it is explicit.
@@ -648,9 +657,17 @@ direction.
 
 **Index drift is normal operation.** The vault will be edited in Obsidian — PRD
 §7.3 wants that. SQLite stores a content hash per file; startup sweeps mtimes and
-re-derives what changed; `read` and `local_search` do a cheap staleness check on
-files they touch and self-heal. Because derivation is a fold rather than an
-incremental merge, re-processing a file can never double-count its assertions.
+re-derives what changed. Because derivation is a fold rather than an incremental
+merge, re-processing a file can never double-count its assertions.
+
+> **Partially implemented (v0.1).** Drift is detected and healed at
+> `Session.open()` only. The read tools do **not** do a per-call staleness check,
+> so an Obsidian edit made while the server is running is not picked up until the
+> next restart — search and alias resolution serve the previous content for the
+> rest of the session. The drift set does now cover `entities/` and
+> `communities/` as well as Tier 1, so the edit is noticed on the next open
+> rather than never. Adding a `has_drift`/`resync` call at the top of the read
+> tools is the remaining work.
 
 **Deleted or edited notes** — their assertions leave the source set and every
 affected aggregate recomputes. Entities left with no assertions become orphans
