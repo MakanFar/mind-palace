@@ -24,8 +24,8 @@ restatement of the capture. Extract entities with a type and a one-line
 description. Propose a relationship only where you can give a specific rationale
 citing both endpoints; give each a strength 1-10. Reuse an existing entity name
 over inventing a near-duplicate. Check previously_dismissed before re-proposing a
-pair, and only re-propose when your evidence genuinely differs. Proposing nothing
-is a valid outcome.
+pair, and only re-propose when your evidence genuinely differs.
+Proposing nothing is a valid outcome.
 
 ## template: report_next
 Write one report per community using write_community_report. Ground every finding
