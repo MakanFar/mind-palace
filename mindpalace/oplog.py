@@ -26,10 +26,27 @@ def _append_line(path: Path, record: dict) -> None:
 def _read_lines(path: Path) -> list[dict]:
     if not path.exists():
         return []
+
+    lines = path.read_text(encoding="utf-8").splitlines()
     records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
+
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+
+        try:
             records.append(json.loads(line))
+        except json.JSONDecodeError:
+            # Malformed final line is a crash artifact from incomplete write/flush/fsync.
+            # Skip it; the record was never durably committed anyway.
+            if i == len(lines) - 1:
+                continue
+            # Malformed line in the middle indicates real corruption, not a torn write.
+            # Raise loudly with context so it doesn't fail silently.
+            raise ValueError(
+                f"Malformed JSON in {path} at line {i + 1}: {line!r}"
+            ) from None
+
     return records
 
 

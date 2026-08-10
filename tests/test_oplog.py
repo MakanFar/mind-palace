@@ -65,3 +65,62 @@ def test_confirmation_clears_a_prior_dismissal_reason(tmp_path):
     decisions.append("x_01", "dismiss", "resolve_assertion", "op_1", "different sense")
     decisions.append("x_01", "confirm", "resolve_assertion", "op_2")
     assert decisions.dismissal_reasons() == {}
+
+
+def test_oplog_survives_truncated_final_line(tmp_path):
+    """Malformed final line from incomplete write is a crash artifact; skip it gracefully."""
+    log = OpLog(tmp_path / "log.jsonl")
+    op1 = log.begin({"tool": "save_capture"})
+    log.commit(op1)
+    op2 = log.begin({"tool": "write_note"})
+
+    # Simulate a crash mid-write: remove the closing brace from the final line
+    path = tmp_path / "log.jsonl"
+    lines = path.read_text().splitlines(keepends=True)
+    lines[-1] = lines[-1][:-3]  # Remove closing "}\n" to make malformed JSON
+    path.write_text("".join(lines))
+
+    # pending() should survive by skipping the malformed final line (crash artifact)
+    # op1 was committed, so not pending; op2's line is malformed so skipped; result: []
+    reopened = OpLog(path)
+    pending = reopened.pending()
+    assert pending == []
+
+
+def test_oplog_raises_on_malformed_middle_line(tmp_path):
+    """Malformed line in the middle is real corruption, not a torn write; raise loudly."""
+    path = tmp_path / "log.jsonl"
+    path.write_text('{"kind": "op.begin", "op": "op_001", "ts": "2024-01-01T00:00:00Z", "intent": {}}\n')
+    path.write_text(
+        path.read_text() + 'CORRUPTED JSON LINE\n',
+    )
+    path.write_text(
+        path.read_text() + '{"kind": "op.commit", "op": "op_001", "ts": "2024-01-01T00:00:00Z"}\n',
+    )
+
+    log = OpLog(path)
+    try:
+        log.pending()
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "Malformed JSON" in str(e)
+        assert str(path) in str(e)
+        assert "line 2" in str(e)
+
+
+def test_decision_log_survives_truncated_final_line(tmp_path):
+    """Decision log degrades gracefully: truncated final line skipped, surviving decisions kept."""
+    path = tmp_path / "decisions.jsonl"
+    decisions = DecisionLog(path)
+    decisions.append("x_01", "dismiss", "resolve_assertion", "op_1", "reason1")
+    decisions.append("x_02", "confirm", "resolve_assertion", "op_2")
+
+    # Simulate a crash mid-write: truncate the file
+    content = path.read_text()
+    truncated = content[:-10]
+    path.write_text(truncated)
+
+    # status_map() should recover and return only the surviving decision
+    reopened = DecisionLog(path)
+    status = reopened.status_map()
+    assert status == {"x_01": "dismiss"}
