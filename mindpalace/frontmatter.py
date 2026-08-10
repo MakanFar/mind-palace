@@ -22,12 +22,17 @@ def parse(text: str) -> tuple[dict, str]:
         raw = "".join(lines[1:cursor])
         body = "".join(lines[cursor + 1 :])
         try:
-            data = yaml.safe_load(raw) or {}
+            data = yaml.safe_load(raw)
         except yaml.YAMLError as exc:
             raise FrontMatterError(f"invalid YAML front-matter: {exc}") from exc
-        if not isinstance(data, dict):
+        if data is None:
+            data = {}
+        elif not isinstance(data, dict):
             raise FrontMatterError("front-matter must be a mapping")
-        return data, body.lstrip("\n")
+        # Strip exactly one leading newline (the separator render() added), not all of them
+        if body and body[0] == "\n":
+            body = body[1:]
+        return data, body
 
     raise FrontMatterError("unterminated front-matter block")
 
