@@ -43,6 +43,8 @@ def test_cas_write_with_none_expects_absent_file(tmp_path):
     target = tmp_path / "new.md"
     cas_write(target, "fresh\n", None)
     assert target.read_text() == "fresh\n"
+    # Verify no temp files left behind on success
+    assert [p.name for p in tmp_path.iterdir()] == ["new.md"]
 
 
 def test_cas_write_with_none_rejects_existing_file(tmp_path):
@@ -50,3 +52,7 @@ def test_cas_write_with_none_rejects_existing_file(tmp_path):
     atomic_write(target, "already here\n")
     with pytest.raises(ConflictError, match="already exists"):
         cas_write(target, "fresh\n", None)
+    # Verify original content is untouched
+    assert target.read_text() == "already here\n"
+    # Verify no temp files left behind on conflict
+    assert [p.name for p in tmp_path.iterdir()] == ["new.md"]

@@ -40,8 +40,28 @@ def cas_write(path: Path, content: str, expected_hash: str | None) -> None:
     rather than clobbering an edit made in Obsidian since we last read.
     """
     if expected_hash is None:
-        if path.exists():
-            raise ConflictError(f"{path} already exists")
+        # Exclusive create via atomic OS link: write to temp, link atomically.
+        # This avoids the race window between exists() check and replace().
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temp_path, path)
+            except FileExistsError:
+                raise ConflictError(f"{path} already exists")
+        except ConflictError:
+            temp_path.unlink(missing_ok=True)
+            raise
+        except BaseException:
+            temp_path.unlink(missing_ok=True)
+            raise
+        else:
+            temp_path.unlink()
     else:
         if not path.exists():
             raise ConflictError(f"{path} changed on disk: expected content, found none")
@@ -50,4 +70,4 @@ def cas_write(path: Path, content: str, expected_hash: str | None) -> None:
             raise ConflictError(
                 f"{path} changed on disk: expected {expected_hash}, found {actual}"
             )
-    atomic_write(path, content)
+        atomic_write(path, content)
