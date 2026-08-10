@@ -38,6 +38,8 @@ class StubEmbedder:
             seed = int.from_bytes(digest[:8], "big")
             generator = np.random.default_rng(seed)
             vector = generator.standard_normal(self.dim).astype(DTYPE)
+            # Gaussian sampling cannot produce exact zero vectors, unlike LocalEmbedder
+            # which wraps an opaque external model; no zero-norm guard needed here.
             rows.append(vector / np.linalg.norm(vector))
         return np.vstack(rows)
 

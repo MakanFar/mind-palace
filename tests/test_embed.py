@@ -27,6 +27,11 @@ def test_stub_vectors_are_unit_length():
     assert np.linalg.norm(vectors[0]) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_stub_output_dtype_is_float32():
+    vectors = StubEmbedder().embed(["hello"])
+    assert vectors.dtype == np.float32
+
+
 def test_stub_handles_empty_input():
     assert StubEmbedder().embed([]).shape == (0, 64)
 
@@ -34,6 +39,11 @@ def test_stub_handles_empty_input():
 def test_get_embedder_returns_stub_for_stub_kind():
     embedder = get_embedder({"kind": "stub", "dim": 16})
     assert embedder.model_id == "stub-16"
+
+
+def test_get_embedder_rejects_cloud_kind():
+    with pytest.raises(EmbedderError, match="cloud embedder is not implemented"):
+        get_embedder({"kind": "cloud"})
 
 
 def test_get_embedder_rejects_unknown_kind():
