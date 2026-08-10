@@ -7,14 +7,28 @@ from dataclasses import dataclass
 
 from collections.abc import Iterable
 
-from mindpalace.atomic import content_hash
+from mindpalace.atomic import ConflictError, content_hash
 from mindpalace.config import Config
 from mindpalace.embed import Embedder
-from mindpalace.graph.fold import FoldedEntity, GraphTables, fold
+from mindpalace.frontmatter import FrontMatterError
+from mindpalace.graph.fold import FoldedEntity, GraphTables
 from mindpalace.ids import slugify
-from mindpalace.index.sync import sync
+from mindpalace.index.sync import _load_notes, fold_notes_with_quarantine, sync
 from mindpalace.models import EntityPage, Note
 from mindpalace.vault.store import VaultStore
+
+# Kinds `fold_notes_with_quarantine` can produce. Scoped so `rebuild` can
+# persist its own quarantine pass without disturbing vault_issue kinds that
+# belong to a different stage (ambiguous_alias, stale_prose, ...), and
+# without duplicating whatever `sync` already wrote this same call when
+# scope includes "cache" -- both passes fold the same source set, so a
+# kind-scoped replace is idempotent either way.
+_FOLD_ISSUE_KINDS = (
+    "malformed_note",
+    "unknown_edge_type",
+    "duplicate_assertion_id",
+    "unknown_decision_action",
+)
 
 
 @dataclass(frozen=True)
@@ -159,7 +173,13 @@ def mark_stale_reports(
         row["lineage_id"]: (row["members"].split(",") if row["members"] else [])
         for row in conn.execute("SELECT lineage_id, members FROM communities")
     }
-    notes_by_id = {note.id: note for note in store.iter_notes()}
+    # `_load_notes`, not `store.iter_notes()`: a note that fails to parse
+    # must not take clustering/rebuild down just to compute a staleness
+    # hash (spec §10). Issues are already recorded by whichever quarantine
+    # pass (`sync`, `fold_notes_with_quarantine`) this call is nested
+    # inside; this one only needs the notes that DID parse.
+    parsed_notes, _issues, _degraded, _sources = _load_notes(store)
+    notes_by_id = {note.id: note for note in parsed_notes}
     marked = 0
     for report in list(store.iter_reports()):
         members = membership.get(report.lineage_id)
@@ -169,7 +189,13 @@ def mark_stale_reports(
         if report.input_hash != expected and not report.stale:
             report.stale = True
             report.input_hash = expected
-            store.write_report(report)
+            try:
+                store.write_report(report)
+            except ConflictError:
+                # Someone edited this report between our read and our
+                # write; leave it for the next pass rather than crashing
+                # every other report's staleness update over one race.
+                continue
             marked += 1
     return marked
 
@@ -198,16 +224,45 @@ def rebuild(
     if scope in {"cache", "all"}:
         synced = sync(conn, store, config, embedder, statuses).notes
 
-    notes = list(store.iter_notes())
-    notes_by_id = {note.id: note for note in notes}
-    tables = fold(notes, statuses, config)
+    # Quarantine-aware, not a bare `fold()` call: a note with a typo'd edge
+    # type or a duplicate assertion id must not take this whole call down --
+    # `write_note`, `resolve_assertion`, `cluster`, and every other caller of
+    # `rebuild` route through here (spec §10). See
+    # `mindpalace.index.sync.fold_notes_with_quarantine`.
+    notes, notes_by_id, tables, fold_issues = fold_notes_with_quarantine(
+        store, config, statuses
+    )
+    # Persist what quarantine found. When scope includes "cache", `sync`
+    # (above) already wrote the identical set as part of its own full
+    # rewrite of `vault_issues`; this is a kind-scoped replace, so it is a
+    # no-op in that case rather than a duplicate. When scope is
+    # "related_blocks" only, `sync` never ran this call, and without this,
+    # a note `fold` rejects would be quarantined correctly but invisibly --
+    # `review_queue` would never learn about it.
+    with conn:
+        conn.execute(
+            f"DELETE FROM vault_issues WHERE kind IN "
+            f"({','.join('?' for _ in _FOLD_ISSUE_KINDS)})",
+            _FOLD_ISSUE_KINDS,
+        )
+        conn.executemany(
+            "INSERT INTO vault_issues (path, kind, detail) VALUES (?, ?, ?)",
+            fold_issues,
+        )
 
     written = 0
     marked_stale = 0
     if scope in {"related_blocks", "all"}:
         for entity in tables.entities.values():
             expected = entity_input_hash(entity, tables, notes_by_id)
-            existing = store.read_entity_page(entity.slug)
+            try:
+                existing = store.read_entity_page(entity.slug)
+            except FrontMatterError:
+                # The file exists but cannot be parsed: leave it alone
+                # (spec §10 -- Tier 2 is never deleted or clobbered by
+                # rebuild) rather than let it take this whole call down.
+                # `sync`'s own pass already recorded it as a vault_issue.
+                continue
             related = _related_lines(entity.slug, tables)
 
             if existing is None:
@@ -229,18 +284,45 @@ def rebuild(
             if became_stale and not existing.stale:
                 marked_stale += 1
 
-            store.write_entity_page(
-                EntityPage(
-                    slug=entity.slug,
-                    type=existing.user.get("type", entity.type),
-                    description=existing.description,
-                    generated_from=list(entity.note_ids),
-                    input_hash=expected,
-                    stale=existing.stale or became_stale,
-                    user=existing.user,
-                    related=related,
-                )
+            new_type = existing.user.get("type", entity.type)
+            new_generated_from = list(entity.note_ids)
+            new_stale = existing.stale or became_stale
+            unchanged = (
+                existing.type == new_type
+                and existing.generated_from == new_generated_from
+                and existing.input_hash == expected
+                and existing.stale == new_stale
+                and existing.related == related
             )
+            if unchanged:
+                # Nothing to write: rewriting anyway would still be
+                # idempotent, but at the cost of a Tier-2 file touch (and a
+                # git diff) on every single rebuild -- and rebuild runs on
+                # every write tool. See spec §9.1/§9.2: unconditional
+                # rewrite here also unconditionally widens the CAS window
+                # below on content that hasn't moved.
+                continue
+
+            try:
+                store.write_entity_page(
+                    EntityPage(
+                        slug=entity.slug,
+                        type=new_type,
+                        description=existing.description,
+                        generated_from=new_generated_from,
+                        input_hash=expected,
+                        stale=new_stale,
+                        user=existing.user,
+                        related=related,
+                        trailing=existing.trailing,
+                        source_hash=existing.source_hash,
+                    )
+                )
+            except ConflictError:
+                # Someone (Obsidian, another tool call) wrote this file
+                # between our read and our write. Leave it for the next
+                # rebuild rather than crashing this one over one page.
+                continue
             written += 1
 
     reports_marked = mark_stale_reports(conn, store, tables)

@@ -399,6 +399,116 @@ def test_community_input_hash_is_stable_across_runs(store, config):
     assert first == second
 
 
+# ---- CRITICAL 1: rebuild() must not call fold() bare -----------------------
+
+
+def test_rebuild_quarantines_a_note_fold_rejects_instead_of_raising(conn, store, config):
+    """rebuild() used to call fold(notes, statuses, config) bare -- a note
+    fold() rejects (unknown edge type, duplicate assertion id) took
+    rebuild() down, and every write tool calls rebuild()."""
+    add_note(store)
+    bad = Note(
+        id="n_bad",
+        derived_from="c_bad",
+        created="2026-08-01T00:00:00Z",
+        author="llm",
+        body="A hand-written note with a typo'd edge type.",
+        relationship_assertions=(
+            RelationshipAssertion(
+                "x_bad", "scaling-laws", "data-exhaustion", "invented", 5, "nope."
+            ),
+        ),
+    )
+    store.write_note(bad, "bad-note")
+
+    report = rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+
+    assert report.synced == 1  # the good note folded; the bad one was excluded
+    issue_kinds = [row[0] for row in conn.execute("SELECT kind FROM vault_issues")]
+    assert "unknown_edge_type" in issue_kinds
+    # The good note's entity page still gets written -- one bad note does
+    # not take the rest of the rebuild down.
+    assert store.read_entity_page("scaling-laws") is not None
+
+
+def test_rebuild_persists_quarantine_issues_even_when_scope_excludes_cache(
+    conn, store, config
+):
+    """`rebuild(scope="related_blocks")` never calls `sync`, which is the
+    only other place vault_issues used to get written -- so quarantine
+    finding a bad note was correct but invisible to review_queue unless a
+    later "all"/"cache" rebuild happened to run."""
+    add_note(store)
+    bad = Note(
+        id="n_bad",
+        derived_from="c_bad",
+        created="2026-08-01T00:00:00Z",
+        author="llm",
+        body="Bad note.",
+        relationship_assertions=(
+            RelationshipAssertion(
+                "x_bad", "scaling-laws", "data-exhaustion", "invented", 5, "nope."
+            ),
+        ),
+    )
+    store.write_note(bad, "bad-note")
+
+    rebuild(
+        conn, store, config, StubEmbedder(), {"x_n_01": "confirm"},
+        scope="related_blocks",
+    )
+
+    issue_kinds = [row[0] for row in conn.execute("SELECT kind FROM vault_issues")]
+    assert "unknown_edge_type" in issue_kinds
+
+
+# ---- IMPORTANT 6: rebuild must not rewrite an unchanged entity page --------
+
+
+def test_rebuild_does_not_rewrite_an_unchanged_entity_page(conn, store, config):
+    """`written` counted every visited entity unconditionally, so a second
+    rebuild with nothing changed still rewrote every page (churning git and
+    widening the CAS window from Important 5 for no reason)."""
+    add_note(store)
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+
+    page_path = next(store.paths.entities.glob("*.md"))
+    before_text = page_path.read_text()
+    before_mtime = page_path.stat().st_mtime_ns
+
+    report = rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+
+    assert report.pages_written == 0
+    assert page_path.read_text() == before_text
+    assert page_path.stat().st_mtime_ns == before_mtime
+
+
+def test_rebuild_does_not_double_sync_when_nothing_changed(
+    conn, store, config, monkeypatch
+):
+    """`if written or reports_marked: sync(...)` fired a second full sync
+    (which re-embeds the whole vault) on every non-empty rebuild, because
+    `written` was never actually zero. Once the pages are stable, exactly
+    one sync (the scope="all" call) should run per rebuild, not two."""
+    add_note(store)
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+
+    import mindpalace.rebuild as rebuild_module
+
+    calls = []
+    original_sync = rebuild_module.sync
+
+    def counting_sync(*args, **kwargs):
+        calls.append(1)
+        return original_sync(*args, **kwargs)
+
+    monkeypatch.setattr(rebuild_module, "sync", counting_sync)
+
+    rebuild(conn, store, config, StubEmbedder(), {"x_n_01": "confirm"})
+
+    assert len(calls) == 1
+
+
 def test_entity_input_hash_is_stable_across_runs(store, config):
     add_note(store)
     notes = list(store.iter_notes())
