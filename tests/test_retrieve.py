@@ -43,7 +43,11 @@ def hit(doc_id, *, bm25=0.0, cosine=0.0):
 
 
 def test_rrf_prefers_documents_appearing_in_both_lists():
-    fused = rrf([["a", "b", "c"], ["c", "b", "a"]])
+    # "a" is present only in the first list; "b" is present in both. RRF sums
+    # a document's 1/(k+rank) contribution from every list it appears in, so
+    # "b" accumulates two terms against "a"'s one and wins even though "a"
+    # holds the better individual rank in the list they share.
+    fused = rrf([["a", "b"], ["b"]])
     assert fused[0][0] == "b"
 
 
@@ -80,12 +84,32 @@ def test_local_search_abstains_with_an_explicit_instruction(conn, config):
 
 
 def test_local_search_returns_lexical_matches(conn, config):
+    # SQLite FTS5's bm25() uses the unsmoothed idf = ln((N - df + 0.5) /
+    # (df + 0.5)); with only 2 documents and 1 matching (df = N/2), idf is
+    # exactly 0 and the match scores ~0 regardless of how well it matches -
+    # a degenerate corpus, not a degenerate query. A ~10-document corpus
+    # keeps idf comfortably non-zero so this test actually exercises the
+    # production abstain_bm25_floor (2.0) instead of always clearing an
+    # empty gate. Do not shrink this back down to 2 documents.
     embedder = StubEmbedder()
     index_doc(conn, embedder, "n_01", "note", "Scaling", "the plateau is data exhaustion")
-    index_doc(conn, embedder, "n_02", "note", "Bread", "sourdough starter hydration")
+    distractors = [
+        ("n_02", "Bread", "sourdough starter hydration"),
+        ("n_03", "Weather", "cold front moving through tonight"),
+        ("n_04", "Garden", "tomatoes need staking this week"),
+        ("n_05", "Commute", "the train was delayed again"),
+        ("n_06", "Recipe", "simmer the stock for two hours"),
+        ("n_07", "Notes", "remember to renew the passport"),
+        ("n_08", "Music", "the new album drops on friday"),
+        ("n_09", "Repairs", "the bike chain keeps slipping"),
+        ("n_10", "Travel", "book the ferry crossing early"),
+    ]
+    for doc_id, title, text in distractors:
+        index_doc(conn, embedder, doc_id, "note", title, text)
+
     result = local_search(conn, embedder, "data exhaustion", config)
     assert [h["id"] for h in result["hits"]][0] == "n_01"
-    assert result["hits"][0]["bm25"] > 0
+    assert result["hits"][0]["bm25"] >= config.thresholds.abstain_bm25_floor
 
 
 def test_local_search_reports_raw_signals_for_tuning(conn, config):
