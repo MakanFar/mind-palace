@@ -15,7 +15,9 @@
 - **No network in the test suite.** Tests use `StubEmbedder` exclusively. Exactly one test, marked `@pytest.mark.network`, exercises `LocalEmbedder`; it is excluded from the default run via `addopts = "-m 'not network'"`.
 - **Determinism is a hard requirement.** Leiden is seeded; embeddings in tests are hash-derived; any test asserting ordering must pin the seed.
 - **Vault contract:** `--vault PATH` required; scaffold only under `--init`; refuse a non-empty directory lacking `MINDPALACE.md`; refuse `$HOME` and `/`.
-- **IDs are prefixed ULIDs stored in front-matter, never derived from filenames.** Prefixes: `c_` capture, `n_` note, `x_` relationship assertion, `k_` claim assertion, `e_` entity, `g_` community lineage, `op_` operation. Aggregate relationships have **no ULID** — key is `r:<source>|<type>|<target>`.
+- **ULID-based ids live in front-matter and are never derived from filenames**, so an Obsidian rename cannot dangle a reference: `c_` capture, `n_` note, `x_` relationship assertion, `k_` claim assertion, `g_` community lineage, `op_` operation.
+- **Entities are the deliberate exception:** an entity is identified by its normalized slug (`e_<slug>`) — the slug *is* the identity (spec §4.1). That is GraphRAG's exact-string-match entity resolution, and the paper's finding is that residual duplicates are tolerable because they cluster together anyway. Renaming an entity page in Obsidian therefore leaves an orphan Tier-2 file, which rebuild ignores while rewriting the correct one.
+- **Aggregate relationships have no ULID at all** — the key is `r:<source>|<type>|<target>`.
 - **Assertions carry no status field.** Status is the fold of `decisions.jsonl`. Notes are immutable after write.
 - **Tier 2 files are never deleted by any rebuild.** `rebuild` recomputes input hashes and marks prose stale; it never regenerates prose.
 - **Symmetric edge types** (`relates-to`, `contradicts`) sort endpoint slugs in the aggregate key; **directed types** do not.
