@@ -231,11 +231,28 @@ def test_entity_types_must_be_list_not_scalar(tmp_path):
 
 
 def test_open_vault_error_message_tailored_for_non_empty_dir_without_init(tmp_path):
-    """Minor: error message should be tailored based on whether directory is empty."""
+    """Minor: error message should be tailored based on whether directory is empty.
+
+    The two candidate messages are distinguishable, so this must assert
+    exactly the non-empty-dir wording and rule out the empty-dir wording --
+    an `or` between the two would pass even if the tailoring branch fired
+    backwards and returned the *empty*-dir message here instead, which is
+    exactly the bug this test exists to catch.
+    """
     (tmp_path / "unrelated.txt").write_text("hello")
     # Without init, error should mention the directory is not a vault
     with pytest.raises(ConfigError) as excinfo:
         open_vault(tmp_path, init=False)
-    assert "not a Mind Palace vault" in str(excinfo.value) or "no MINDPALACE.md" in str(
-        excinfo.value
-    )
+    message = str(excinfo.value)
+    assert "not a Mind Palace vault and is not empty" in message
+    assert "no MINDPALACE.md" not in message
+
+
+def test_open_vault_error_message_tailored_for_empty_dir_without_init(tmp_path):
+    """The companion branch: an empty (or nonexistent) directory without
+    --init gets the "no MINDPALACE.md" wording, not the "is not empty" one."""
+    with pytest.raises(ConfigError) as excinfo:
+        open_vault(tmp_path, init=False)
+    message = str(excinfo.value)
+    assert "no MINDPALACE.md" in message
+    assert "is not empty" not in message
