@@ -6,7 +6,13 @@ from mindpalace.graph.fold import UnknownEdgeTypeError
 from mindpalace.index import db
 from mindpalace.index import sync as sync_module
 from mindpalace.index.sync import has_drift, sync
-from mindpalace.models import Capture, EntityInstance, Note, RelationshipAssertion
+from mindpalace.models import (
+    Capture,
+    EntityInstance,
+    EntityPage,
+    Note,
+    RelationshipAssertion,
+)
 from mindpalace.vault.paths import VaultPaths
 from mindpalace.vault.store import VaultStore
 
@@ -141,6 +147,40 @@ def test_duplicate_assertion_ids_are_reported(conn, vault, config):
 
     report = sync(conn, store, config, StubEmbedder(), {})
     assert any(issue[1] == "duplicate_assertion_id" for issue in report.issues)
+
+
+def test_ambiguous_alias_is_reported_as_a_vault_issue(conn, vault, config):
+    """Spec §8.5: two entities claiming the same alias is a vault_issue,
+    never silently resolved in favour of one -- aliases explicitly do not
+    merge identities."""
+    _, store = vault
+    store.write_entity_page(
+        EntityPage(
+            slug="alpha",
+            type="concept",
+            description="",
+            user={"aliases": ["shared-name"]},
+        )
+    )
+    store.write_entity_page(
+        EntityPage(
+            slug="beta",
+            type="concept",
+            description="",
+            user={"aliases": ["shared-name"]},
+        )
+    )
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    matches = [issue for issue in report.issues if issue[1] == "ambiguous_alias"]
+    assert len(matches) == 1
+    _, _, detail = matches[0]
+    assert "alpha" in detail and "beta" in detail
+    stored = conn.execute(
+        "SELECT COUNT(*) FROM vault_issues WHERE kind = 'ambiguous_alias'"
+    ).fetchone()[0]
+    assert stored == 1
 
 
 def test_sync_records_the_embedder_in_cache_meta(conn, vault, config):

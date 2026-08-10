@@ -17,6 +17,7 @@ from mindpalace.graph.fold import (
     UnknownEdgeTypeError,
     fold,
 )
+from mindpalace.ids import slugify
 from mindpalace.index import db, vectors
 from mindpalace.models import Capture, Note, capture_from_markdown, note_from_markdown
 from mindpalace.vault.store import VaultStore
@@ -192,6 +193,40 @@ def _first_line(text: str) -> str:
     return ""
 
 
+def _ambiguous_alias_issues(
+    store: VaultStore, entity_pages: list
+) -> list[tuple[str, str, str]]:
+    """Two entities claiming the same alias is a vault_issue (spec §8.5),
+    never silently resolved in favour of one -- aliases explicitly do not
+    merge identities. `_resolve_slug` (mindpalace/tools.py) raises on lookup
+    when it hits one of these live; this is the same collision surfaced
+    proactively through `review_queue` so it can be noticed and fixed even
+    before anyone happens to look the ambiguous name up.
+    """
+    owners: dict[str, list[str]] = {}
+    for page in entity_pages:
+        for alias in page.user.get("aliases", []):
+            owners.setdefault(slugify(alias), []).append(page.slug)
+
+    issues: list[tuple[str, str, str]] = []
+    for alias, slugs in sorted(owners.items()):
+        if len(slugs) <= 1:
+            continue
+        claimants = sorted(set(slugs))
+        paths = ", ".join(
+            _relative(store, store.paths.entity_path(slug)) for slug in claimants
+        )
+        issues.append(
+            (
+                paths,
+                "ambiguous_alias",
+                f"alias {alias!r} is claimed by more than one entity: "
+                f"{claimants}; aliases do not merge identities",
+            )
+        )
+    return issues
+
+
 def _render_index(
     captures: list[Capture], notes: list[Note], tables: GraphTables
 ) -> str:
@@ -249,8 +284,10 @@ def sync(
         claim_text = " ".join(c.text for c in note.claim_assertions)
         searchable = "\n".join(filter(None, [note.body, assertion_text, claim_text]))
         documents.append((note.id, "note", _first_line(note.body), searchable))
-    for page in store.iter_entity_pages():
+    entity_pages = list(store.iter_entity_pages())
+    for page in entity_pages:
         documents.append((f"e_{page.slug}", "entity", page.slug, page.description))
+    issues.extend(_ambiguous_alias_issues(store, entity_pages))
     for report in store.iter_reports():
         documents.append(
             (report.lineage_id, "report", report.title, f"{report.summary}\n{report.findings}")

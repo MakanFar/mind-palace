@@ -348,17 +348,35 @@ def neighbors(
 
 
 def _resolve_slug(session: Session, name: str) -> str | None:
+    """Exact slug always wins outright; only alias-to-alias ambiguity raises.
+
+    Two entities claiming the same alias is a vault_issue (spec §8.5), never
+    silently resolved in favour of one -- aliases explicitly do not merge
+    identities. Picking a winner here would hand the caller the wrong
+    entity's data with no signal anything was wrong; an error the assistant
+    can relay, naming every candidate, is the only actionable outcome.
+    `mindpalace.index.sync._ambiguous_alias_issues` surfaces the same
+    collision proactively through `review_queue`, before anyone happens to
+    look the ambiguous name up.
+    """
     slug = slugify(name)
     row = session.conn.execute(
         "SELECT slug FROM entities WHERE slug = ?", (slug,)
     ).fetchone()
     if row is not None:
         return row["slug"]
+    matches: list[str] = []
     for page in session.store.iter_entity_pages():
         aliases = {slugify(alias) for alias in page.user.get("aliases", [])}
         if slug in aliases:
-            return page.slug
-    return None
+            matches.append(page.slug)
+    if len(matches) > 1:
+        candidates = sorted(set(matches))
+        raise ToolError(
+            f"alias {name!r} is ambiguous: claimed by more than one entity "
+            f"{candidates}; aliases do not merge identities"
+        )
+    return matches[0] if matches else None
 
 
 def get_entity(session: Session, name: str) -> dict:

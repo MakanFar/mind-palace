@@ -4,7 +4,7 @@ import pytest
 
 from mindpalace.embed import StubEmbedder
 from mindpalace.ids import new_id
-from mindpalace.models import Note, RelationshipAssertion
+from mindpalace.models import EntityPage, Note, RelationshipAssertion
 from mindpalace.session import Session
 from mindpalace.tools import (
     ToolError,
@@ -131,6 +131,28 @@ def test_review_queue_separates_proposals_from_issues(with_assertion):
     assert len(queue["proposals"]) == 1
     assert queue["proposals"][0]["pair"].startswith("scaling-laws|contradicts")
     assert any("broken.md" in issue["path"] for issue in queue["vault_issues"])
+
+
+def test_review_queue_surfaces_an_ambiguous_alias(with_assertion):
+    """Spec §8.5: two entities claiming the same alias is a vault_issue,
+    never silently resolved in favour of one -- surfaced proactively through
+    review_queue so it can be noticed and fixed before anyone happens to
+    look the ambiguous name up (that lookup path itself is covered by
+    test_tools_read.py::test_get_entity_raises_on_an_ambiguous_alias)."""
+    session, _ = with_assertion
+    for slug in ("scaling-laws", "data-exhaustion"):
+        page = session.store.read_entity_page(slug)
+        page.user = {"aliases": ["shared-name"]}
+        session.store.write_entity_page(page)
+    session.resync()
+
+    issues = [
+        issue for issue in review_queue(session)["vault_issues"]
+        if issue["kind"] == "ambiguous_alias"
+    ]
+    assert len(issues) == 1
+    assert "scaling-laws" in issues[0]["detail"]
+    assert "data-exhaustion" in issues[0]["detail"]
 
 
 def test_review_queue_inlines_both_endpoint_snippets(with_assertion):

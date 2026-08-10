@@ -92,6 +92,33 @@ def test_get_entity_rejects_an_unknown_name(populated):
         get_entity(session, "nonexistent")
 
 
+def test_get_entity_raises_on_an_ambiguous_alias(populated):
+    """Spec §8.5: two entities claiming the same alias is never silently
+    resolved in favour of one -- an ambiguous lookup must be an error the
+    assistant can relay, naming every candidate, not a coin flip."""
+    session, _, _ = populated
+    for slug in ("scaling-laws", "data-exhaustion"):
+        page = session.store.read_entity_page(slug)
+        page.user = {"aliases": ["shared-name"]}
+        session.store.write_entity_page(page)
+
+    with pytest.raises(ToolError, match="ambiguous") as excinfo:
+        get_entity(session, "shared-name")
+    assert "scaling-laws" in str(excinfo.value)
+    assert "data-exhaustion" in str(excinfo.value)
+
+
+def test_get_entity_exact_slug_wins_over_someone_elses_alias(populated):
+    """An exact slug match must win outright over any alias match -- only
+    alias-to-alias ambiguity is an error."""
+    session, _, _ = populated
+    page = session.store.read_entity_page("scaling-laws")
+    page.user = {"aliases": ["data-exhaustion"]}
+    session.store.write_entity_page(page)
+
+    assert get_entity(session, "data-exhaustion")["slug"] == "data-exhaustion"
+
+
 def test_graph_stats_reports_distance_to_the_threshold(populated):
     session, _, _ = populated
     stats = graph_stats(session)
