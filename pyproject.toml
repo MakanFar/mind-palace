@@ -8,6 +8,8 @@ dependencies = [
     "python-ulid>=2.7",
     "numpy>=1.26",
     "fastembed>=0.4",
+    "graspologic>=3.4",
+    "networkx>=3.0",
 ]
 
 [dependency-groups]
