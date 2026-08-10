@@ -24,3 +24,9 @@ build-backend = "hatchling.build"
 testpaths = ["tests"]
 addopts = "-m 'not network'"
 markers = ["network: requires network access (model download)"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["mindpalace"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"mindpalace/templates" = "mindpalace/templates"
