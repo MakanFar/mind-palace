@@ -1,3 +1,5 @@
+import threading
+
 from mindpalace.index import db
 
 
@@ -34,6 +36,29 @@ def test_foreign_keys_and_wal_are_enabled(tmp_path):
     conn = db.connect(tmp_path / "cache.db")
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+def test_a_writer_waits_for_another_connections_transaction(tmp_path):
+    """Several sessions now share one cache file, so meeting another
+    connection mid-transaction is routine rather than impossible. sqlite's
+    default is to fail that write instantly with `database is locked`; it has
+    to wait for the other transaction to finish instead."""
+    path = tmp_path / "cache.db"
+    holder = db.connect(path)
+    db.create_schema(holder)
+    other = db.connect(path)
+
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO files (path, hash) VALUES ('held', 'h')")
+    releaser = threading.Timer(0.3, holder.commit)
+    releaser.start()
+    try:
+        other.execute("INSERT INTO files (path, hash) VALUES ('waited', 'h')")
+        other.commit()
+    finally:
+        releaser.join()
+
+    assert other.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
 
 
 def test_file_hashes_round_trip(tmp_path):

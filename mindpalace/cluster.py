@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import networkx as nx
-from graspologic.partition import hierarchical_leiden
 
 from mindpalace.config import Config
 from mindpalace.graph.fold import Aggregate
@@ -61,6 +60,14 @@ def partition(
     graph = _build_graph(aggregates, config)
     if graph.number_of_edges() == 0:
         return []
+
+    # Imported here, not at module scope: graspologic pulls in umap ->
+    # pynndescent -> numba, which cost ~7s of the ~12s `import
+    # mindpalace.server` used to take -- inside the fixed window an MCP client
+    # allows for `initialize` (30s in Claude Code). Clustering is one tool of
+    # fifteen and most sessions never reach this line, so the cost belongs to
+    # the caller that needs it.
+    from graspologic.partition import hierarchical_leiden
 
     assignments = hierarchical_leiden(graph, random_seed=seed)
 

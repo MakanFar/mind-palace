@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from mindpalace.embed import StubEmbedder
@@ -14,27 +16,159 @@ def test_session_initialises_a_fresh_vault(tmp_path):
         assert session.config.schema_version == 1
 
 
-def test_lock_prevents_a_second_writer(tmp_path):
-    with open_session(tmp_path):
-        with pytest.raises(VaultLockedError, match="already open"):
-            open_session(tmp_path).open()
+# ---- concurrency: exclusion belongs around writes, not around the process ---
 
 
-def test_lock_is_released_on_close(tmp_path):
-    with open_session(tmp_path):
-        pass
+def test_two_sessions_can_hold_the_same_vault_open(tmp_path):
+    """The lock used to be an exclusive `flock` taken for the whole session
+    lifetime, so the *second* server on a vault exited 2 with `vault ... is
+    already open (pid N)`. Every MCP client that starts one stdio server per
+    editor session (Claude Code does) therefore had exactly one working
+    session and a queue of dead ones behind it. Opening is a read; only
+    writes need to exclude each other."""
+    with open_session(tmp_path) as first, open_session(tmp_path) as second:
+        assert first.opened is True
+        assert second.opened is True
+
+
+def test_a_write_excludes_a_writer_in_another_session(tmp_path):
+    """The single-writer invariant survives the change above: one flock, taken
+    for the duration of a write rather than the duration of the process."""
+    with open_session(tmp_path) as first, open_session(tmp_path) as second:
+        second.lock_timeout = 0.05
+        with first.write_lock():
+            with pytest.raises(VaultLockedError, match="already open"):
+                with second.write_lock():
+                    pass
+
+
+def test_a_finished_write_releases_the_lock(tmp_path):
+    """The mirror of the test above: exclusion that outlives the write is the
+    process-lifetime lock again, wearing a different name."""
+    with open_session(tmp_path) as first, open_session(tmp_path) as second:
+        second.lock_timeout = 0.05
+        with first.write_lock():
+            pass
+        with second.write_lock():
+            assert second.opened is True
+
+
+def test_an_operation_excludes_a_writer_in_another_session(tmp_path):
+    """`operation()` is the framing every mutating tool goes through, so it is
+    what must take the lock; a `write_lock()` nobody calls protects nothing."""
+    with open_session(tmp_path) as first, open_session(tmp_path) as second:
+        second.lock_timeout = 0.05
+        with first.operation({"tool": "test"}):
+            with pytest.raises(VaultLockedError, match="already open"):
+                with second.operation({"tool": "test"}):
+                    pass
+
+
+def test_a_write_refused_for_the_lock_leaves_no_pending_operation(tmp_path):
+    """The lock is taken before the op log is written. Taking it after would
+    make every contended write look like a crashed one, and the next open
+    would replay it."""
+    with open_session(tmp_path) as first, open_session(tmp_path) as second:
+        second.lock_timeout = 0.05
+        with first.write_lock():
+            with pytest.raises(VaultLockedError):
+                with second.operation({"tool": "test"}):
+                    pass
+        assert second.oplog.pending() == []
+
+
+def test_nested_write_locks_stay_held_until_the_outermost_exits(tmp_path):
+    """`resync()` locks and is itself called from inside `operation()` (see
+    tools.py). A non-reentrant lock would have the inner exit unlock the
+    vault while the outer write is still running."""
+    with open_session(tmp_path) as first, open_session(tmp_path) as second:
+        second.lock_timeout = 0.05
+        with first.write_lock():
+            with first.write_lock():
+                pass
+            with pytest.raises(VaultLockedError, match="already open"):
+                with second.write_lock():
+                    pass
+
+
+def test_a_write_in_one_session_is_visible_in_another(tmp_path):
+    """Two live sessions share Tier 1 files and the one Tier 3 cache file, so
+    a capture saved by one is readable by the other with no reopen."""
+    from mindpalace.tools import read, save_capture
+
+    with open_session(tmp_path) as writer, open_session(tmp_path) as reader:
+        capture = save_capture(writer, "Something worth remembering.")
+        assert read(reader, capture["id"])["id"] == capture["id"]
+
+
+def test_closing_a_session_leaves_another_sessions_lock_armed(tmp_path):
+    """`close()` used to `unlink` the lock file. A session still holding a
+    flock on the now-unlinked inode does not exclude a newcomer, which creates
+    a fresh file at the same path and locks that instead: two writers, each
+    believing it is exclusive."""
+    holder = open_session(tmp_path).open()
+    closer = open_session(tmp_path).open()
+    late = open_session(tmp_path).open()
+    late.lock_timeout = 0.05
+    try:
+        with holder.write_lock():
+            closer.close()
+            with pytest.raises(VaultLockedError, match="already open"):
+                with late.write_lock():
+                    pass
+    finally:
+        late.close()
+        holder.close()
+
+
+def test_a_vault_with_nothing_to_heal_opens_while_another_session_writes(tmp_path):
+    """`heal()` runs on every open. Taking the write lock before checking
+    whether there is anything to heal puts every new session behind whatever
+    the other one is doing -- and a `rebuild` outlasting the timeout would
+    fail the open outright, which is the startup failure this whole change
+    exists to remove."""
+    with open_session(tmp_path) as writer:
+        with writer.write_lock():
+            with Session(
+                tmp_path, embedder=StubEmbedder(), lock_timeout=0.05
+            ) as opened:
+                assert opened.opened is True
+                assert opened.heal() is False
+
+
+def test_a_lock_error_that_is_not_contention_is_not_reported_as_contention(tmp_path):
+    """Only `EWOULDBLOCK` means "someone else is writing". Retrying anything
+    else until the timeout spends 60s to raise a `VaultLockedError` naming an
+    innocent pid, hiding the real fault (a closed descriptor, say)."""
+    import errno
+    import fcntl
+
     with open_session(tmp_path) as session:
-        assert session.paths.lock.exists()
+        def refuse(_fd, _op):
+            raise OSError(errno.EBADF, "bad file descriptor")
+
+        original = fcntl.flock
+        fcntl.flock = refuse
+        try:
+            with pytest.raises(OSError) as caught:
+                with session.write_lock():
+                    pass
+        finally:
+            fcntl.flock = original
+
+    assert caught.value.errno == errno.EBADF
+    assert not isinstance(caught.value, VaultLockedError)
 
 
-def test_stale_lock_from_a_dead_process_is_reclaimed(tmp_path):
-    """flock is released by the kernel when the holder dies, so a leftover pid
-    file never blocks a restart."""
+def test_a_stale_pid_in_the_lock_file_does_not_block_a_write(tmp_path):
+    """flock is released by the kernel when the holder dies, so the recorded
+    pid is diagnostics only and a leftover one never blocks a write."""
     with open_session(tmp_path) as session:
         lock_path = session.paths.lock
     lock_path.write_text("999999")  # pid that cannot be running
     with open_session(tmp_path) as session:
-        assert session.paths.lock.read_text() != "999999"
+        with session.write_lock():
+            assert lock_path.read_text().strip() == str(os.getpid())
 
 
 def test_changing_the_embedder_rebuilds_the_cache(tmp_path):
@@ -99,27 +233,56 @@ def test_heal_reports_whether_it_did_work(tmp_path):
         assert session.heal() is False  # nothing pending, no drift
 
 
-def test_a_failed_open_does_not_leak_the_lock(tmp_path):
-    """If a step after the lock is taken raises (e.g. the configured embedder
-    can't be constructed), the lock must be released -- otherwise a vault that
-    failed to open once can never be opened again in the same process."""
+def break_the_embedder_config(tmp_path):
+    """Leave the vault scaffolded but unopenable: `cloud` is a configured
+    embedder kind that deliberately refuses to construct."""
+    with open_session(tmp_path):
+        pass
+
+    md = session_paths_mindpalace_md(tmp_path)
+    md.write_text(
+        md.read_text().replace(
+            "embedder: {kind: local, model: BAAI/bge-small-en-v1.5}",
+            "embedder: {kind: cloud}",
+        )
+    )
+
+
+def test_a_failed_open_leaves_the_vault_openable(tmp_path):
+    """If a step after the lock file is opened raises (e.g. the configured
+    embedder can't be constructed), the half-built session must not hold
+    anything a later, good open would trip over."""
     from mindpalace.embed import EmbedderError
 
-    with open_session(tmp_path):
-        pass  # scaffold the vault
-
-    text = session_paths_mindpalace_md(tmp_path).read_text()
-    session_paths_mindpalace_md(tmp_path).write_text(
-        text.replace("embedder: {kind: local, model: BAAI/bge-small-en-v1.5}",
-                     "embedder: {kind: cloud}")
-    )
+    break_the_embedder_config(tmp_path)
 
     with pytest.raises(EmbedderError):
         Session(tmp_path).open()  # no explicit embedder -> uses the broken config
 
-    # The lock must have been released despite the failure above.
     with open_session(tmp_path) as session:
         assert session.opened is True
+
+
+def test_a_failed_open_does_not_leak_a_descriptor(tmp_path):
+    """The lock file is opened before the steps that can fail, and a server
+    that retries a bad open (or a long-lived process opening several vaults)
+    would otherwise run out of descriptors."""
+    from mindpalace.embed import EmbedderError
+
+    break_the_embedder_config(tmp_path)
+
+    def open_descriptor_count():
+        return len(os.listdir("/dev/fd"))
+
+    with pytest.raises(EmbedderError):
+        Session(tmp_path).open()  # warm up: first failure may cache imports
+    before = open_descriptor_count()
+
+    for _ in range(5):
+        with pytest.raises(EmbedderError):
+            Session(tmp_path).open()
+
+    assert open_descriptor_count() == before
 
 
 def session_paths_mindpalace_md(root):

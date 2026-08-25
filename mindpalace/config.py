@@ -182,8 +182,17 @@ def open_vault(root: Path, *, init: bool = False) -> tuple[VaultPaths, Config]:
     if paths.mindpalace_md.exists():
         return paths, load_config(paths.mindpalace_md)
 
-    # Check non-emptiness first to tailor the error message
-    is_empty = not root.exists() or not any(root.iterdir())
+    # Check non-emptiness first to tailor the error message. "Empty" ignores
+    # the directories scaffolding itself creates: several servers can start on
+    # one brand-new vault at once, and the one that loses the race would
+    # otherwise mistake the winner's half-built `captures/`, `.graph/`, ... for
+    # a foreign directory and refuse. Their names are all this ignores -- a
+    # single unrelated file still means the vault is somebody else's.
+    ours = {directory.name for directory in paths.all_directories()}
+    ours.add(paths.index_md.name)
+    is_empty = not root.exists() or all(
+        entry.name in ours for entry in root.iterdir()
+    )
 
     if not init:
         if is_empty:

@@ -256,3 +256,32 @@ def test_open_vault_error_message_tailored_for_empty_dir_without_init(tmp_path):
     message = str(excinfo.value)
     assert "no MINDPALACE.md" in message
     assert "is not empty" not in message
+
+
+def test_init_scaffolds_over_another_sessions_half_built_vault(tmp_path):
+    """Several servers may start on a brand-new vault at once, and they now
+    all get as far as scaffolding it. The loser used to see the winner's
+    freshly created `captures/`, `.graph/`, ... , conclude the directory was
+    somebody else's, and refuse to --init -- so the very first launch of a new
+    vault could still fail a session. Directories scaffolding itself creates
+    are ours, not evidence of a foreign directory."""
+    from mindpalace.vault.paths import VaultPaths
+
+    for directory in VaultPaths(tmp_path).all_directories():
+        directory.mkdir(parents=True, exist_ok=True)
+
+    paths, config = open_vault(tmp_path, init=True)
+
+    assert paths.mindpalace_md.exists()
+    assert config.schema_version == 1
+
+
+def test_init_still_refuses_a_directory_with_unrelated_content(tmp_path):
+    """The loosening above must not extend to anything that is not ours: the
+    guard exists so `--vault ~/Documents` cannot be scaffolded over."""
+    (tmp_path / "captures").mkdir()
+    (tmp_path / "tax-returns.pdf").write_text("not mine")
+
+    with pytest.raises(ConfigError) as excinfo:
+        open_vault(tmp_path, init=True)
+    assert "refusing to --init" in str(excinfo.value)

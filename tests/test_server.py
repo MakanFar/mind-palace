@@ -1,5 +1,7 @@
 import asyncio
 import json
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -47,6 +49,22 @@ def test_every_tool_has_a_description(session):
     server = build_server(session)
     for tool in asyncio.run(server.list_tools()):
         assert tool.description, f"{tool.name} has no description"
+
+
+def test_importing_the_server_does_not_import_graspologic():
+    """Startup cost is a correctness problem, not a nicety: an MCP client
+    gives the server a fixed window (30s in Claude Code) to answer
+    `initialize`, and `import mindpalace.server` spent ~12s of it, ~7s of
+    that in graspologic -> umap -> pynndescent -> numba. Clustering is one
+    tool out of fifteen and most sessions never call it, so that import
+    belongs at first use. A subprocess, because pytest has already imported
+    half the world.
+    """
+    probe = "import sys, mindpalace.server; print('graspologic' in sys.modules)"
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "False"
 
 
 def test_main_requires_a_vault_argument(capsys):
