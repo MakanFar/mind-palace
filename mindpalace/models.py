@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
 
 from mindpalace.frontmatter import parse, render
 
@@ -104,6 +105,37 @@ class Decision:
     reason: str | None = None
 
 
+def _timestamp(value: object, record_id: object) -> str:
+    """Normalise a front-matter `created` value to the canonical string.
+
+    YAML parses an unquoted ISO timestamp into a `datetime` -- which is what
+    a human hand-editing a note in Obsidian naturally writes. `created` is
+    declared `str` and is sorted against other notes' values, so letting a
+    datetime through raised `TypeError: '<' not supported between 'str' and
+    'datetime.datetime'` inside `fold`. That is not a `FoldError`, so the
+    quarantine pass never caught it and one hand-edited file took the whole
+    vault's sync down -- exactly what spec §10 forbids.
+
+    So: accept it and canonicalise, rather than reject. The value means the
+    right thing; only its type is wrong. Anything that is not a timestamp at
+    all still raises, and `_load_notes` degrades that file into a
+    `malformed_note` issue the same as any other parse failure.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        # Match `tools._stamp`: UTC with a "Z", never "+00:00". These strings
+        # are compared lexicographically across notes, and the two spellings
+        # of the same instant do not sort equal.
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    raise TypeError(
+        f"{record_id!r}: created must be a timestamp, got "
+        f"{type(value).__name__!r} ({value!r})"
+    )
+
+
 def capture_to_markdown(capture: Capture) -> str:
     data = {"id": capture.id, "created": capture.created, "source": capture.source}
     if capture.why is not None:
@@ -115,7 +147,7 @@ def capture_from_markdown(text: str) -> Capture:
     data, body = parse(text)
     return Capture(
         id=data["id"],
-        created=data["created"],
+        created=_timestamp(data["created"], data.get("id")),
         source=data["source"],
         why=data.get("why"),
         text=body.rstrip("\n"),
@@ -158,7 +190,7 @@ def note_from_markdown(text: str) -> Note:
     return Note(
         id=data["id"],
         derived_from=data.get("derived_from"),
-        created=data["created"],
+        created=_timestamp(data["created"], data.get("id")),
         author=data["author"],
         body=body.rstrip("\n"),
         entities=tuple(

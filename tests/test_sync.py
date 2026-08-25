@@ -5,6 +5,7 @@ from mindpalace.embed import StubEmbedder
 from mindpalace.graph.fold import UnknownEdgeTypeError
 from mindpalace.index import db
 from mindpalace.index import sync as sync_module
+from mindpalace.ids import slugify
 from mindpalace.index.sync import has_drift, sync
 from mindpalace.models import (
     Capture,
@@ -552,3 +553,165 @@ def test_has_drift_detects_an_edit_to_a_community_report(conn, vault, config):
     report_path = next(store.paths.communities.glob("*.md"))
     report_path.write_text(report_path.read_text() + "\nEdited in Obsidian.\n")
     assert has_drift(conn, store) is True
+
+
+def test_near_duplicate_entities_are_reported_as_a_vault_issue(conn, vault, config):
+    """Spec §10 defers automatic near-duplicate detection to a Phase-1 lint.
+
+    Detection only: the pair is surfaced through `review_queue` for a human
+    to reconcile, never merged (spec §8.5).
+    """
+    _, store = vault
+    add_note(store, "n_01", "openai")
+    add_note(store, "n_02", "openai inc")
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    matches = [issue for issue in report.issues if issue[1] == "near_duplicate_entity"]
+    assert len(matches) == 1
+    _, _, detail = matches[0]
+    assert "openai" in detail and "openai-inc" in detail
+    stored = conn.execute(
+        "SELECT COUNT(*) FROM vault_issues WHERE kind = 'near_duplicate_entity'"
+    ).fetchone()[0]
+    assert stored == 1
+
+
+def test_a_near_duplicate_already_declared_as_an_alias_is_not_reported(
+    conn, vault, config
+):
+    """Once reconciled by hand the lint must go quiet, or it trains its
+    reader to ignore it. Catches `sync` folding the graph without passing
+    the entity pages' declared aliases through to the lint.
+    """
+    _, store = vault
+    add_note(store, "n_01", "openai")
+    add_note(store, "n_02", "openai inc")
+    store.write_entity_page(
+        EntityPage(
+            slug="openai",
+            type="concept",
+            description="",
+            user={"aliases": ["openai inc"]},
+        )
+    )
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    assert not any(issue[1] == "near_duplicate_entity" for issue in report.issues)
+
+
+def typed_note(store, note_id, name, entity_type, *, relationships=()):
+    """`add_note` hardcodes a valid type; these tests need a chosen one."""
+    note = Note(
+        id=note_id,
+        derived_from=f"c_{note_id[2:]}",
+        created="2026-08-01T00:00:00Z",
+        author="llm",
+        body=f"Analysis about {name}.",
+        entities=(EntityInstance(name, entity_type, "A thing."),),
+        relationship_assertions=tuple(relationships),
+    )
+    store.write_note(note, slugify(name))
+    return note
+
+
+def test_an_entity_type_absent_from_config_is_reported_as_a_vault_issue(
+    conn, vault, config
+):
+    """`fold` accepts any string in `entities.type`; only `write_note`
+    validates, and only for notes it wrote. A hand-edited note gets no
+    check at all today.
+    """
+    _, store = vault
+    typed_note(store, "n_01", "scaling", "concpet")
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    matches = [issue for issue in report.issues if issue[1] == "unknown_entity_type"]
+    assert len(matches) == 1
+    path, _, detail = matches[0]
+    assert "scaling" in path
+    assert "concpet" in detail
+    stored = conn.execute(
+        "SELECT COUNT(*) FROM vault_issues WHERE kind = 'unknown_entity_type'"
+    ).fetchone()[0]
+    assert stored == 1
+
+
+def test_an_entity_only_referenced_by_an_assertion_is_reported(conn, vault, config):
+    """`data-exhaustion` enters the graph with the `unknown` sentinel type
+    and no page-worthy declaration behind it.
+    """
+    _, store = vault
+    typed_note(
+        store,
+        "n_01",
+        "scaling",
+        "concept",
+        relationships=(
+            RelationshipAssertion(
+                "x_1", "scaling", "data exhaustion", "contradicts", 8, "because."
+            ),
+        ),
+    )
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    matches = [i for i in report.issues if i[1] == "reference_only_entity"]
+    assert [i[0].endswith("data-exhaustion.md") for i in matches] == [True]
+    assert "data-exhaustion" in matches[0][2]
+
+
+def test_a_type_finding_from_a_quarantined_note_is_not_reported(conn, vault, config):
+    """The note never made it into the graph, so complaining about the type
+    of an entity it declared points the user at a second problem that will
+    disappear the moment they fix the first one.
+    """
+    _, store = vault
+    typed_note(
+        store,
+        "n_01",
+        "scaling",
+        "concpet",
+        relationships=(
+            RelationshipAssertion("x_1", "scaling", "other", "nonesuch", 8, "because."),
+        ),
+    )
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    assert any(issue[1] == "unknown_edge_type" for issue in report.issues)
+    assert not any(issue[1] == "unknown_entity_type" for issue in report.issues)
+
+
+def test_a_hand_edited_note_with_an_unquoted_timestamp_still_syncs(conn, vault, config):
+    """Spec §10: one bad file must never render the vault unusable.
+
+    An unquoted `created:` is valid YAML for a datetime, so this file used
+    to reach `fold` with a datetime among strings and take the whole sync
+    down with a TypeError -- which is not a FoldError, so the quarantine
+    pass could not catch it either.
+    """
+    _, store = vault
+    add_note(store, "n_01", "scaling-laws")
+    (store.paths.notes / "handwritten.md").write_text(
+        "---\n"
+        "id: n_zz\n"
+        "created: 2026-08-02T00:00:00Z\n"
+        "author: human\n"
+        "entities:\n"
+        "  - name: Data Exhaustion\n"
+        "    type: concept\n"
+        "    description: A limit.\n"
+        "---\n"
+        "\n"
+        "Hand-written in Obsidian.\n"
+    )
+
+    report = sync(conn, store, config, StubEmbedder(), {})
+
+    assert report.notes == 2
+    assert not any(issue[1] == "malformed_note" for issue in report.issues)
+    slugs = {row[0] for row in conn.execute("SELECT slug FROM entities")}
+    assert "data-exhaustion" in slugs

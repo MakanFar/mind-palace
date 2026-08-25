@@ -17,6 +17,8 @@ from mindpalace.graph.fold import (
     UnknownEdgeTypeError,
     fold,
 )
+from mindpalace.graph.duplicates import propose_near_duplicates
+from mindpalace.graph.integrity import check_entity_types
 from mindpalace.ids import slugify
 from mindpalace.index import db, vectors
 from mindpalace.models import Capture, Note, capture_from_markdown, note_from_markdown
@@ -336,6 +338,67 @@ def _ambiguous_alias_issues(
     return issues
 
 
+def _near_duplicate_issues(
+    store: VaultStore, tables: GraphTables, entity_pages: list
+) -> list[tuple[str, str, str]]:
+    """The Phase-1 near-duplicate lint (spec §10), surfaced like every other
+    deferred-cleanup finding: reported through `review_queue`, never acted on.
+    Spec §8.5 forbids merging identities, so the remedy is always a human
+    adding one slug to the other's `user.aliases` -- which is exactly what
+    `declared_aliases` then suppresses on the next sync.
+    """
+    declared: dict[str, set[str]] = {}
+    for page in entity_pages:
+        user = page.user if isinstance(page.user, dict) else {}
+        declared[page.slug] = {slugify(a) for a in user.get("aliases", [])}
+
+    issues: list[tuple[str, str, str]] = []
+    for pair in propose_near_duplicates(tables, declared):
+        paths = ", ".join(
+            _relative(store, store.paths.entity_path(slug))
+            for slug in (pair.base, pair.superset)
+        )
+        issues.append(
+            (
+                paths,
+                "near_duplicate_entity",
+                f"{pair.base!r} and {pair.superset!r} may be the same entity; "
+                f"if they are, add one to the other's `user.aliases` -- "
+                f"mindpalace does not merge identities for you",
+            )
+        )
+    return issues
+
+
+def _entity_type_issues(
+    store: VaultStore, notes: list[Note], tables: GraphTables, config: Config
+) -> list[tuple[str, str, str]]:
+    """Entity-type integrity findings, reported and never acted on.
+
+    `fold` validates edge types but not entity types, because an edge type
+    drives real behaviour (`is_symmetric`, `cluster_weight`) while an entity
+    type is only a label -- there is nothing `fold` cannot do with a wrong
+    one, so refusing the note would be a harsher remedy than the problem
+    warrants. That leaves the label free to be wrong with no signal at all,
+    which is what these three checks supply.
+
+    `notes` must already have quarantined notes filtered out: a note the
+    graph rejected is a problem the user is being pointed at anyway, and
+    re-reporting its entity types would send them to a second finding that
+    vanishes the moment they fix the first.
+    """
+    issues: list[tuple[str, str, str]] = []
+    for finding in check_entity_types(notes, tables, config):
+        issues.append(
+            (
+                _relative(store, store.paths.entity_path(finding.slug)),
+                finding.kind,
+                finding.detail,
+            )
+        )
+    return issues
+
+
 def _render_index(
     captures: list[Capture], notes: list[Note], tables: GraphTables
 ) -> str:
@@ -404,6 +467,8 @@ def sync(
     for page in entity_pages:
         documents.append((f"e_{page.slug}", "entity", page.slug, page.description))
     issues.extend(_ambiguous_alias_issues(store, entity_pages))
+    issues.extend(_near_duplicate_issues(store, tables, entity_pages))
+    issues.extend(_entity_type_issues(store, folded_notes, tables, config))
 
     reports, report_issues, report_degraded = _load_reports(store)
     issues.extend(report_issues)

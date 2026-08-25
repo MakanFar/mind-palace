@@ -94,3 +94,62 @@ def test_capture_round_trips_without_optional_why():
         text="A bare thought.",
     )
     assert capture_from_markdown(capture_to_markdown(capture)) == capture
+
+
+def test_a_note_whose_created_is_unquoted_yaml_parses_to_the_canonical_string():
+    """`created: 2026-08-02T00:00:00Z` without quotes is valid YAML for a
+    datetime, and a human hand-editing in Obsidian writes it that way. It
+    used to reach `fold` as a datetime and take the sort down with a
+    TypeError -- not a FoldError, so quarantine never saw it and the whole
+    vault failed to sync.
+    """
+    note = note_from_markdown(
+        "---\n"
+        "id: n_zz\n"
+        "created: 2026-08-02T00:00:00Z\n"
+        "author: human\n"
+        "---\n"
+        "\n"
+        "Hand-written.\n"
+    )
+
+    assert note.created == "2026-08-02T00:00:00Z"
+
+
+def test_a_capture_whose_created_is_unquoted_yaml_parses_to_the_canonical_string():
+    """Captures carry the same `created` field written by the same hands."""
+    capture = capture_from_markdown(
+        "---\n"
+        "id: c_zz\n"
+        "created: 2026-08-02T00:00:00Z\n"
+        "source: chat\n"
+        "---\n"
+        "\n"
+        "Pasted.\n"
+    )
+
+    assert capture.created == "2026-08-02T00:00:00Z"
+
+
+def test_a_timestamp_in_another_offset_is_normalised_to_utc():
+    """These strings are ordered lexicographically against each other, so a
+    surviving `+05:00` would sort by wall-clock rather than by instant.
+    """
+    note = note_from_markdown(
+        "---\nid: n_zz\ncreated: 2026-08-02T05:00:00+05:00\nauthor: human\n---\n\nX.\n"
+    )
+
+    assert note.created == "2026-08-02T00:00:00Z"
+
+
+def test_a_created_value_that_is_not_a_timestamp_is_rejected():
+    """Raising is right here where coercing was right above: there is no
+    correct reading of the value. `_load_notes` catches it and records a
+    `malformed_note` issue, so the file degrades rather than the vault.
+    """
+    import pytest
+
+    with pytest.raises(TypeError, match="must be a timestamp"):
+        note_from_markdown(
+            "---\nid: n_zz\ncreated: 12345\nauthor: human\n---\n\nX.\n"
+        )
