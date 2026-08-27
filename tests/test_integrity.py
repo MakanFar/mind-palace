@@ -236,3 +236,25 @@ def test_each_kind_names_its_notes_with_the_right_verb(config):
     assert "declared in n_1, n_2" in detail["conflicting_entity_type"]
     assert "referenced by n_1" in detail["reference_only_entity"]
     assert "declared" not in detail["reference_only_entity"]
+
+
+def test_an_entity_declared_with_a_configured_unknown_type_is_not_reference_only():
+    """`touch` stores the string `unknown` for an entity no note extracted.
+
+    Nothing stops a vault from configuring `unknown` as a real entity type,
+    and then that sentinel is indistinguishable from a deliberate
+    declaration. So the reference-only check must be derived from what the
+    notes declare; reading the stored type would report an entity the user
+    extracted on purpose.
+    """
+    config = Config(
+        schema_version=1,
+        entity_types=["unknown"],
+        edge_types={"supports": EdgeType("supports", directed=True, cluster_weight=1.0)},
+        thresholds=Thresholds(150, 2.0, 0.35, 0.5),
+        embedder={"kind": "stub"},
+        templates={},
+    )
+    notes = [note("n_1", "2026-01-01", entities=[("Scaling", "unknown")])]
+
+    assert check(notes, config) == []
