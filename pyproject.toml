@@ -1,0 +1,44 @@
+[project]
+name = "mindpalace"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2.0.0",
+    "pyyaml>=6.0",
+    "python-ulid>=2.7",
+    "numpy>=1.26",
+    "fastembed>=0.4",
+    "graspologic>=3.4",
+    "networkx>=3.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+mindpalace = "mindpalace.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not network'"
+markers = ["network: requires network access (model download)"]
+filterwarnings = [
+    # graspologic's inference submodule eagerly imports hyppo (unrelated to
+    # the partition/clustering API this project uses), which still imports a
+    # deprecated scipy.sparse path. Scoped to the exact originating module so
+    # genuine DeprecationWarnings anywhere else stay visible.
+    "ignore::DeprecationWarning:hyppo\\.independence\\.hhg",
+    # numba (a graspologic-native transitive dependency) warns about a
+    # keyword it now defaults to True; scoped to the module that issues it.
+    "ignore:.*nopython=False.*:numba.core.errors.NumbaDeprecationWarning:numba\\.core\\.decorators",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["mindpalace"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"mindpalace/templates" = "mindpalace/templates"

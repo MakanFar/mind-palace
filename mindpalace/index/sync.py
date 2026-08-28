@@ -1,0 +1,596 @@
+"""Full rebuild of the Tier 3 cache from Tier 1 sources."""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from mindpalace.atomic import atomic_write, content_hash
+from mindpalace.config import Config
+from mindpalace.embed import Embedder
+from mindpalace.graph.fold import (
+    DuplicateAssertionIdError,
+    GraphTables,
+    UnknownDecisionActionError,
+    UnknownEdgeTypeError,
+    fold,
+)
+from mindpalace.graph.duplicates import propose_near_duplicates
+from mindpalace.graph.integrity import check_entity_types
+from mindpalace.ids import slugify
+from mindpalace.index import db, vectors
+from mindpalace.models import Capture, Note, capture_from_markdown, note_from_markdown
+from mindpalace.vault.store import VaultStore
+
+DOC_KINDS = ("capture", "note", "entity", "report", "unparsed")
+
+
+@dataclass(frozen=True)
+class SyncReport:
+    notes: int
+    captures: int
+    entities: int
+    aggregates: int
+    issues: tuple[tuple[str, str, str], ...] = field(default=())
+
+
+def _relative(store: VaultStore, path: Path) -> str:
+    return str(path.relative_to(store.paths.root))
+
+
+def _iter_source_files(store: VaultStore) -> Iterator[Path]:
+    """Every file the derived cache depends on.
+
+    Includes the decision log and MINDPALACE.md. Both are inputs — decisions
+    determine assertion status, config determines how the fold groups edges — so
+    omitting them means an external edit to either leaves the cache silently
+    stale with nothing able to notice.
+
+    Also includes `entities/` and `communities/`: they are Tier 2 (generated
+    prose, not source truth), but their description/summary text is indexed
+    into `docs`/`vectors` same as a note body, so an Obsidian edit to either
+    -- or a hand-added `user.aliases` -- is a change this cache depends on
+    exactly as much as a note edit is. Omitting them left such an edit
+    invisible to `has_drift`, so `heal()` could never notice it (spec §10).
+    """
+    yield from sorted(store.paths.captures.glob("*.md"))
+    yield from sorted(store.paths.notes.glob("*.md"))
+    yield from sorted(store.paths.entities.glob("*.md"))
+    yield from sorted(store.paths.communities.glob("*.md"))
+    for dependency in (store.paths.decisions_log, store.paths.mindpalace_md):
+        if dependency.exists():
+            yield dependency
+
+
+def _load_notes(
+    store: VaultStore,
+) -> tuple[
+    list[Note],
+    list[tuple[str, str, str]],
+    list[tuple[str, str]],
+    dict[str, tuple[str, str]],
+]:
+    """Parse every note file, degrading rather than raising on failure.
+
+    Returns successfully-parsed notes, issues recorded so far, (path,
+    raw_text) pairs for files that failed to parse at all, and a note_id ->
+    (path, raw_text) map for every note that DID parse -- kept around so
+    that a note `fold` later rejects (see `_fold_with_quarantine`) can still
+    be indexed as a degraded document by its path, without re-reading the
+    file from disk.
+    """
+    notes: list[Note] = []
+    issues: list[tuple[str, str, str]] = []
+    degraded: list[tuple[str, str]] = []
+    note_sources: dict[str, tuple[str, str]] = {}
+
+    for path in sorted(store.paths.notes.glob("*.md")):
+        raw = path.read_text(encoding="utf-8")
+        try:
+            note = note_from_markdown(raw)
+        except Exception as exc:
+            issues.append((_relative(store, path), "malformed_note", str(exc)))
+            degraded.append((_relative(store, path), raw))
+            continue
+        notes.append(note)
+        note_sources[note.id] = (_relative(store, path), raw)
+
+    return notes, issues, degraded, note_sources
+
+
+def _load_sources(
+    store: VaultStore,
+) -> tuple[
+    list[Capture],
+    list[Note],
+    list[tuple[str, str, str]],
+    list[tuple[str, str]],
+    dict[str, tuple[str, str]],
+]:
+    """Parse every Tier 1 source file, degrading rather than dropping on
+    failure. See `_load_notes` for the notes half of this."""
+    captures: list[Capture] = []
+    issues: list[tuple[str, str, str]] = []
+    degraded: list[tuple[str, str]] = []
+
+    for path in sorted(store.paths.captures.glob("*.md")):
+        raw = path.read_text(encoding="utf-8")
+        try:
+            captures.append(capture_from_markdown(raw))
+        except Exception as exc:
+            issues.append((_relative(store, path), "malformed_capture", str(exc)))
+            degraded.append((_relative(store, path), raw))
+
+    notes, note_issues, note_degraded, note_sources = _load_notes(store)
+    issues.extend(note_issues)
+    degraded.extend(note_degraded)
+
+    return captures, notes, issues, degraded, note_sources
+
+
+def _load_entity_pages(
+    store: VaultStore,
+) -> tuple[list, list[tuple[str, str, str]], list[tuple[str, str]]]:
+    """Parse every entity page, degrading rather than raising on failure --
+    the Tier 2 counterpart of `_load_notes` (spec §10: one bad file must
+    never render the vault unusable, and that applies to hand-edited Tier 2
+    exactly as it does to Tier 1). `VaultStore.iter_entity_pages` already
+    skips a page it cannot parse; this wraps the same read but also records
+    *which* file was skipped, as a `vault_issue`, and keeps its raw text
+    around so it can still be indexed as an `unparsed` document.
+    """
+    pages = []
+    issues: list[tuple[str, str, str]] = []
+    degraded: list[tuple[str, str]] = []
+    for path in sorted(store.paths.entities.glob("*.md")):
+        try:
+            page = store.read_entity_page(path.stem)
+        except Exception as exc:
+            issues.append((_relative(store, path), "malformed_entity_page", str(exc)))
+            degraded.append((_relative(store, path), path.read_text(encoding="utf-8")))
+            continue
+        if page is not None:
+            pages.append(page)
+    return pages, issues, degraded
+
+
+def _load_reports(
+    store: VaultStore,
+) -> tuple[list, list[tuple[str, str, str]], list[tuple[str, str]]]:
+    """The community-report counterpart of `_load_entity_pages`."""
+    reports = []
+    issues: list[tuple[str, str, str]] = []
+    degraded: list[tuple[str, str]] = []
+    for path in sorted(store.paths.communities.glob("*.md")):
+        try:
+            report = store.read_report(path.stem)
+        except Exception as exc:
+            issues.append((_relative(store, path), "malformed_report", str(exc)))
+            degraded.append((_relative(store, path), path.read_text(encoding="utf-8")))
+            continue
+        if report is not None:
+            reports.append(report)
+    return reports, issues, degraded
+
+
+def _fold_with_quarantine(
+    notes: list[Note],
+    statuses: dict[str, str],
+    config: Config,
+    issues: list[tuple[str, str, str]],
+    note_paths: dict[str, str],
+) -> tuple[GraphTables, set[str]]:
+    """Fold, quarantining and retrying on a typed `FoldError` instead of
+    letting it propagate out of `sync`.
+
+    `fold` (Task 9) now raises rather than silently misbehaving on a
+    malformed source set. That is exactly right for `fold`'s own contract,
+    but wrong for `sync`: spec §10 requires one bad note can never take the
+    whole cache rebuild -- and therefore the whole vault -- down. So `sync`
+    must not call `fold` bare. Instead: try, and on a recognised error,
+    remove the offending note (or status-log entry) from the candidate set
+    and retry, recording a `vault_issue` for what was excluded.
+
+    Mutates `issues` in place. Returns the tables folded from whatever
+    remained after quarantine, plus the set of note ids that got excluded
+    so the caller can still index them as degraded FTS documents (a note
+    the graph rejected must stay findable so the user can go fix it).
+    """
+    candidates: dict[str, Note] = {note.id: note for note in notes}
+    # Never mutate the caller's statuses dict -- it may be reused elsewhere
+    # (e.g. re-synced after a fix) and quarantine is a `sync`-local decision.
+    status_map = dict(statuses)
+    excluded: set[str] = set()
+
+    # Each accepted iteration strictly shrinks len(candidates) + len(status_map)
+    # by at least one, so this many attempts is always enough for a set of
+    # exceptions that shrink correctly. A future exception type (or a bug)
+    # that doesn't shrink on would otherwise spin forever; bound it instead.
+    max_iterations = len(notes) + len(statuses) + 1
+
+    for _ in range(max_iterations):
+        try:
+            return fold(candidates.values(), status_map, config), excluded
+        except UnknownEdgeTypeError as exc:
+            path = note_paths.get(exc.note_id, f"notes/{exc.note_id}")
+            issues.append(
+                (
+                    path,
+                    "unknown_edge_type",
+                    f"edge type {exc.edge_type!r} is not declared in "
+                    f"MINDPALACE.md (assertion {exc.assertion_id})",
+                )
+            )
+            excluded.add(exc.note_id)
+            candidates.pop(exc.note_id, None)
+        except DuplicateAssertionIdError as exc:
+            keep, *rest = exc.note_ids
+            for note_id in rest:
+                path = note_paths.get(note_id, f"notes/{note_id}")
+                issues.append(
+                    (
+                        path,
+                        "duplicate_assertion_id",
+                        f"assertion {exc.assertion_id!r} collides with the one "
+                        f"already recorded from note {keep!r}",
+                    )
+                )
+                excluded.add(note_id)
+                candidates.pop(note_id, None)
+        except UnknownDecisionActionError as exc:
+            issues.append(
+                (
+                    ".mindpalace/decisions.jsonl",
+                    "unknown_decision_action",
+                    f"action {exc.action!r} is not recognised "
+                    f"(assertion {exc.assertion_id})",
+                )
+            )
+            status_map = {
+                item_id: action
+                for item_id, action in status_map.items()
+                if item_id != exc.assertion_id
+            }
+
+    raise RuntimeError(
+        f"fold quarantine loop exceeded its iteration cap ({max_iterations}) "
+        "without converging -- a FoldError subtype is being raised for "
+        "something the loop cannot shrink on. This is an internal bug, not "
+        "a vault problem."
+    )
+
+
+def fold_notes_with_quarantine(
+    store: VaultStore, config: Config, statuses: dict[str, str]
+) -> tuple[list[Note], dict[str, Note], GraphTables, list[tuple[str, str, str]]]:
+    """Parse and fold every note currently on disk, quarantining anything
+    `fold` rejects instead of raising.
+
+    This is the ONE shared entry point every caller that needs the folded
+    graph must use -- not `fold` directly. `rebuild()` and `tools._tables()`
+    both used to call `fold(notes, statuses, config)` bare, which defeats
+    `sync`'s quarantine: a note with a typo'd edge type (or a duplicate
+    assertion id from a git merge, or an edge type MINDPALACE.md stopped
+    declaring) makes `fold` raise a typed `FoldError`, and a bare call lets
+    that propagate straight out of `write_note`, `propose_relationship`,
+    `resolve_assertion`, `rebuild`, `cluster`, `write_entity_description`,
+    and `write_community_report` -- the entire write surface goes dead over
+    one bad note, which is exactly what spec §10 says must never happen.
+
+    Returns the notes that survived quarantine, a note_id -> Note map of the
+    same, the folded tables, and every issue recorded along the way
+    (including a raw parse failure -- reused from `_load_notes` -- so a note
+    that isn't even valid YAML is quarantined the same way as one `fold`
+    itself rejects).
+    """
+    notes, issues, _degraded, note_sources = _load_notes(store)
+    note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
+    tables, excluded = _fold_with_quarantine(notes, statuses, config, issues, note_paths)
+    folded_notes = [note for note in notes if note.id not in excluded]
+    notes_by_id = {note.id: note for note in folded_notes}
+    return folded_notes, notes_by_id, tables, issues
+
+
+def _first_line(text: str) -> str:
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()[:120]
+    return ""
+
+
+def _ambiguous_alias_issues(
+    store: VaultStore, entity_pages: list
+) -> list[tuple[str, str, str]]:
+    """Two entities claiming the same alias is a vault_issue (spec §8.5),
+    never silently resolved in favour of one -- aliases explicitly do not
+    merge identities. `_resolve_slug` (mindpalace/tools.py) raises on lookup
+    when it hits one of these live; this is the same collision surfaced
+    proactively through `review_queue` so it can be noticed and fixed even
+    before anyone happens to look the ambiguous name up.
+    """
+    owners: dict[str, list[str]] = {}
+    for page in entity_pages:
+        # Dedupe per page before recording a claim: a page listing the same
+        # alias twice (or the same alias in two different cases -- both
+        # normalise to the same slug) must count as one claim, not two, or
+        # it self-collides and gets reported as ambiguous against itself.
+        for alias in {slugify(a) for a in page.user.get("aliases", [])}:
+            owners.setdefault(alias, []).append(page.slug)
+
+    issues: list[tuple[str, str, str]] = []
+    for alias, slugs in sorted(owners.items()):
+        if len(slugs) <= 1:
+            continue
+        claimants = sorted(set(slugs))
+        paths = ", ".join(
+            _relative(store, store.paths.entity_path(slug)) for slug in claimants
+        )
+        issues.append(
+            (
+                paths,
+                "ambiguous_alias",
+                f"alias {alias!r} is claimed by more than one entity: "
+                f"{claimants}; aliases do not merge identities",
+            )
+        )
+    return issues
+
+
+def _near_duplicate_issues(
+    store: VaultStore, tables: GraphTables, entity_pages: list
+) -> list[tuple[str, str, str]]:
+    """The Phase-1 near-duplicate lint (spec §10), surfaced like every other
+    deferred-cleanup finding: reported through `review_queue`, never acted on.
+    Spec §8.5 forbids merging identities, so the remedy is always a human
+    adding one slug to the other's `user.aliases` -- which is exactly what
+    `declared_aliases` then suppresses on the next sync.
+    """
+    declared: dict[str, set[str]] = {}
+    for page in entity_pages:
+        user = page.user if isinstance(page.user, dict) else {}
+        declared[page.slug] = {slugify(a) for a in user.get("aliases", [])}
+
+    issues: list[tuple[str, str, str]] = []
+    for pair in propose_near_duplicates(tables, declared):
+        paths = ", ".join(
+            _relative(store, store.paths.entity_path(slug))
+            for slug in (pair.base, pair.superset)
+        )
+        issues.append(
+            (
+                paths,
+                "near_duplicate_entity",
+                f"{pair.base!r} and {pair.superset!r} may be the same entity; "
+                f"if they are, add one to the other's `user.aliases` -- "
+                f"mindpalace does not merge identities for you",
+            )
+        )
+    return issues
+
+
+def _entity_type_issues(
+    store: VaultStore, notes: list[Note], tables: GraphTables, config: Config
+) -> list[tuple[str, str, str]]:
+    """Entity-type integrity findings, reported and never acted on.
+
+    `fold` validates edge types but not entity types, because an edge type
+    drives real behaviour (`is_symmetric`, `cluster_weight`) while an entity
+    type is only a label -- there is nothing `fold` cannot do with a wrong
+    one, so refusing the note would be a harsher remedy than the problem
+    warrants. That leaves the label free to be wrong with no signal at all,
+    which is what these three checks supply.
+
+    `notes` must already have quarantined notes filtered out: a note the
+    graph rejected is a problem the user is being pointed at anyway, and
+    re-reporting its entity types would send them to a second finding that
+    vanishes the moment they fix the first.
+    """
+    issues: list[tuple[str, str, str]] = []
+    for finding in check_entity_types(notes, tables, config):
+        issues.append(
+            (
+                _relative(store, store.paths.entity_path(finding.slug)),
+                finding.kind,
+                finding.detail,
+            )
+        )
+    return issues
+
+
+def _render_index(
+    captures: list[Capture], notes: list[Note], tables: GraphTables
+) -> str:
+    """The human- and Obsidian-readable catalog promised by spec §4.5."""
+    lines = [
+        "# Index",
+        "",
+        f"{len(captures)} captures · {len(notes)} notes · "
+        f"{len(tables.entities)} entities",
+        "",
+        "## Notes",
+        "",
+    ]
+    for note in sorted(notes, key=lambda item: (item.created, item.id)):
+        lines.append(f"- `{note.id}` {note.created[:10]} — {_first_line(note.body)}")
+    lines += ["", "## Entities", ""]
+    for entity in sorted(
+        tables.entities.values(), key=lambda item: (-item.rank, item.slug)
+    ):
+        lines.append(f"- [[{entity.slug}]] — {entity.type}, rank {entity.rank}")
+    return "\n".join(lines) + "\n"
+
+
+def sync(
+    conn: sqlite3.Connection,
+    store: VaultStore,
+    config: Config,
+    embedder: Embedder,
+    statuses: dict[str, str],
+) -> SyncReport:
+    captures, notes, issues, degraded, note_sources = _load_sources(store)
+
+    note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
+    tables, excluded_notes = _fold_with_quarantine(
+        notes, statuses, config, issues, note_paths
+    )
+
+    # A note the graph rejected (unknown edge type, duplicate assertion id)
+    # must still be findable so the user can go fix it -- spec §10 applies
+    # to graph-level rejections exactly as it does to parse failures.
+    folded_notes = [note for note in notes if note.id not in excluded_notes]
+    for note_id in excluded_notes:
+        degraded.append(note_sources[note_id])
+
+    documents: list[tuple[str, str, str, str]] = []
+    for capture in captures:
+        documents.append((capture.id, "capture", _first_line(capture.text), capture.text))
+    for note in folded_notes:
+        # Assertion descriptions ride along in the note's searchable text rather
+        # than becoming their own documents: they must be findable (spec §8.1)
+        # but an `x_` id is not something `read` can return.
+        assertion_text = " ".join(
+            a.description for a in note.relationship_assertions
+        )
+        claim_text = " ".join(c.text for c in note.claim_assertions)
+        searchable = "\n".join(filter(None, [note.body, assertion_text, claim_text]))
+        documents.append((note.id, "note", _first_line(note.body), searchable))
+    # Tier 2 gets the same degrade-and-record treatment as Tier 1 notes: a
+    # page that fails to parse is skipped, recorded as a vault_issue, and
+    # kept searchable via `degraded` rather than taking `sync` down (spec
+    # §10 applies to a hand-edited entity page exactly as it does to a
+    # hand-edited note).
+    entity_pages, entity_issues, entity_degraded = _load_entity_pages(store)
+    issues.extend(entity_issues)
+    degraded.extend(entity_degraded)
+    for page in entity_pages:
+        documents.append((f"e_{page.slug}", "entity", page.slug, page.description))
+    issues.extend(_ambiguous_alias_issues(store, entity_pages))
+    issues.extend(_near_duplicate_issues(store, tables, entity_pages))
+    issues.extend(_entity_type_issues(store, folded_notes, tables, config))
+
+    reports, report_issues, report_degraded = _load_reports(store)
+    issues.extend(report_issues)
+    degraded.extend(report_degraded)
+    for report in reports:
+        documents.append(
+            (report.lineage_id, "report", report.title, f"{report.summary}\n{report.findings}")
+        )
+    # A file we cannot parse -- or a note the graph rejected -- is still
+    # findable, not vanished. Keyed by path, since it has no usable id.
+    for relative_path, raw in degraded:
+        documents.append((relative_path, "unparsed", relative_path, raw))
+
+    # Embed before opening the transaction. The model call is the slow part and
+    # must not hold a write transaction open across it.
+    matrix = embedder.embed([text for _, _, _, text in documents]) if documents else []
+
+    with conn:
+        for table in (
+            "files",
+            "entities",
+            "entity_sources",
+            "assertions",
+            "aggregates",
+            "aggregate_members",
+            "claims",
+            "docs",
+            "vault_issues",
+        ):
+            conn.execute(f"DELETE FROM {table}")
+        vectors.clear(conn)
+        db.write_meta(conn, embedder.model_id, embedder.dim)
+
+        for path in _iter_source_files(store):
+            conn.execute(
+                "INSERT INTO files (path, hash) VALUES (?, ?)",
+                (_relative(store, path), content_hash(path.read_text(encoding="utf-8"))),
+            )
+
+        for entity in tables.entities.values():
+            conn.execute(
+                "INSERT INTO entities (slug, type, rank) VALUES (?, ?, ?)",
+                (entity.slug, entity.type, entity.rank),
+            )
+            conn.executemany(
+                "INSERT INTO entity_sources (slug, note_id) VALUES (?, ?)",
+                [(entity.slug, note_id) for note_id in entity.note_ids],
+            )
+
+        for assertion in tables.assertions.values():
+            conn.execute(
+                "INSERT INTO assertions (id, kind, note_id, source, target, type, "
+                "strength, description, status) VALUES (?, 'relationship', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    assertion.id,
+                    assertion.note_id,
+                    assertion.source,
+                    assertion.target,
+                    assertion.type,
+                    assertion.strength,
+                    assertion.description,
+                    assertion.status,
+                ),
+            )
+
+        for claim in tables.claims.values():
+            conn.execute(
+                "INSERT INTO claims (id, note_id, subject, text, status) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (claim.id, claim.note_id, claim.subject, claim.text, claim.status),
+            )
+
+        for aggregate in tables.aggregates.values():
+            conn.execute(
+                "INSERT INTO aggregates (key, source, type, target, weight, "
+                "mean_strength, traversable) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    aggregate.key,
+                    aggregate.source,
+                    aggregate.type,
+                    aggregate.target,
+                    aggregate.weight,
+                    aggregate.mean_strength,
+                    int(aggregate.traversable),
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO aggregate_members (key, assertion_id) VALUES (?, ?)",
+                [(aggregate.key, aid) for aid in aggregate.assertion_ids],
+            )
+
+        conn.executemany(
+            "INSERT INTO docs (doc_id, kind, title, text) VALUES (?, ?, ?, ?)",
+            documents,
+        )
+        conn.executemany(
+            "INSERT INTO vault_issues (path, kind, detail) VALUES (?, ?, ?)", issues
+        )
+
+        for (doc_id, kind, _, _), vector in zip(documents, matrix, strict=True):
+            vectors.store(conn, doc_id, kind, embedder.model_id, vector)
+
+    atomic_write(store.paths.index_md, _render_index(captures, folded_notes, tables))
+
+    return SyncReport(
+        notes=len(folded_notes),
+        captures=len(captures),
+        entities=len(tables.entities),
+        aggregates=len(tables.aggregates),
+        issues=tuple(issues),
+    )
+
+
+def has_drift(conn: sqlite3.Connection, store: VaultStore) -> bool:
+    recorded = {
+        row["path"]: row["hash"] for row in conn.execute("SELECT path, hash FROM files")
+    }
+    seen: set[str] = set()
+    for path in _iter_source_files(store):
+        relative = _relative(store, path)
+        seen.add(relative)
+        current = content_hash(path.read_text(encoding="utf-8"))
+        if recorded.get(relative) != current:
+            return True
+    return seen != recorded.keys()
