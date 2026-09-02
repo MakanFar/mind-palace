@@ -1,10 +1,12 @@
 # Mind Palace — Product Requirements Document
 
-*Version 0.3 (draft) · Owner: Makan · Status: for review*
+*Version 0.4 (draft) · Owner: Makan · Status: for review*
 
 > **v0.2 change:** Mind Palace is reframed from a standalone app into a **headless integration layer** — a background sync engine + MCP server over a plain-file vault. It rents its capture and recall surfaces from tools people already use (the OS share sheet, Apple Notes, email, messaging, and AI assistants) and owns only the store and the intelligence. The goal is explicitly **not to make another app** but to disappear into existing workflows.
 >
 > **v0.3 change:** The knowledge graph adopts the **GraphRAG schema** ([Edge et al., 2024](https://arxiv.org/abs/2404.16130); [microsoft/graphrag](https://github.com/microsoft/graphrag)) — entities, relationships, claims, and, critically, **hierarchical communities with pre-generated community reports**. This adds the one capability the previous design structurally could not deliver: answering *global* questions ("what are the themes in my thinking?") rather than only *local* ones ("what did I save about X?"). Mind Palace extends the schema with **typed, review-gated edges**, which GraphRAG lacks and which the contradiction view depends on.
+>
+> **v0.4 change:** Seven governance mechanisms are borrowed from [Utopia](https://github.com/deeplethe/utopia), an enterprise bitemporal knowledge graph, and re-homed on the plain-file vault: out-of-vocabulary types are **kept as proposals** and adopted by decision rather than refused; a per-item **drop ledger** replaces whole-note rejection; edge types may carry **domain/range** with direction correction; claims carry **validity dates and supersession**; merges are **logged decisions** the fold applies; the duplicate lint gains an **embedding stage**; and every write **echoes what landed**. Design and rationale: [`docs/decisions/0001`](docs/decisions/0001-what-we-borrowed-from-utopia.md).
 
 ---
 
