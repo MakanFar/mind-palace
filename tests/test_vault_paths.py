@@ -46,3 +46,17 @@ def test_well_known_locations(tmp_path):
     assert paths.decisions_log == tmp_path / ".mindpalace" / "decisions.jsonl"
     assert paths.op_log == tmp_path / ".mindpalace" / "log.jsonl"
     assert paths.lock == tmp_path / ".mindpalace" / "lock"
+
+
+def test_note_path_caps_the_slug_at_a_word_boundary(tmp_path):
+    from mindpalace.vault.paths import MAX_NOTE_SLUG, VaultPaths
+
+    paths = VaultPaths(tmp_path)
+    first_line = " ".join(f"word{i}" for i in range(60))
+    path = paths.note_path("n_01", first_line)
+    slug = path.stem.removeprefix("n_01-")
+    assert len(slug) <= MAX_NOTE_SLUG
+    assert not slug.endswith("-")
+    assert slug.split("-")[-1].startswith("word")
+    assert len(path.name.encode()) < 255
+    assert paths.note_path("n_01", "short title") == tmp_path / "notes" / "n_01-short-title.md"

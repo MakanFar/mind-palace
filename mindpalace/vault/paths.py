@@ -8,6 +8,11 @@ from pathlib import Path
 from mindpalace.ids import slugify
 
 SUFFIX_LENGTH = 6
+#: A note's file name carries the slug of its first line for human
+#: orientation. An unbounded slug overflowed the filesystem's 255-byte name
+#: limit on a note whose first line was a full paragraph, and the write
+#: failed with ENAMETOOLONG after the capture was already saved.
+MAX_NOTE_SLUG = 80
 
 
 class VaultPaths:
@@ -31,7 +36,7 @@ class VaultPaths:
         return self.captures / f"{created:%Y-%m-%d-%H%M}-{suffix}.md"
 
     def note_path(self, note_id: str, slug: str) -> Path:
-        return self.notes / f"{note_id}-{slugify(slug)}.md"
+        return self.notes / f"{note_id}-{_truncate_slug(slugify(slug))}.md"
 
     def entity_path(self, slug: str) -> Path:
         return self.entities / f"{slugify(slug)}.md"
@@ -50,3 +55,12 @@ class VaultPaths:
             self.graph_db.parent,
             self.op_log.parent,
         ]
+
+
+def _truncate_slug(slug: str) -> str:
+    """Cut to MAX_NOTE_SLUG at a word boundary where one exists."""
+    if len(slug) <= MAX_NOTE_SLUG:
+        return slug
+    cut = slug[:MAX_NOTE_SLUG]
+    head, _, _ = cut.rpartition("-")
+    return (head or cut).rstrip("-")
