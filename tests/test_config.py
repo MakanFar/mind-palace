@@ -285,3 +285,77 @@ def test_init_still_refuses_a_directory_with_unrelated_content(tmp_path):
     with pytest.raises(ConfigError) as excinfo:
         open_vault(tmp_path, init=True)
     assert "refusing to --init" in str(excinfo.value)
+
+
+# ---- signatures and adoption (docs/decisions/0001, items 1, 3, 6) ---------
+
+
+def test_edge_type_may_declare_domain_and_range(tmp_path):
+    text = MINIMAL.replace(
+        "supports: {directed: true, cluster_weight: 1.0}",
+        "supports: {directed: true, cluster_weight: 1.0, domain: [concept], range: [concept]}",
+    )
+    config = load_config(write_config(tmp_path, text))
+    assert config.edge_types["supports"].domain == ("concept",)
+    assert config.edge_types["supports"].range == ("concept",)
+    assert config.edge_types["relates-to"].domain is None
+
+
+def test_symmetric_edge_type_rejects_a_range(tmp_path):
+    text = MINIMAL.replace(
+        "relates-to: {directed: false, cluster_weight: 1.0}",
+        "relates-to: {directed: false, cluster_weight: 1.0, range: [concept]}",
+    )
+    with pytest.raises(ConfigError, match="symmetric"):
+        load_config(write_config(tmp_path, text))
+
+
+def test_domain_must_name_configured_entity_types(tmp_path):
+    text = MINIMAL.replace(
+        "supports: {directed: true, cluster_weight: 1.0}",
+        "supports: {directed: true, cluster_weight: 1.0, domain: [planet]}",
+    )
+    with pytest.raises(ConfigError, match="planet"):
+        load_config(write_config(tmp_path, text))
+
+
+def test_duplicate_cosine_floor_is_optional_with_a_default(tmp_path):
+    config = load_config(write_config(tmp_path, MINIMAL))
+    assert config.thresholds.duplicate_cosine_floor == 0.92
+    text = MINIMAL.replace(
+        "community_lineage_jaccard: 0.5",
+        "community_lineage_jaccard: 0.5\n  duplicate_cosine_floor: 0.8",
+    )
+    config = load_config(write_config(tmp_path, text))
+    assert config.thresholds.duplicate_cosine_floor == 0.8
+
+
+def test_add_edge_type_rewrites_front_matter_and_keeps_templates(tmp_path):
+    from mindpalace.config import add_edge_type
+
+    path = write_config(tmp_path, MINIMAL)
+    add_edge_type(path, "available-on", directed=True, cluster_weight=0.5, domain=None, range=["concept"])
+    config = load_config(path)
+    assert config.edge_types["available-on"].directed is True
+    assert config.edge_types["available-on"].cluster_weight == 0.5
+    assert config.edge_types["available-on"].range == ("concept",)
+    assert config.templates["extraction_next"] == "Do the thing."
+    assert config.templates["report_next"] == "Write the report."
+
+
+def test_add_edge_type_refuses_to_redefine_an_existing_one(tmp_path):
+    from mindpalace.config import add_edge_type
+
+    path = write_config(tmp_path, MINIMAL)
+    with pytest.raises(ConfigError, match="already"):
+        add_edge_type(path, "supports", directed=False, cluster_weight=1.0)
+
+
+def test_add_entity_type_appends_to_the_list(tmp_path):
+    from mindpalace.config import add_entity_type
+
+    path = write_config(tmp_path, MINIMAL)
+    add_entity_type(path, "organisation")
+    assert load_config(path).entity_types == ["concept", "organisation"]
+    with pytest.raises(ConfigError, match="already"):
+        add_entity_type(path, "organisation")

@@ -7,7 +7,7 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-from mindpalace.ids import new_id
+from mindpalace.ids import new_id, slugify
 from mindpalace.models import Decision
 
 
@@ -141,3 +141,130 @@ class DecisionLog:
             else:
                 reasons.pop(decision.assertion, None)
         return reasons
+
+
+VOCABULARY_KINDS = {"edge", "entity"}
+VOCABULARY_ACTIONS = {"adopt", "revoke"}
+
+
+class VocabularyLog:
+    """Adoptions of proposed types into the vocabulary (docs/decisions/0001 §1).
+
+    Its own file, not a record shape inside `decisions.jsonl`: forgetting to
+    read this log leaves proposals unadopted, which is visible in
+    `review_queue`; a malformed record in the decisions file would block
+    every rebuild. Utopia's 0015 makes the same argument for `pending_facts`.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def append(
+        self,
+        kind: str,
+        proposed: str,
+        adopted: str,
+        action: str,
+        via: str,
+        op_id: str,
+    ) -> None:
+        if kind not in VOCABULARY_KINDS:
+            raise ValueError(
+                f"invalid vocabulary kind {kind!r} (expected one of "
+                f"{sorted(VOCABULARY_KINDS)})"
+            )
+        if action not in VOCABULARY_ACTIONS:
+            raise ValueError(
+                f"invalid vocabulary action {action!r} (expected one of "
+                f"{sorted(VOCABULARY_ACTIONS)})"
+            )
+        _append_line(
+            self.path,
+            {
+                "op": op_id,
+                "ts": _now(),
+                "kind": kind,
+                "proposed": slugify(proposed),
+                "adopted": adopted,
+                "action": action,
+                "via": via,
+            },
+        )
+
+    def adoptions(self) -> dict[str, dict[str, str]]:
+        """kind -> {slugified proposal -> adopted type name}. Last write wins."""
+        result: dict[str, dict[str, str]] = {kind: {} for kind in VOCABULARY_KINDS}
+        for record in _read_lines(self.path):
+            table = result.setdefault(record["kind"], {})
+            if record["action"] == "adopt":
+                table[record["proposed"]] = record["adopted"]
+            else:
+                table.pop(record["proposed"], None)
+        return result
+
+
+MERGE_ACTIONS = {"merge", "unmerge", "keep"}
+
+
+class MergeLog:
+    """Durable identity decisions (docs/decisions/0001 §5).
+
+    `merge` folds `duplicate` into `canonical` on every subsequent rebuild;
+    `unmerge` reverses it; `keep` records that the two are different so the
+    duplicate lint stops proposing them. All three are the same shape so a
+    reader of the file sees the whole history of a pair in one place.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def append(
+        self,
+        duplicate: str,
+        canonical: str,
+        action: str,
+        via: str,
+        op_id: str,
+        reason: str | None = None,
+    ) -> None:
+        if action not in MERGE_ACTIONS:
+            raise ValueError(
+                f"invalid merge action {action!r} (expected one of "
+                f"{sorted(MERGE_ACTIONS)})"
+            )
+        _append_line(
+            self.path,
+            {
+                "op": op_id,
+                "ts": _now(),
+                "duplicate": slugify(duplicate),
+                "canonical": slugify(canonical),
+                "action": action,
+                "via": via,
+                "reason": reason,
+            },
+        )
+
+    def _fold(self) -> tuple[dict[str, str], set[tuple[str, str]]]:
+        merges: dict[str, str] = {}
+        kept: set[tuple[str, str]] = set()
+        for record in _read_lines(self.path):
+            duplicate, canonical = record["duplicate"], record["canonical"]
+            pair = tuple(sorted((duplicate, canonical)))
+            if record["action"] == "merge":
+                merges[duplicate] = canonical
+                kept.discard(pair)
+            elif record["action"] == "unmerge":
+                merges.pop(duplicate, None)
+            else:
+                kept.add(pair)
+                merges.pop(duplicate, None)
+                merges.pop(canonical, None)
+        return merges, kept
+
+    def merges(self) -> dict[str, str]:
+        """duplicate slug -> canonical slug, one hop; `fold` follows chains."""
+        return self._fold()[0]
+
+    def kept(self) -> set[tuple[str, str]]:
+        return self._fold()[1]

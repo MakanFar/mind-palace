@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from mindpalace.atomic import ConflictError, content_hash
 from mindpalace.config import Config
@@ -28,6 +28,7 @@ _FOLD_ISSUE_KINDS = (
     "unknown_edge_type",
     "duplicate_assertion_id",
     "unknown_decision_action",
+    "merge_cycle",
 )
 
 
@@ -72,6 +73,7 @@ def entity_input_hash(
             continue
         parts.append(
             f"assertion={assertion.id}:{assertion.status}:{assertion.strength}:"
+            f"{assertion.type}:{assertion.proposed_type}:"
             f"{content_hash(assertion.description)}"
         )
 
@@ -86,7 +88,10 @@ def entity_input_hash(
 
     for claim in sorted(tables.claims.values(), key=lambda item: item.id):
         if claim.subject == entity.slug:
-            parts.append(f"claim={claim.id}:{claim.status}:{content_hash(claim.text)}")
+            parts.append(
+                f"claim={claim.id}:{claim.status}:{claim.valid_from}:{claim.valid_to}:"
+                f"{content_hash(claim.text)}"
+            )
 
     return content_hash("\n".join(parts))
 
@@ -150,7 +155,10 @@ def community_input_hash(
 
     for claim in sorted(tables.claims.values(), key=lambda item: item.id):
         if claim.subject in membership:
-            parts.append(f"claim={claim.id}:{claim.status}:{content_hash(claim.text)}")
+            parts.append(
+                f"claim={claim.id}:{claim.status}:{claim.valid_from}:{claim.valid_to}:"
+                f"{content_hash(claim.text)}"
+            )
 
     return content_hash("\n".join(parts))
 
@@ -219,10 +227,17 @@ def rebuild(
     embedder: Embedder,
     statuses: dict[str, str],
     scope: str = "all",
+    *,
+    adoptions: Mapping[str, Mapping[str, str]] | None = None,
+    merges: Mapping[str, str] | None = None,
+    kept: Iterable[tuple[str, str]] = (),
 ) -> RebuildReport:
     synced = 0
     if scope in {"cache", "all"}:
-        synced = sync(conn, store, config, embedder, statuses).notes
+        synced = sync(
+            conn, store, config, embedder, statuses,
+            adoptions=adoptions, merges=merges, kept=kept,
+        ).notes
 
     # Quarantine-aware, not a bare `fold()` call: a note with a typo'd edge
     # type or a duplicate assertion id must not take this whole call down --
@@ -230,7 +245,7 @@ def rebuild(
     # `rebuild` route through here (spec §10). See
     # `mindpalace.index.sync.fold_notes_with_quarantine`.
     notes, notes_by_id, tables, fold_issues = fold_notes_with_quarantine(
-        store, config, statuses
+        store, config, statuses, adoptions, merges
     )
     # Persist what quarantine found. When scope includes "cache", `sync`
     # (above) already wrote the identical set as part of its own full
@@ -330,7 +345,10 @@ def rebuild(
     # Entity pages are written *after* the first sync, so their docs and vectors
     # would otherwise lag a full cycle behind. Re-sync once they exist.
     if written or reports_marked:
-        sync(conn, store, config, embedder, statuses)
+        sync(
+            conn, store, config, embedder, statuses,
+            adoptions=adoptions, merges=merges, kept=kept,
+        )
 
     return RebuildReport(
         synced=synced,

@@ -354,3 +354,119 @@ def test_fold_output_is_independent_of_input_note_ordering(config):
     assert list(forward.entities) == list(backward.entities)
     assert list(forward.aggregates) == list(backward.aggregates)
     assert list(forward.assertions) == list(backward.assertions)
+
+
+# ---- borrowed from Utopia (docs/decisions/0001) --------------------------
+
+
+def untyped_rel(assertion_id, source, target, proposed):
+    return RelationshipAssertion(
+        id=assertion_id, source=source, target=target, type=None,
+        strength=5, description="because.", proposed_type=proposed,
+    )
+
+
+def test_an_untyped_assertion_keeps_its_endpoints_but_forms_no_aggregate(config):
+    note = make_note("n_1", "2026-01-01", relationships=[untyped_rel("x_1", "a", "b", "available on")])
+    tables = fold([note], {"x_1": "confirm"}, config)
+    assert set(tables.entities) == {"a", "b"}
+    assert tables.aggregates == {}
+    assert tables.entities["a"].rank == 0
+    folded = tables.assertions["x_1"]
+    assert folded.type is None
+    assert folded.proposed_type == "available on"
+    assert folded.status == "confirmed"
+
+
+def test_an_adopted_proposal_folds_as_the_adopted_type(config):
+    note = make_note("n_1", "2026-01-01", relationships=[untyped_rel("x_1", "a", "b", "Supports!")])
+    tables = fold([note], {"x_1": "confirm"}, config, adoptions={"edge": {"supports": "supports"}})
+    [aggregate] = tables.aggregates.values()
+    assert aggregate.type == "supports"
+    assert aggregate.traversable
+    assert tables.assertions["x_1"].type == "supports"
+    assert tables.assertions["x_1"].proposed_type == "Supports!"
+
+
+def test_an_adoption_naming_a_type_no_longer_configured_stays_untyped(config):
+    note = make_note("n_1", "2026-01-01", relationships=[untyped_rel("x_1", "a", "b", "gone")])
+    tables = fold([note], {}, config, adoptions={"edge": {"gone": "removed-type"}})
+    assert tables.aggregates == {}
+    assert tables.assertions["x_1"].type is None
+
+
+def test_an_untyped_entity_instance_can_be_adopted_too(config):
+    note = make_note(
+        "n_1", "2026-01-01",
+        entities=[EntityInstance(name="acme", type=None, description="d", proposed_type="Organisation")],
+    )
+    assert fold([note], {}, config).entities["acme"].type == "unknown"
+    tables = fold([note], {}, config, adoptions={"entity": {"organisation": "concept"}})
+    assert tables.entities["acme"].type == "concept"
+
+
+def test_a_typed_string_absent_from_config_still_raises(config):
+    note = make_note("n_1", "2026-01-01", relationships=[rel("x_1", "a", "b", edge_type="invented")])
+    with pytest.raises(UnknownEdgeTypeError):
+        fold([note], {}, config)
+
+
+def test_merges_rewrite_every_slug_before_anything_is_touched(config):
+    notes = [
+        make_note(
+            "n_1", "2026-01-01",
+            entities=[EntityInstance(name="open-ai", type="concept", description="d")],
+            relationships=[rel("x_1", "open-ai", "b", edge_type="supports")],
+            claims=[ClaimAssertion(id="k_1", subject="open-ai", text="t")],
+        ),
+        make_note(
+            "n_2", "2026-01-02",
+            entities=[EntityInstance(name="openai", type="concept", description="d")],
+        ),
+    ]
+    tables = fold(notes, {"x_1": "confirm"}, config, merges={"open-ai": "openai"})
+    assert "open-ai" not in tables.entities
+    canonical = tables.entities["openai"]
+    assert canonical.note_ids == ("n_1", "n_2")
+    assert canonical.merged_from == ("open-ai",)
+    assert canonical.rank == 1
+    assert tables.assertions["x_1"].source == "openai"
+    assert tables.claims["k_1"].subject == "openai"
+    [aggregate] = tables.aggregates.values()
+    assert aggregate.source == "openai"
+
+
+def test_merge_chains_are_followed_and_cycles_raise(config):
+    from mindpalace.graph.fold import MergeCycleError
+
+    note = make_note("n_1", "2026-01-01", entities=[EntityInstance(name="a", type="concept", description="d")])
+    tables = fold([note], {}, config, merges={"a": "b", "b": "c"})
+    assert set(tables.entities) == {"c"}
+    with pytest.raises(MergeCycleError) as excinfo:
+        fold([note], {}, config, merges={"a": "b", "b": "a"})
+    assert excinfo.value.slug in {"a", "b"}
+
+
+def test_a_merge_collapsing_a_self_loop_drops_no_assertion(config):
+    note = make_note("n_1", "2026-01-01", relationships=[rel("x_1", "a", "b", edge_type="supports")])
+    tables = fold([note], {"x_1": "confirm"}, config, merges={"b": "a"})
+    assert tables.assertions["x_1"].source == tables.assertions["x_1"].target == "a"
+    [aggregate] = tables.aggregates.values()
+    assert aggregate.source == aggregate.target == "a"
+
+
+def test_a_confirmed_superseding_claim_marks_the_old_one_superseded(config):
+    old = ClaimAssertion(id="k_1", subject="acme", text="HQ in Beijing.", valid_from="2015")
+    new = ClaimAssertion(id="k_2", subject="acme", text="HQ in Shenzhen.", valid_from="2026-03-15", supersedes="k_1")
+    notes = [
+        make_note("n_1", "2026-01-01", claims=[old]),
+        make_note("n_2", "2026-01-02", claims=[new]),
+    ]
+    proposed = fold(notes, {"k_1": "confirm"}, config)
+    assert proposed.claims["k_1"].status == "confirmed"
+    assert proposed.claims["k_2"].status == "proposed"
+    assert proposed.claims["k_2"].supersedes == "k_1"
+    assert proposed.claims["k_2"].valid_from == "2026-03-15"
+    confirmed = fold(notes, {"k_1": "confirm", "k_2": "confirm"}, config)
+    assert confirmed.claims["k_1"].status == "superseded"
+    assert confirmed.claims["k_2"].status == "confirmed"

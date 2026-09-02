@@ -15,7 +15,7 @@ from mindpalace.config import Config, load_config, open_vault
 from mindpalace.embed import Embedder, get_embedder
 from mindpalace.index import db
 from mindpalace.index.sync import has_drift, sync
-from mindpalace.oplog import DecisionLog, OpLog
+from mindpalace.oplog import DecisionLog, MergeLog, OpLog, VocabularyLog
 from mindpalace.vault.paths import VaultPaths
 from mindpalace.vault.store import VaultStore
 
@@ -77,6 +77,8 @@ class Session:
             self._open_cache()
             self.oplog = OpLog(self.paths.op_log)
             self.decisions = DecisionLog(self.paths.decisions_log)
+            self.vocabulary = VocabularyLog(self.paths.vocabulary_log)
+            self.merges = MergeLog(self.paths.merges_log)
             self.embedder = self._explicit_embedder or get_embedder(self.config.embedder)
             self.opened = True
             self._verify_cache_model()
@@ -271,7 +273,23 @@ class Session:
 
     def resync(self) -> None:
         with self.write_lock():
-            sync(self.conn, self.store, self.config, self.embedder, self.statuses())
+            sync(
+                self.conn,
+                self.store,
+                self.config,
+                self.embedder,
+                self.statuses(),
+                **self.overlays(),
+            )
 
     def statuses(self) -> dict[str, str]:
         return self.decisions.status_map()
+
+    def overlays(self) -> dict:
+        """The folded vocabulary and merge logs, as keyword arguments for
+        `fold` / `sync` / `rebuild` (docs/decisions/0001 §1, §5)."""
+        return {
+            "adoptions": self.vocabulary.adoptions(),
+            "merges": self.merges.merges(),
+            "kept": self.merges.kept(),
+        }

@@ -56,7 +56,7 @@ def check_entity_types(
     here too, or the user is sent to a second finding that disappears the
     moment they fix the first.
     """
-    declared: dict[str, dict[str, list[str]]] = {}
+    declared: dict[str, dict[str | None, list[str]]] = {}
     for note in notes:
         for instance in note.entities:
             slug = slugify(instance.name)
@@ -67,7 +67,10 @@ def check_entity_types(
     findings: list[TypeFinding] = []
     for slug, by_type in declared.items():
         for entity_type, note_ids in by_type.items():
-            if entity_type in config.entity_types:
+            # `None` is a deliberate "no configured type fits" with the
+            # wording kept in `proposed_type` (docs/decisions/0001 §1); it
+            # is surfaced through vocabulary proposals, not as a typo.
+            if entity_type is None or entity_type in config.entity_types:
                 continue
             findings.append(
                 TypeFinding(

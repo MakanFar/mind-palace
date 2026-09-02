@@ -22,6 +22,8 @@ class VaultPaths:
         self.graph_db = self.root / ".graph" / "mindpalace.db"
         self.decisions_log = self.root / ".mindpalace" / "decisions.jsonl"
         self.op_log = self.root / ".mindpalace" / "log.jsonl"
+        self.vocabulary_log = self.root / ".mindpalace" / "vocabulary.jsonl"
+        self.merges_log = self.root / ".mindpalace" / "merges.jsonl"
         self.lock = self.root / ".mindpalace" / "lock"
 
     def capture_path(self, capture_id: str, created: datetime) -> Path:

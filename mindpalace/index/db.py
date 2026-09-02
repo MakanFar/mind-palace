@@ -5,6 +5,11 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+#: Bumped whenever SCHEMA changes shape. The cache is delete-and-rebuild by
+#: construction, so a mismatch is not migrated: the tables are dropped and
+#: recreated, and the next sync repopulates them from Tier 1.
+SCHEMA_VERSION = 2
+
 TABLES = frozenset(
     {
         "cache_meta",
@@ -19,6 +24,8 @@ TABLES = frozenset(
         "docs",
         "vectors",
         "vault_issues",
+        "drops",
+        "vocabulary_proposals",
     }
 )
 
@@ -60,7 +67,11 @@ CREATE TABLE IF NOT EXISTS assertions (
     subject TEXT,
     text TEXT,
     description TEXT,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    -- Untyped assertions (docs/decisions/0001 §1): type is NULL and the
+    -- model's wording sits here.
+    proposed_type TEXT,
+    direction_corrected INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS aggregates (
@@ -84,7 +95,29 @@ CREATE TABLE IF NOT EXISTS claims (
     note_id TEXT NOT NULL,
     subject TEXT NOT NULL,
     text TEXT NOT NULL,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    valid_from TEXT,
+    valid_to TEXT,
+    supersedes TEXT
+);
+
+-- Projection of every note's `drops:` ledger (docs/decisions/0001 §2).
+CREATE TABLE IF NOT EXISTS drops (
+    note_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    example TEXT
+);
+
+-- Out-of-vocabulary wordings, counted by normalised form (0001 §1).
+CREATE TABLE IF NOT EXISTS vocabulary_proposals (
+    kind TEXT NOT NULL,
+    proposed TEXT NOT NULL,
+    count INTEGER NOT NULL,
+    example TEXT NOT NULL,
+    ids TEXT NOT NULL,
+    PRIMARY KEY (kind, proposed)
 );
 
 CREATE TABLE IF NOT EXISTS communities (
@@ -151,6 +184,22 @@ def connect(path: Path) -> sqlite3.Connection:
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
+    """Create the tables, first dropping every one of them if the file was
+    written by a different schema version. `CREATE TABLE IF NOT EXISTS`
+    alone would leave an old table missing the new columns and fail on the
+    first insert; the version pragma is what lets an upgrade be a rebuild
+    rather than a crash."""
+    current = conn.execute("PRAGMA user_version").fetchone()[0]
+    if current != SCHEMA_VERSION:
+        existing = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        for table in sorted(TABLES & existing):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.executescript(SCHEMA)
     conn.commit()
 

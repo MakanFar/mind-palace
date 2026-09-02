@@ -439,7 +439,7 @@ def test_fold_quarantine_loop_raises_internal_error_if_it_cannot_shrink(
         body="x",
     )
 
-    def broken_fold(notes, statuses, config):
+    def broken_fold(notes, statuses, config, **_overlays):
         raise UnknownEdgeTypeError(edge_type="ghost", note_id="n_01", assertion_id="x_1")
 
     monkeypatch.setattr(sync_module, "fold", broken_fold)
@@ -715,3 +715,132 @@ def test_a_hand_edited_note_with_an_unquoted_timestamp_still_syncs(conn, vault, 
     assert not any(issue[1] == "malformed_note" for issue in report.issues)
     slugs = {row[0] for row in conn.execute("SELECT slug FROM entities")}
     assert "data-exhaustion" in slugs
+
+
+# ---- borrowed from Utopia (docs/decisions/0001) --------------------------
+
+from mindpalace.models import ClaimAssertion, Drop  # noqa: E402
+
+
+def test_sync_projects_drops_untyped_and_validity_into_the_cache(conn, vault, config):
+    _, store = vault
+    note = Note(
+        id="n_10",
+        derived_from="c_10",
+        created="2026-09-01T00:00:00Z",
+        author="llm",
+        body="Body.",
+        entities=(EntityInstance("acme", None, "A company.", proposed_type="organisation"),),
+        relationship_assertions=(
+            RelationshipAssertion(
+                "x_10", "star-wars", "geforce-now", None, 5, "playable", proposed_type="available on"
+            ),
+            RelationshipAssertion(
+                "x_11", "a", "b", "contradicts", 5, "d", direction_corrected=True
+            ),
+        ),
+        claim_assertions=(
+            ClaimAssertion("k_10", "acme", "HQ moved.", valid_from="2026-03-15", valid_to="unknown"),
+        ),
+        drops=(Drop("relationship", "missing_field", "target", "a -> ?"),),
+    )
+    store.write_note(note, "acme")
+    sync(conn, store, config, StubEmbedder(), {})
+
+    row = conn.execute("SELECT type, proposed_type FROM assertions WHERE id = 'x_10'").fetchone()
+    assert row["type"] is None and row["proposed_type"] == "available on"
+    assert conn.execute("SELECT direction_corrected FROM assertions WHERE id = 'x_11'").fetchone()[0] == 1
+    claim = conn.execute("SELECT valid_from, valid_to FROM claims WHERE id = 'k_10'").fetchone()
+    assert (claim["valid_from"], claim["valid_to"]) == ("2026-03-15", "unknown")
+    drop = conn.execute("SELECT note_id, kind, reason, detail, example FROM drops").fetchone()
+    assert tuple(drop) == ("n_10", "relationship", "missing_field", "target", "a -> ?")
+    proposals = {
+        (r["kind"], r["proposed"]): (r["count"], r["example"])
+        for r in conn.execute("SELECT kind, proposed, count, example FROM vocabulary_proposals")
+    }
+    assert proposals[("edge", "available-on")][0] == 1
+    assert "star-wars" in proposals[("edge", "available-on")][1]
+    assert proposals[("entity", "organisation")][0] == 1
+
+
+def test_sync_applies_merges_and_adoptions_and_tracks_their_logs_for_drift(conn, vault, config):
+    paths, store = vault
+    add_note(store, "n_20", "open-ai")
+    add_note(store, "n_21", "openai")
+    sync(conn, store, config, StubEmbedder(), {}, merges={"open-ai": "openai"})
+    slugs = {r["slug"] for r in conn.execute("SELECT slug FROM entities")}
+    assert slugs == {"openai"}
+    assert not has_drift(conn, store)
+    paths.merges_log.parent.mkdir(exist_ok=True)
+    paths.merges_log.write_text('{"x": 1}\n')
+    assert has_drift(conn, store)
+    sync(conn, store, config, StubEmbedder(), {})
+    paths.vocabulary_log.write_text('{"x": 1}\n')
+    assert has_drift(conn, store)
+
+
+def test_a_merge_cycle_is_quarantined_as_an_issue(conn, vault, config):
+    _, store = vault
+    add_note(store, "n_30", "alpha")
+    report = sync(conn, store, config, StubEmbedder(), {}, merges={"alpha": "beta", "beta": "alpha"})
+    kinds = {issue[1] for issue in report.issues}
+    assert "merge_cycle" in kinds
+    assert {r["slug"] for r in conn.execute("SELECT slug FROM entities")} >= {"alpha"}
+
+
+class _ProfileEmbedder:
+    """Two entity profiles that mention SAME embed identically; all else random."""
+
+    model_id = "profile-test"
+    dim = 8
+
+    def embed(self, texts):
+        import numpy as np
+
+        rows = []
+        for text in texts:
+            if "SAME" in text:
+                rows.append(np.array([1, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32))
+            else:
+                rows.append(StubEmbedder(dim=8).embed([text])[0])
+        return np.vstack(rows)
+
+
+def test_similar_entities_by_embedding_are_reported_once_and_kept_pairs_are_not(conn, vault, config):
+    _, store = vault
+    for note_id, slug in (("n_40", "large-language-model"), ("n_41", "llm-large-model")):
+        store.write_note(
+            Note(
+                id=note_id, derived_from=f"c_{note_id[2:]}", created="2026-08-01T00:00:00Z",
+                author="llm", body="Body.",
+                entities=(EntityInstance(slug, "concept", "SAME thing."),),
+            ),
+            slug,
+        )
+    add_note(store, "n_42", "sourdough")
+    report = sync(conn, store, config, _ProfileEmbedder(), {})
+    similar = [issue for issue in report.issues if issue[1] == "similar_entity"]
+    assert len(similar) == 1
+    assert "large-language-model" in similar[0][2] and "llm-large-model" in similar[0][2]
+    assert "merge_entities" in similar[0][2]
+    report = sync(
+        conn, store, config, _ProfileEmbedder(), {},
+        kept={("large-language-model", "llm-large-model")},
+    )
+    assert not [issue for issue in report.issues if issue[1] == "similar_entity"]
+
+
+def test_a_stale_cache_schema_is_rebuilt_on_connect(tmp_path):
+    import sqlite3
+
+    path = tmp_path / ".graph" / "mindpalace.db"
+    connection = db.connect(path)
+    db.create_schema(connection)
+    connection.execute("PRAGMA user_version = 0")
+    connection.execute("DROP TABLE drops")
+    connection.commit()
+    connection.close()
+    connection = db.connect(path)
+    db.create_schema(connection)
+    assert connection.execute("SELECT COUNT(*) FROM drops").fetchone()[0] == 0
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION

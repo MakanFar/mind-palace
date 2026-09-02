@@ -258,3 +258,16 @@ def test_an_entity_declared_with_a_configured_unknown_type_is_not_reference_only
     notes = [note("n_1", "2026-01-01", entities=[("Scaling", "unknown")])]
 
     assert check(notes, config) == []
+
+
+def test_an_untyped_instance_with_a_proposal_is_neither_unknown_nor_reference_only(config):
+    from mindpalace.graph.fold import fold
+    from mindpalace.graph.integrity import check_entity_types
+    from mindpalace.models import EntityInstance, Note
+
+    note = Note(
+        id="n_1", derived_from="c_1", created="2026-01-01", author="llm", body="B.",
+        entities=(EntityInstance("acme", None, "d", proposed_type="organisation"),),
+    )
+    tables = fold([note], {}, config)
+    assert check_entity_types([note], tables, config) == []

@@ -138,3 +138,59 @@ def test_decision_log_survives_truncated_final_line(tmp_path):
     reopened = DecisionLog(path)
     status = reopened.status_map()
     assert status == {"x_01": "dismiss"}
+
+
+# ---- vocabulary and merge logs (docs/decisions/0001 §1, §5) --------------
+
+
+def test_vocabulary_log_folds_to_an_adoption_map_last_write_wins(tmp_path):
+    from mindpalace.oplog import VocabularyLog
+
+    log = VocabularyLog(tmp_path / "vocabulary.jsonl")
+    assert log.adoptions() == {"edge": {}, "entity": {}}
+    log.append("edge", "Available On", "available-on", "adopt", "adopt_type", "op_1")
+    log.append("entity", "organisation", "organisation", "adopt", "adopt_type", "op_2")
+    assert log.adoptions() == {
+        "edge": {"available-on": "available-on"},
+        "entity": {"organisation": "organisation"},
+    }
+    log.append("edge", "available on", "available-on", "revoke", "adopt_type", "op_3")
+    assert log.adoptions()["edge"] == {}
+
+
+def test_vocabulary_log_rejects_a_bad_kind_or_action(tmp_path):
+    import pytest
+    from mindpalace.oplog import VocabularyLog
+
+    log = VocabularyLog(tmp_path / "vocabulary.jsonl")
+    with pytest.raises(ValueError, match="kind"):
+        log.append("verb", "x", "x", "adopt", "t", "op")
+    with pytest.raises(ValueError, match="action"):
+        log.append("edge", "x", "x", "forget", "t", "op")
+    assert not (tmp_path / "vocabulary.jsonl").exists()
+
+
+def test_merge_log_folds_to_a_map_and_a_keep_set(tmp_path):
+    from mindpalace.oplog import MergeLog
+
+    log = MergeLog(tmp_path / "merges.jsonl")
+    assert log.merges() == {}
+    assert log.kept() == set()
+    log.append("open-ai", "openai", "merge", "merge_entities", "op_1", reason="same org")
+    log.append("gpt-4", "gpt-4-turbo", "keep", "merge_entities", "op_2")
+    assert log.merges() == {"open-ai": "openai"}
+    assert log.kept() == {("gpt-4", "gpt-4-turbo")}
+    log.append("open-ai", "openai", "unmerge", "merge_entities", "op_3")
+    assert log.merges() == {}
+    # A later merge of a kept pair overrides the keep, and vice versa.
+    log.append("gpt-4", "gpt-4-turbo", "merge", "merge_entities", "op_4")
+    assert log.merges() == {"gpt-4": "gpt-4-turbo"}
+    assert log.kept() == set()
+
+
+def test_merge_log_normalises_pair_order_for_keep(tmp_path):
+    from mindpalace.oplog import MergeLog
+
+    log = MergeLog(tmp_path / "merges.jsonl")
+    log.append("zeta", "alpha", "keep", "merge_entities", "op_1")
+    assert log.kept() == {("alpha", "zeta")}

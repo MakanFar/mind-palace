@@ -8,7 +8,7 @@ re-processing an edited or re-detected file safe.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from mindpalace.config import Config
@@ -17,6 +17,9 @@ from mindpalace.models import Note
 
 ACTION_TO_STATUS = {"confirm": "confirmed", "dismiss": "dismissed"}
 UNKNOWN_TYPE = "unknown"
+#: A claim a *confirmed* later claim names in `supersedes`
+#: (docs/decisions/0001 §4). Never a decision-log action: it is derived.
+SUPERSEDED = "superseded"
 
 
 class FoldError(ValueError):
@@ -84,12 +87,30 @@ class UnknownDecisionActionError(FoldError):
         )
 
 
+class MergeCycleError(FoldError):
+    """The merge map sends a slug back to itself (a -> b -> a).
+
+    `merge_entities` refuses to write one, so this is defence against a
+    hand-edited `merges.jsonl`; the quarantine loop drops the offending entry
+    and records an issue rather than failing the whole rebuild.
+    """
+
+    def __init__(self, slug: str):
+        self.slug = slug
+        super().__init__(
+            f"merge cycle through {slug!r}: following `merges.jsonl` from it "
+            f"never reaches a canonical entity"
+        )
+
+
 @dataclass(frozen=True)
 class FoldedEntity:
     slug: str
     type: str
     rank: int
     note_ids: tuple[str, ...]
+    # Slugs folded into this one by `merges.jsonl` (docs/decisions/0001 §5).
+    merged_from: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -98,10 +119,14 @@ class FoldedAssertion:
     note_id: str
     source: str
     target: str
-    type: str
+    # None: untyped. The model's wording is in `proposed_type` and no
+    # aggregate is formed (docs/decisions/0001 §1).
+    type: str | None
     strength: int
     description: str
     status: str
+    proposed_type: str | None = None
+    direction_corrected: bool = False
 
 
 @dataclass(frozen=True)
@@ -111,6 +136,9 @@ class FoldedClaim:
     subject: str
     text: str
     status: str
+    valid_from: str | None = None
+    valid_to: str | None = None
+    supersedes: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,19 +178,60 @@ def _status(item_id: str, statuses: dict[str, str]) -> str:
         raise UnknownDecisionActionError(action=action, assertion_id=item_id) from None
 
 
+def resolve_merges(merges: Mapping[str, str] | None) -> dict[str, str]:
+    """Flatten a one-hop merge map into duplicate -> final canonical.
+
+    Chains (a -> b, b -> c) are followed to their end. A cycle raises
+    `MergeCycleError` naming a slug on it.
+    """
+    flat: dict[str, str] = {}
+    for start in merges or {}:
+        seen = [start]
+        cursor = start
+        while cursor in merges:
+            cursor = merges[cursor]
+            if cursor in seen:
+                raise MergeCycleError(slug=cursor)
+            seen.append(cursor)
+        flat[start] = cursor
+    return flat
+
+
+def _adopted(adoptions: Mapping[str, Mapping[str, str]] | None, kind: str, proposed: str | None) -> str | None:
+    if proposed is None or not adoptions:
+        return None
+    return adoptions.get(kind, {}).get(slugify(proposed))
+
+
 def fold(
-    notes: Iterable[Note], statuses: dict[str, str], config: Config
+    notes: Iterable[Note],
+    statuses: dict[str, str],
+    config: Config,
+    *,
+    adoptions: Mapping[str, Mapping[str, str]] | None = None,
+    merges: Mapping[str, str] | None = None,
 ) -> GraphTables:
+    """`adoptions` is `VocabularyLog.adoptions()`; `merges` is
+    `MergeLog.merges()`. Both default to empty so callers that predate them
+    (and every test that folds a bare note list) keep working."""
     ordered = sorted(notes, key=lambda note: (note.created, note.id))
+    canonical_of = resolve_merges(merges)
+
+    def canon(slug: str) -> str:
+        return canonical_of.get(slug, slug)
 
     entity_types: dict[str, str] = {}
     entity_notes: dict[str, list[str]] = {}
+    merged_from: dict[str, set[str]] = {}
     assertions: dict[str, FoldedAssertion] = {}
     claims: dict[str, FoldedClaim] = {}
     grouped: dict[str, list[FoldedAssertion]] = {}
     aggregate_shape: dict[str, tuple[str, str, str]] = {}
 
-    def touch(slug: str, note_id: str, declared_type: str | None) -> None:
+    def touch(raw_slug: str, note_id: str, declared_type: str | None) -> None:
+        slug = canon(raw_slug)
+        if slug != raw_slug:
+            merged_from.setdefault(slug, set()).add(raw_slug)
         if declared_type is not None or slug not in entity_types:
             entity_types[slug] = declared_type or UNKNOWN_TYPE
         note_ids = entity_notes.setdefault(slug, [])
@@ -171,10 +240,15 @@ def fold(
 
     for note in ordered:
         for instance in note.entities:
-            touch(slugify(instance.name), note.id, instance.type)
+            declared = instance.type
+            if declared is None:
+                declared = _adopted(adoptions, "entity", instance.proposed_type)
+                if declared is not None and declared not in config.entity_types:
+                    declared = None
+            touch(slugify(instance.name), note.id, declared)
 
         for raw in note.relationship_assertions:
-            if raw.type not in config.edge_types:
+            if raw.type is not None and raw.type not in config.edge_types:
                 raise UnknownEdgeTypeError(
                     edge_type=raw.type, note_id=note.id, assertion_id=raw.id
                 )
@@ -183,24 +257,38 @@ def fold(
                     assertion_id=raw.id,
                     note_ids=(assertions[raw.id].note_id, note.id),
                 )
-            source, target = slugify(raw.source), slugify(raw.target)
-            touch(source, note.id, None)
-            touch(target, note.id, None)
+            source, target = canon(slugify(raw.source)), canon(slugify(raw.target))
+            touch(slugify(raw.source), note.id, None)
+            touch(slugify(raw.target), note.id, None)
+
+            # An adoption may name a type that has since left the config.
+            # That is not the note's fault: the proposal simply stands.
+            edge_type = raw.type
+            if edge_type is None:
+                adopted = _adopted(adoptions, "edge", raw.proposed_type)
+                if adopted in config.edge_types:
+                    edge_type = adopted
 
             folded = FoldedAssertion(
                 id=raw.id,
                 note_id=note.id,
                 source=source,
                 target=target,
-                type=raw.type,
+                type=edge_type,
                 strength=raw.strength,
                 description=raw.description,
                 status=_status(raw.id, statuses),
+                proposed_type=raw.proposed_type,
+                direction_corrected=raw.direction_corrected,
             )
             assertions[raw.id] = folded
+            if edge_type is None:
+                # Untyped: nothing to group by. The endpoints and the review
+                # status are kept; no aggregate, no rank (0001 §1).
+                continue
 
-            symmetric = config.is_symmetric(raw.type)
-            key = aggregate_key(source, raw.type, target, symmetric=symmetric)
+            symmetric = config.is_symmetric(edge_type)
+            key = aggregate_key(source, edge_type, target, symmetric=symmetric)
             grouped.setdefault(key, []).append(folded)
             if key not in aggregate_shape:
                 # Capture (source, type, target) directly from values already
@@ -209,7 +297,7 @@ def fold(
                 # edge-type names (config.load_config doesn't enforce one),
                 # so an edge type containing "|" would silently mis-split.
                 left, right = sorted((source, target)) if symmetric else (source, target)
-                aggregate_shape[key] = (left, raw.type, right)
+                aggregate_shape[key] = (left, edge_type, right)
 
         for raw_claim in note.claim_assertions:
             if raw_claim.id in claims:
@@ -217,14 +305,33 @@ def fold(
                     assertion_id=raw_claim.id,
                     note_ids=(claims[raw_claim.id].note_id, note.id),
                 )
-            subject = slugify(raw_claim.subject)
-            touch(subject, note.id, None)
+            subject = canon(slugify(raw_claim.subject))
+            touch(slugify(raw_claim.subject), note.id, None)
             claims[raw_claim.id] = FoldedClaim(
                 id=raw_claim.id,
                 note_id=note.id,
                 subject=subject,
                 text=raw_claim.text,
                 status=_status(raw_claim.id, statuses),
+                valid_from=raw_claim.valid_from,
+                valid_to=raw_claim.valid_to,
+                supersedes=raw_claim.supersedes,
+            )
+
+    # Supersession takes effect on confirmation only: a proposed correction
+    # must not retire the claim it corrects before anyone has agreed to it.
+    for claim in list(claims.values()):
+        if claim.status == "confirmed" and claim.supersedes in claims:
+            old = claims[claim.supersedes]
+            claims[old.id] = FoldedClaim(
+                id=old.id,
+                note_id=old.note_id,
+                subject=old.subject,
+                text=old.text,
+                status=SUPERSEDED,
+                valid_from=old.valid_from,
+                valid_to=old.valid_to,
+                supersedes=old.supersedes,
             )
 
     aggregates: dict[str, Aggregate] = {}
@@ -255,6 +362,7 @@ def fold(
             type=entity_types[slug],
             rank=degree.get(slug, 0),
             note_ids=tuple(entity_notes[slug]),
+            merged_from=tuple(sorted(merged_from.get(slug, ()))),
         )
         for slug in sorted(entity_types)
     }

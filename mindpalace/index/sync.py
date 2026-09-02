@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,11 +13,16 @@ from mindpalace.embed import Embedder
 from mindpalace.graph.fold import (
     DuplicateAssertionIdError,
     GraphTables,
+    MergeCycleError,
     UnknownDecisionActionError,
     UnknownEdgeTypeError,
     fold,
 )
-from mindpalace.graph.duplicates import propose_near_duplicates
+from mindpalace.graph.duplicates import (
+    entity_profile,
+    propose_near_duplicates,
+    propose_similar_entities,
+)
 from mindpalace.graph.integrity import check_entity_types
 from mindpalace.ids import slugify
 from mindpalace.index import db, vectors
@@ -59,7 +64,12 @@ def _iter_source_files(store: VaultStore) -> Iterator[Path]:
     yield from sorted(store.paths.notes.glob("*.md"))
     yield from sorted(store.paths.entities.glob("*.md"))
     yield from sorted(store.paths.communities.glob("*.md"))
-    for dependency in (store.paths.decisions_log, store.paths.mindpalace_md):
+    for dependency in (
+        store.paths.decisions_log,
+        store.paths.mindpalace_md,
+        store.paths.vocabulary_log,
+        store.paths.merges_log,
+    ):
         if dependency.exists():
             yield dependency
 
@@ -181,6 +191,8 @@ def _fold_with_quarantine(
     config: Config,
     issues: list[tuple[str, str, str]],
     note_paths: dict[str, str],
+    adoptions: Mapping[str, Mapping[str, str]] | None = None,
+    merges: Mapping[str, str] | None = None,
 ) -> tuple[GraphTables, set[str]]:
     """Fold, quarantining and retrying on a typed `FoldError` instead of
     letting it propagate out of `sync`.
@@ -202,17 +214,37 @@ def _fold_with_quarantine(
     # Never mutate the caller's statuses dict -- it may be reused elsewhere
     # (e.g. re-synced after a fix) and quarantine is a `sync`-local decision.
     status_map = dict(statuses)
+    merge_map = dict(merges or {})
     excluded: set[str] = set()
 
     # Each accepted iteration strictly shrinks len(candidates) + len(status_map)
-    # by at least one, so this many attempts is always enough for a set of
-    # exceptions that shrink correctly. A future exception type (or a bug)
-    # that doesn't shrink on would otherwise spin forever; bound it instead.
-    max_iterations = len(notes) + len(statuses) + 1
+    # + len(merge_map) by at least one, so this many attempts is always enough
+    # for a set of exceptions that shrink correctly. A future exception type
+    # (or a bug) that doesn't shrink on would otherwise spin forever; bound it.
+    max_iterations = len(notes) + len(statuses) + len(merge_map) + 1
 
     for _ in range(max_iterations):
         try:
-            return fold(candidates.values(), status_map, config), excluded
+            return (
+                fold(
+                    candidates.values(),
+                    status_map,
+                    config,
+                    adoptions=adoptions,
+                    merges=merge_map,
+                ),
+                excluded,
+            )
+        except MergeCycleError as exc:
+            issues.append(
+                (
+                    ".mindpalace/merges.jsonl",
+                    "merge_cycle",
+                    f"merging {exc.slug!r} follows a cycle back to itself; "
+                    f"that entry is ignored until an `unmerge` breaks the loop",
+                )
+            )
+            merge_map.pop(exc.slug, None)
         except UnknownEdgeTypeError as exc:
             path = note_paths.get(exc.note_id, f"notes/{exc.note_id}")
             issues.append(
@@ -263,7 +295,11 @@ def _fold_with_quarantine(
 
 
 def fold_notes_with_quarantine(
-    store: VaultStore, config: Config, statuses: dict[str, str]
+    store: VaultStore,
+    config: Config,
+    statuses: dict[str, str],
+    adoptions: Mapping[str, Mapping[str, str]] | None = None,
+    merges: Mapping[str, str] | None = None,
 ) -> tuple[list[Note], dict[str, Note], GraphTables, list[tuple[str, str, str]]]:
     """Parse and fold every note currently on disk, quarantining anything
     `fold` rejects instead of raising.
@@ -287,7 +323,9 @@ def fold_notes_with_quarantine(
     """
     notes, issues, _degraded, note_sources = _load_notes(store)
     note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
-    tables, excluded = _fold_with_quarantine(notes, statuses, config, issues, note_paths)
+    tables, excluded = _fold_with_quarantine(
+        notes, statuses, config, issues, note_paths, adoptions, merges
+    )
     folded_notes = [note for note in notes if note.id not in excluded]
     notes_by_id = {note.id: note for note in folded_notes}
     return folded_notes, notes_by_id, tables, issues
@@ -399,6 +437,89 @@ def _entity_type_issues(
     return issues
 
 
+def _similar_entity_issues(
+    store: VaultStore,
+    tables: GraphTables,
+    entity_pages: list,
+    profiles: Mapping[str, object],
+    config: Config,
+    kept: Iterable[tuple[str, str]],
+) -> list[tuple[str, str, str]]:
+    """Stage two of the duplicate lint (docs/decisions/0001 §6). The issue
+    text tells the assistant what its stage-three verdict can be."""
+    declared: dict[str, set[str]] = {}
+    for page in entity_pages:
+        user = page.user if isinstance(page.user, dict) else {}
+        declared[page.slug] = {slugify(a) for a in user.get("aliases", [])}
+
+    issues: list[tuple[str, str, str]] = []
+    for pair in propose_similar_entities(
+        profiles, tables, config.thresholds.duplicate_cosine_floor, declared, kept
+    ):
+        paths = ", ".join(
+            _relative(store, store.paths.entity_path(slug))
+            for slug in (pair.left, pair.right)
+        )
+        issues.append(
+            (
+                paths,
+                "similar_entity",
+                f"{pair.left!r} and {pair.right!r} have near-identical profiles "
+                f"(cosine {pair.similarity:.2f}); if they are one thing, call "
+                f"merge_entities(duplicate, canonical); if not, call "
+                f"merge_entities(..., action='keep') so this is not asked again",
+            )
+        )
+    return issues
+
+
+def _vocabulary_proposals(notes: list[Note]) -> list[tuple[str, str, int, str, str]]:
+    """(kind, normalised proposal, count, one example, comma-joined ids)."""
+    tally: dict[tuple[str, str], list] = {}
+
+    def record(kind: str, wording: str | None, example: str, item_id: str) -> None:
+        if not wording:
+            return
+        key = (kind, slugify(wording))
+        if not key[1]:
+            return
+        entry = tally.setdefault(key, [0, example, []])
+        entry[0] += 1
+        entry[2].append(item_id)
+
+    for note in notes:
+        for instance in note.entities:
+            if instance.type is None:
+                record("entity", instance.proposed_type, f"{instance.name} ({instance.proposed_type})", note.id)
+        for assertion in note.relationship_assertions:
+            if assertion.type is None:
+                record(
+                    "edge",
+                    assertion.proposed_type,
+                    f"{assertion.source} {assertion.proposed_type} {assertion.target}",
+                    assertion.id,
+                )
+    return [
+        (kind, proposed, count, example, ",".join(ids))
+        for (kind, proposed), (count, example, ids) in sorted(tally.items())
+    ]
+
+
+def _entity_profiles(notes: list[Note], tables: GraphTables) -> dict[str, str]:
+    """slug -> profile text, for every entity the graph currently holds."""
+    descriptions: dict[str, list[str]] = {}
+    for note in notes:
+        for instance in note.entities:
+            descriptions.setdefault(slugify(instance.name), []).append(instance.description)
+    profiles: dict[str, str] = {}
+    for slug, entity in tables.entities.items():
+        texts = list(descriptions.get(slug, []))
+        for merged in entity.merged_from:
+            texts.extend(descriptions.get(merged, []))
+        profiles[slug] = entity_profile(slug, texts)
+    return profiles
+
+
 def _render_index(
     captures: list[Capture], notes: list[Note], tables: GraphTables
 ) -> str:
@@ -428,12 +549,17 @@ def sync(
     config: Config,
     embedder: Embedder,
     statuses: dict[str, str],
+    adoptions: Mapping[str, Mapping[str, str]] | None = None,
+    merges: Mapping[str, str] | None = None,
+    kept: Iterable[tuple[str, str]] = (),
 ) -> SyncReport:
+    """`adoptions`, `merges`, `kept` are the folded vocabulary and merge logs
+    (see `Session.overlays`). Defaulted so a caller that has none still syncs."""
     captures, notes, issues, degraded, note_sources = _load_sources(store)
 
     note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
     tables, excluded_notes = _fold_with_quarantine(
-        notes, statuses, config, issues, note_paths
+        notes, statuses, config, issues, note_paths, adoptions, merges
     )
 
     # A note the graph rejected (unknown edge type, duplicate assertion id)
@@ -483,8 +609,23 @@ def sync(
         documents.append((relative_path, "unparsed", relative_path, raw))
 
     # Embed before opening the transaction. The model call is the slow part and
-    # must not hold a write transaction open across it.
-    matrix = embedder.embed([text for _, _, _, text in documents]) if documents else []
+    # must not hold a write transaction open across it. Entity profiles for
+    # the similarity lint ride in the same batch: one model call, not two.
+    profile_texts = _entity_profiles(folded_notes, tables)
+    profile_slugs = sorted(profile_texts)
+    batch = [text for _, _, _, text in documents] + [profile_texts[s] for s in profile_slugs]
+    embedded = embedder.embed(batch) if batch else []
+    matrix = embedded[: len(documents)]
+    profiles = dict(zip(profile_slugs, embedded[len(documents) :], strict=True))
+    issues.extend(
+        _similar_entity_issues(store, tables, entity_pages, profiles, config, kept)
+    )
+    drops = [
+        (note.id, drop.kind, drop.reason, drop.detail, drop.example)
+        for note in folded_notes
+        for drop in note.drops
+    ]
+    proposals = _vocabulary_proposals(folded_notes)
 
     with conn:
         for table in (
@@ -497,6 +638,8 @@ def sync(
             "claims",
             "docs",
             "vault_issues",
+            "drops",
+            "vocabulary_proposals",
         ):
             conn.execute(f"DELETE FROM {table}")
         vectors.clear(conn)
@@ -521,7 +664,8 @@ def sync(
         for assertion in tables.assertions.values():
             conn.execute(
                 "INSERT INTO assertions (id, kind, note_id, source, target, type, "
-                "strength, description, status) VALUES (?, 'relationship', ?, ?, ?, ?, ?, ?, ?)",
+                "strength, description, status, proposed_type, direction_corrected) "
+                "VALUES (?, 'relationship', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     assertion.id,
                     assertion.note_id,
@@ -531,15 +675,37 @@ def sync(
                     assertion.strength,
                     assertion.description,
                     assertion.status,
+                    assertion.proposed_type,
+                    int(assertion.direction_corrected),
                 ),
             )
 
         for claim in tables.claims.values():
             conn.execute(
-                "INSERT INTO claims (id, note_id, subject, text, status) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (claim.id, claim.note_id, claim.subject, claim.text, claim.status),
+                "INSERT INTO claims (id, note_id, subject, text, status, "
+                "valid_from, valid_to, supersedes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    claim.id,
+                    claim.note_id,
+                    claim.subject,
+                    claim.text,
+                    claim.status,
+                    claim.valid_from,
+                    claim.valid_to,
+                    claim.supersedes,
+                ),
             )
+
+        conn.executemany(
+            "INSERT INTO drops (note_id, kind, reason, detail, example) "
+            "VALUES (?, ?, ?, ?, ?)",
+            drops,
+        )
+        conn.executemany(
+            "INSERT INTO vocabulary_proposals (kind, proposed, count, example, ids) "
+            "VALUES (?, ?, ?, ?, ?)",
+            proposals,
+        )
 
         for aggregate in tables.aggregates.values():
             conn.execute(
