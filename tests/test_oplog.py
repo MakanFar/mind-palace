@@ -194,3 +194,13 @@ def test_merge_log_normalises_pair_order_for_keep(tmp_path):
     log = MergeLog(tmp_path / "merges.jsonl")
     log.append("zeta", "alpha", "keep", "merge_entities", "op_1")
     assert log.kept() == {("alpha", "zeta")}
+
+
+def test_keep_only_undoes_a_merge_of_that_same_pair(tmp_path):
+    from mindpalace.oplog import MergeLog
+
+    log = MergeLog(tmp_path / "merges.jsonl")
+    log.append("a", "c", "merge", "t", "op_1")
+    log.append("a", "b", "keep", "t", "op_2")
+    assert log.merges() == {"a": "c"}
+    assert log.kept() == {("a", "b")}

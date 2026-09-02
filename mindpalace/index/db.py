@@ -199,7 +199,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        for table in sorted(TABLES & existing):
+        # `communities` is written by `cluster`, not by `sync`, so dropping it
+        # would orphan every existing report until someone reclusters -- and
+        # reclustering mints new lineage ids. Its shape has not changed;
+        # leave it alone.
+        for table in sorted((TABLES - {"communities"}) & existing):
             conn.execute(f"DROP TABLE IF EXISTS {table}")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.executescript(SCHEMA)

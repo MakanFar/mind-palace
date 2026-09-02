@@ -844,3 +844,18 @@ def test_a_stale_cache_schema_is_rebuilt_on_connect(tmp_path):
     db.create_schema(connection)
     assert connection.execute("SELECT COUNT(*) FROM drops").fetchone()[0] == 0
     assert connection.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+
+
+def test_a_schema_upgrade_keeps_the_communities_table(tmp_path):
+    path = tmp_path / ".graph" / "mindpalace.db"
+    connection = db.connect(path)
+    db.create_schema(connection)
+    connection.execute(
+        "INSERT INTO communities (lineage_id, level, parent, members) VALUES ('g_1', 0, NULL, 'a,b')"
+    )
+    connection.execute("PRAGMA user_version = 0")
+    connection.commit()
+    connection.close()
+    connection = db.connect(path)
+    db.create_schema(connection)
+    assert connection.execute("SELECT COUNT(*) FROM communities").fetchone()[0] == 1

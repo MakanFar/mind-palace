@@ -258,8 +258,12 @@ class MergeLog:
                 merges.pop(duplicate, None)
             else:
                 kept.add(pair)
-                merges.pop(duplicate, None)
-                merges.pop(canonical, None)
+                # "These two are different" withdraws a merge *of these two*
+                # only; a merge of either into some third entity stands.
+                if merges.get(duplicate) == canonical:
+                    merges.pop(duplicate)
+                if merges.get(canonical) == duplicate:
+                    merges.pop(canonical)
         return merges, kept
 
     def merges(self) -> dict[str, str]:

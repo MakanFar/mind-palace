@@ -9,7 +9,7 @@ re-processing an edited or re-detected file safe.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from mindpalace.config import Config
 from mindpalace.ids import aggregate_key, slugify
@@ -323,16 +323,7 @@ def fold(
     for claim in list(claims.values()):
         if claim.status == "confirmed" and claim.supersedes in claims:
             old = claims[claim.supersedes]
-            claims[old.id] = FoldedClaim(
-                id=old.id,
-                note_id=old.note_id,
-                subject=old.subject,
-                text=old.text,
-                status=SUPERSEDED,
-                valid_from=old.valid_from,
-                valid_to=old.valid_to,
-                supersedes=old.supersedes,
-            )
+            claims[old.id] = replace(old, status=SUPERSEDED)
 
     aggregates: dict[str, Aggregate] = {}
     degree: dict[str, int] = {}

@@ -344,3 +344,113 @@ def test_write_note_returns_a_landed_summary(session):
     )
     assert "landed" in result["next"]
     assert result["relationship_assertions"][1]["pair"] == "a|(untyped: made of)|b"
+
+
+# ---- review findings -------------------------------------------------------
+
+
+def test_null_and_non_string_fields_are_dropped_not_persisted(session):
+    result = note(
+        session,
+        entities=[
+            {"name": None, "type": "concept", "description": "x"},
+            {"name": "ok", "type": None, "description": "x"},
+            {"name": "ok2", "type": "concept", "description": None},
+        ],
+        relationship_assertions=[
+            {"source": None, "target": "b", "type": "relates-to", "description": "x"},
+            {"source": "a", "target": "b", "type": ["relates-to"], "description": "x"},
+            {"source": "a", "target": "b", "type": "relates-to", "description": None},
+        ],
+        claim_assertions=[
+            {"subject": None, "text": "x"},
+            {"subject": "a", "text": None},
+            {"subject": "a", "text": "fine", "valid_from": 2015},
+        ],
+    )
+    assert result["entities"] == []
+    assert result["relationship_assertions"] == []
+    assert [c["valid_from"] for c in result["claim_assertions"]] == ["2015"]
+    assert all(d["reason"] == "bad_value" for d in result["dropped"])
+    assert len(result["dropped"]) == 8
+    assert review_queue(session)["vocabulary"] == []
+    # And the vault still opens and rebuilds afterwards.
+    assert graph_stats(session)["drops"]["total"] == 8
+
+
+def test_merging_entities_with_conflicting_types_does_not_crash_the_lint(session):
+    note(session, entities=[{"name": "open-ai", "type": "concept", "description": "d"}])
+    note(session, entities=[{"name": "open-ai", "type": "project", "description": "d"}])
+    note(session, entities=[{"name": "openai", "type": "project", "description": "d"}])
+    merge_entities(session, "open-ai", "openai")
+    kinds = {i["kind"] for i in review_queue(session)["vault_issues"]}
+    assert "conflicting_entity_type" in kinds
+    with Session(session.paths.root, embedder=StubEmbedder()) as reopened:
+        assert graph_stats(reopened)["merges"] == 1
+
+
+def test_a_merged_away_entity_page_is_flagged_and_writes_go_to_the_canonical(session):
+    from mindpalace.tools import read, write_entity_description
+
+    note(session, entities=[{"name": "open-ai", "type": "concept", "description": "d"}])
+    note(session, entities=[{"name": "openai", "type": "concept", "description": "d"}])
+    write_entity_description(session, "open-ai", "OLD")
+    merge_entities(session, "open-ai", "openai")
+    issues = [i for i in review_queue(session)["vault_issues"] if i["kind"] == "merged_entity_page"]
+    assert len(issues) == 1 and "open-ai" in issues[0]["path"]
+    write_entity_description(session, "open-ai", "NEW")
+    assert get_entity(session, "open-ai")["description"] == "NEW"
+    assert read(session, "e_open-ai")["text"] == "NEW"
+    docs = {r["doc_id"] for r in session.conn.execute("SELECT doc_id FROM docs WHERE kind = 'entity'")}
+    assert "e_open-ai" not in docs
+
+
+def test_editing_a_description_under_a_merged_name_marks_the_canonical_page_stale(session):
+    from mindpalace.tools import rebuild_tool, write_entity_description
+
+    first = note(session, entities=[{"name": "open-ai", "type": "concept", "description": "d1"}])
+    note(session, entities=[{"name": "openai", "type": "concept", "description": "d"}])
+    merge_entities(session, "open-ai", "openai")
+    write_entity_description(session, "openai", "written")
+    assert session.store.read_entity_page("openai").stale is False
+    path = session.paths.root / first["path"]
+    path.write_text(path.read_text().replace("description: d1", "description: d1 edited"))
+    rebuild_tool(session)
+    assert session.store.read_entity_page("openai").stale is True
+
+
+def test_adopt_type_validation_failure_leaves_no_pending_op(session):
+    with pytest.raises(ToolError, match="directed"):
+        adopt_type(session, "edge", "brand new", "brand-new")
+    assert session.oplog.pending() == []
+
+
+def test_a_signature_violated_after_the_fact_is_reported(signed):
+    """Enforcement is at write time; a later adoption can move an endpoint
+    into a type the signature forbids. That must surface, not vanish."""
+    result = note(
+        signed,
+        entities=[
+            {"name": "kaplan-2020", "type": "paper", "description": "d"},
+            {"name": "acme", "type": "company", "description": "d"},
+        ],
+        relationship_assertions=[
+            {"source": "kaplan-2020", "target": "acme", "type": "supports", "description": "d"},
+        ],
+    )
+    [assertion] = result["relationship_assertions"]
+    assert assertion["type"] == "supports"
+    adopt_type(signed, "entity", "company", "person")
+    issues = [i for i in review_queue(signed)["vault_issues"] if i["kind"] == "signature_violation"]
+    assert len(issues) == 1 and "acme" in issues[0]["detail"]
+
+
+def test_adopting_keeps_the_comments_in_mindpalace_md(session):
+    before = session.paths.mindpalace_md.read_text()
+    assert "# Optional:" in before
+    adopt_type(session, "edge", "available on", "available-on", directed=True)
+    adopt_type(session, "entity", "organisation", "organisation")
+    after = session.paths.mindpalace_md.read_text()
+    assert "# Optional:" in after
+    assert "available-on: {directed: true, cluster_weight: 1.0}" in after
+    assert "entity_types: [person, concept, paper, project, term, theme, organisation]" in after

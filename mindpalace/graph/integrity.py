@@ -56,10 +56,19 @@ def check_entity_types(
     here too, or the user is sent to a second finding that disappears the
     moment they fix the first.
     """
+    # Keyed by the slug the graph actually holds: a merged-away name
+    # (docs/decisions/0001 §5) is folded into its canonical entity, and two
+    # names merged into one with different types is a real conflict there.
+    canonical = {
+        merged: entity.slug
+        for entity in tables.entities.values()
+        for merged in entity.merged_from
+    }
     declared: dict[str, dict[str | None, list[str]]] = {}
     for note in notes:
         for instance in note.entities:
             slug = slugify(instance.name)
+            slug = canonical.get(slug, slug)
             note_ids = declared.setdefault(slug, {}).setdefault(instance.type, [])
             if note.id not in note_ids:
                 note_ids.append(note.id)
@@ -96,7 +105,10 @@ def check_entity_types(
             # The winner is read back off the graph, never re-derived: it
             # is what queries actually see, and it is the thing that tells
             # the user which of the two files is the one to edit.
-            winner = tables.entities[slug].type
+            entity = tables.entities.get(slug)
+            if entity is None:
+                continue
+            winner = entity.type
             losers = ", ".join(f"{t!r}" for t in configured if t != winner)
             findings.append(
                 TypeFinding(
@@ -132,3 +144,52 @@ def check_entity_types(
             )
         )
     return sorted(findings, key=lambda f: (f.kind, f.slug))
+
+
+@dataclass(frozen=True)
+class SignatureFinding:
+    """A typed assertion whose endpoint types now violate the edge type's
+    domain/range (docs/decisions/0001 §3). Enforcement happens once, at
+    write time, against the types known then; an adoption, a merge, a config
+    edit, or a hand-edited note can move an endpoint afterwards. This check
+    observes and reports; it never retypes anything."""
+
+    assertion_id: str
+    detail: str
+
+
+def check_signatures(tables: GraphTables, config: Config) -> list[SignatureFinding]:
+    def fits(entity_type: str | None, allowed: tuple[str, ...] | None) -> bool:
+        return allowed is None or entity_type is None or entity_type in allowed
+
+    def type_of(slug: str) -> str | None:
+        entity = tables.entities.get(slug)
+        if entity is None or entity.type == "unknown":
+            return None
+        return entity.type
+
+    findings: list[SignatureFinding] = []
+    for assertion in sorted(tables.assertions.values(), key=lambda a: a.id):
+        spec = config.edge_types.get(assertion.type) if assertion.type else None
+        if spec is None or (spec.domain is None and spec.range is None):
+            continue
+        s_type, t_type = type_of(assertion.source), type_of(assertion.target)
+        if spec.directed:
+            ok = fits(s_type, spec.domain) and fits(t_type, spec.range)
+        else:
+            ok = fits(s_type, spec.domain) and fits(t_type, spec.domain)
+        if ok:
+            continue
+        findings.append(
+            SignatureFinding(
+                assertion_id=assertion.id,
+                detail=(
+                    f"{assertion.source!r} ({s_type or 'untyped'}) "
+                    f"{assertion.type} {assertion.target!r} ({t_type or 'untyped'}) "
+                    f"violates the signature domain={list(spec.domain or []) or 'any'} "
+                    f"range={list(spec.range or []) or 'any'} in note "
+                    f"{assertion.note_id}; endpoint types moved after it was written"
+                ),
+            )
+        )
+    return findings

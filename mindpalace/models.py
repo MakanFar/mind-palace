@@ -13,7 +13,7 @@ from mindpalace.frontmatter import parse, render
 #: (docs/decisions/0001 §4), so there is no separate precision field to keep
 #: in step with it. `valid_to` may also be the literal "unknown": ended, date
 #: unknown -- which a single nullable value cannot say.
-VALIDITY_DATE = re.compile(r"^\d{4}(-\d{2}(-\d{2})?)?$")
+VALIDITY_DATE = re.compile(r"\d{4}(-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?)?")
 VALIDITY_UNKNOWN = "unknown"
 _PRECISIONS = {4: "year", 7: "month", 10: "day"}
 
@@ -32,7 +32,15 @@ def is_valid_validity(value: str | None, *, allow_unknown: bool) -> bool:
         return True
     if value == VALIDITY_UNKNOWN:
         return allow_unknown
-    return bool(VALIDITY_DATE.match(value))
+    if not isinstance(value, str) or not VALIDITY_DATE.fullmatch(value):
+        return False
+    if len(value) == 10:
+        # The regex admits "2026-02-30"; only the calendar knows better.
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            return False
+    return True
 
 
 @dataclass(frozen=True)

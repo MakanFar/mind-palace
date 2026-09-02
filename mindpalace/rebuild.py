@@ -58,6 +58,9 @@ def entity_input_hash(
     is still awaiting review and someone edits its rationale in place.
     """
     parts = [f"type={entity.type}"]
+    # Descriptions recorded under a name since merged into this entity are
+    # evidence a writer read too (docs/decisions/0001 §5).
+    names = {entity.slug, *entity.merged_from}
 
     for note_id in sorted(entity.note_ids):
         note = notes_by_id.get(note_id)
@@ -65,7 +68,7 @@ def entity_input_hash(
             continue
         parts.append(f"note={note_id}:{content_hash(note.body)}")
         for instance in note.entities:
-            if slugify(instance.name) == entity.slug:
+            if slugify(instance.name) in names:
                 parts.append(f"instance={content_hash(instance.description)}")
 
     for assertion in sorted(tables.assertions.values(), key=lambda item: item.id):
@@ -126,13 +129,14 @@ def community_input_hash(
         )
         if entity is None:
             continue
+        names = {slug, *entity.merged_from}
         for note_id in sorted(entity.note_ids):
             note = notes_by_id.get(note_id)
             if note is None:
                 continue
             parts.append(f"note={slug}:{note_id}:{content_hash(note.body)}")
             for instance in note.entities:
-                if slugify(instance.name) == slug:
+                if slugify(instance.name) in names:
                     parts.append(f"instance={slug}:{content_hash(instance.description)}")
 
     for assertion in sorted(tables.assertions.values(), key=lambda item: item.id):

@@ -6,7 +6,7 @@ nothing but wire them to the protocol.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from mindpalace.citations import extract_ids, unresolvable
 from mindpalace.cluster import Community, match_lineages, partition, should_cluster
@@ -23,6 +23,7 @@ from mindpalace.models import (
     EntityInstance,
     Note,
     RelationshipAssertion,
+    _validity,
     is_valid_validity,
     validity_precision,
 )
@@ -125,12 +126,13 @@ def _previously_dismissed(session: Session) -> list[dict]:
         return []
     placeholders = ",".join("?" for _ in reasons)
     rows = session.conn.execute(
-        f"SELECT id, source, type, target FROM assertions WHERE id IN ({placeholders})",
+        f"SELECT id, source, type, proposed_type, target FROM assertions "
+        f"WHERE id IN ({placeholders})",
         tuple(reasons),
     ).fetchall()
     return [
         {
-            "pair": f"{row['source']}|{row['type']}|{row['target']}",
+            "pair": _pair(row["source"], row["type"], row["proposed_type"], row["target"]),
             "reason": reasons[row["id"]],
         }
         for row in rows
@@ -171,6 +173,20 @@ class _Ledger:
                 example=None if example is None else str(example)[:200],
             )
         )
+
+
+def _text(item: dict, field: str, ledger: _Ledger, kind: str, example: object) -> str | None:
+    """The field as a string, or None after recording a `bad_value` drop.
+
+    JSON null, a list, or a number where a string belongs used to be either
+    refused with a traceback or -- worse -- coerced with `str()` into a real
+    entity called "none". Neither is a drop the user can read.
+    """
+    value = item[field]
+    if isinstance(value, str):
+        return value
+    ledger.drop(kind, "bad_value", f"{field} must be a string, got {type(value).__name__}", example)
+    return None
 
 
 def _entity_type_in_graph(session: Session, slug: str) -> str | None:
@@ -233,7 +249,11 @@ def _validate_entities(
         if missing:
             ledger.drop("entity", "missing_field", ", ".join(missing), example)
             continue
-        name = str(entity["name"])
+        name = _text(entity, "name", ledger, "entity", example)
+        declared = _text(entity, "type", ledger, "entity", example)
+        description = _text(entity, "description", ledger, "entity", example)
+        if name is None or declared is None or description is None:
+            continue
         if len(name.split()) > MAX_NAME_WORDS:
             ledger.drop(
                 "entity", "not_an_entity_name",
@@ -244,14 +264,12 @@ def _validate_entities(
         if not slug:
             ledger.drop("entity", "empty_slug", "name normalises to nothing", name)
             continue
-        declared = entity["type"]
         if declared in session.config.entity_types:
-            built.append(EntityInstance(name=slug, type=declared, description=entity["description"]))
+            built.append(EntityInstance(name=slug, type=declared, description=description))
         else:
             built.append(
                 EntityInstance(
-                    name=slug, type=None, description=entity["description"],
-                    proposed_type=str(declared),
+                    name=slug, type=None, description=description, proposed_type=declared,
                 )
             )
     return built
@@ -274,7 +292,14 @@ def _validate_relationships(
         if not isinstance(strength, int) or strength not in STRENGTH_RANGE:
             ledger.drop("relationship", "bad_strength", f"strength {strength!r} is not 1-10", example)
             continue
-        source, target = slugify(str(assertion["source"])), slugify(str(assertion["target"]))
+        fields = [
+            _text(assertion, f, ledger, "relationship", example)
+            for f in ("source", "target", "type", "description")
+        ]
+        if any(f is None for f in fields):
+            continue
+        raw_source, raw_target, raw_type, description = fields
+        source, target = slugify(raw_source), slugify(raw_target)
         if not source or not target:
             ledger.drop("relationship", "empty_slug", "an endpoint normalises to nothing", example)
             continue
@@ -283,13 +308,13 @@ def _validate_relationships(
             continue
         corrected = False
         proposed = None
-        edge_type = assertion["type"]
+        edge_type = raw_type
         if edge_type in session.config.edge_types:
             source, target, edge_type, corrected = _apply_signature(
                 session, source, target, edge_type, local_types
             )
             if edge_type is None:
-                proposed = str(assertion["type"])
+                proposed = raw_type
                 ledger.drop(
                     "relationship", "domain_mismatch",
                     f"{proposed!r} is not declared between these entity types in "
@@ -297,7 +322,7 @@ def _validate_relationships(
                     example,
                 )
         else:
-            proposed = str(edge_type)
+            proposed = raw_type
             edge_type = None
         built.append(
             RelationshipAssertion(
@@ -306,7 +331,7 @@ def _validate_relationships(
                 target=target,
                 type=edge_type,
                 strength=int(strength),
-                description=assertion["description"],
+                description=description,
                 proposed_type=proposed,
                 direction_corrected=corrected,
             )
@@ -329,10 +354,14 @@ def _validate_claims(session: Session, claims, ledger: _Ledger) -> list[ClaimAss
         if missing:
             ledger.drop("claim", "missing_field", ", ".join(missing), example)
             continue
-        if not str(claim["text"]).strip():
-            ledger.drop("claim", "empty_text", "claim text is empty", claim.get("subject"))
+        raw_subject = _text(claim, "subject", ledger, "claim", example)
+        text = _text(claim, "text", ledger, "claim", example)
+        if raw_subject is None or text is None:
             continue
-        subject = slugify(str(claim["subject"]))
+        if not text.strip():
+            ledger.drop("claim", "empty_text", "claim text is empty", raw_subject)
+            continue
+        subject = slugify(raw_subject)
         if not subject:
             ledger.drop("claim", "empty_slug", "subject normalises to nothing", example)
             continue
@@ -362,6 +391,9 @@ def _validate_claims(session: Session, claims, ledger: _Ledger) -> list[ClaimAss
             )
             continue
         supersedes = claim.get("supersedes")
+        if supersedes is not None and not isinstance(supersedes, str):
+            ledger.drop("claim", "bad_value", "supersedes must be a claim id string", example)
+            continue
         if supersedes is not None:
             known = session.conn.execute(
                 "SELECT 1 FROM claims WHERE id = ?", (supersedes,)
@@ -376,7 +408,7 @@ def _validate_claims(session: Session, claims, ledger: _Ledger) -> list[ClaimAss
             ClaimAssertion(
                 id=new_id("k_"),
                 subject=subject,
-                text=claim["text"],
+                text=text,
                 valid_from=valid_from,
                 valid_to=valid_to,
                 supersedes=supersedes,
@@ -386,11 +418,14 @@ def _validate_claims(session: Session, claims, ledger: _Ledger) -> list[ClaimAss
 
 
 def _validity_string(value: object) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.date().isoformat()
-    return str(value)
+    """A date-like value as the string the precision rules read. Anything
+    that is not a date, datetime, int year, or string is left as-is for
+    `is_valid_validity` to reject."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (datetime, date)) or isinstance(value, int) and not isinstance(value, bool):
+        return _validity(value)
+    return value
 
 
 def _pair(source: str, edge_type: str | None, proposed: str | None, target: str) -> str:
@@ -584,7 +619,9 @@ def read(session: Session, identifier: str) -> dict:
                 return {"id": identifier, "kind": "note", "text": note.body}
     elif kind == "entity":
         try:
-            page = session.store.read_entity_page(identifier.removeprefix("e_"))
+            page = session.store.read_entity_page(
+                _canonical_slug(session, identifier.removeprefix("e_"))
+            )
         except FrontMatterError as exc:
             # A malformed page must surface as a ToolError the assistant can
             # act on, not an uncaught traceback out of the tool boundary
@@ -660,6 +697,16 @@ def neighbors(
     return {"id": identifier, "neighbours": collected, "by_type": grouped}
 
 
+def _canonical_slug(session: Session, slug: str) -> str:
+    """Follow `merges.jsonl` to the slug the graph holds
+    (docs/decisions/0001 §5). A cycle in a hand-edited log is already a
+    vault_issue, so here it just means "no merge applies"."""
+    try:
+        return resolve_merges(session.merges.merges()).get(slug, slug)
+    except MergeCycleError:
+        return slug
+
+
 def _resolve_slug(session: Session, name: str) -> str | None:
     """Exact slug always wins outright; only alias-to-alias ambiguity raises.
 
@@ -672,14 +719,7 @@ def _resolve_slug(session: Session, name: str) -> str | None:
     collision proactively through `review_queue`, before anyone happens to
     look the ambiguous name up.
     """
-    slug = slugify(name)
-    # A merged-away slug resolves to its canonical entity
-    # (docs/decisions/0001 §5); a cycle in a hand-edited log is already a
-    # vault_issue, so here it just means "no merge applies".
-    try:
-        slug = resolve_merges(session.merges.merges()).get(slug, slug)
-    except MergeCycleError:
-        pass
+    slug = _canonical_slug(session, slugify(name))
     row = session.conn.execute(
         "SELECT slug FROM entities WHERE slug = ?", (slug,)
     ).fetchone()
@@ -931,20 +971,27 @@ def adopt_type(
     ).fetchone()
     waiting_ids = [i for i in waiting["ids"].split(",") if i] if waiting else []
 
+    # Everything that can be refused is refused before the operation frame
+    # opens: a `begin` with no `commit` replays as a crash on the next open.
+    new_edge = action == "adopt" and kind == "edge" and name not in session.config.edge_types
+    new_entity = action == "adopt" and kind == "entity" and name not in session.config.entity_types
+    if new_edge:
+        _require(directed is not None, f"{name!r} is a new edge type; say whether it is directed")
+        for end, allowed in (("domain", domain), ("range", range)):
+            unknown = [t for t in (allowed or []) if t not in session.config.entity_types]
+            _require(not unknown, f"{end} names unknown entity type(s) {unknown}")
+        _require(directed or not range, "a symmetric edge type takes domain only, not range")
+
     with session.operation({"tool": "adopt_type", "kind": kind, "proposed": key, "action": action}) as op_id:
-        if action == "adopt":
+        if new_edge or new_entity:
             try:
-                if kind == "edge" and name not in session.config.edge_types:
-                    _require(
-                        directed is not None,
-                        f"{name!r} is a new edge type; say whether it is directed",
-                    )
+                if new_edge:
                     add_edge_type(
                         session.paths.mindpalace_md, name,
                         directed=directed, cluster_weight=cluster_weight,
                         domain=domain, range=range,
                     )
-                elif kind == "entity" and name not in session.config.entity_types:
+                else:
                     add_entity_type(session.paths.mindpalace_md, name)
             except ConfigError as exc:
                 raise ToolError(str(exc)) from exc
@@ -1328,7 +1375,10 @@ def write_community_report(
 
 
 def write_entity_description(session: Session, slug: str, description: str) -> dict:
-    slug = slugify(slug)
+    # A merged-away name writes to the canonical page, never to the
+    # orphaned one (docs/decisions/0001 §5) -- `get_entity` and `read`
+    # already resolve the same way, and two tools must not disagree.
+    slug = _canonical_slug(session, slugify(slug))
     try:
         page = session.store.read_entity_page(slug)
     except FrontMatterError as exc:

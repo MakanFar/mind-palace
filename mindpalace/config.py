@@ -8,7 +8,7 @@ from importlib import resources
 from pathlib import Path
 
 from mindpalace.atomic import atomic_write
-from mindpalace.frontmatter import FrontMatterError, parse, render
+from mindpalace.frontmatter import FrontMatterError, parse
 from mindpalace.vault.paths import VaultPaths
 
 SUPPORTED_SCHEMA_VERSIONS = {1}
@@ -221,21 +221,9 @@ def _parse_templates(body: str) -> dict[str, str]:
     return templates
 
 
-def _rewrite_front_matter(path: Path, mutate) -> None:
-    """Apply `mutate(data)` to MINDPALACE.md's front-matter and write it back,
-    leaving the template body byte-for-byte as it was.
-
-    The result is re-validated through `load_config` before it is written, so
-    a mutation that would produce an unloadable config is rejected instead of
-    bricking the vault on its next open.
-    """
-    raw = path.read_text(encoding="utf-8")
-    try:
-        data, body = parse(raw)
-    except FrontMatterError as exc:
-        raise ConfigError(f"{path.name}: {exc}") from exc
-    mutate(data)
-    rendered = render(data, body)
+def _validated_write(path: Path, rendered: str) -> None:
+    """Write MINDPALACE.md only if the result loads. A rewrite that produced an
+    unloadable config would brick the vault on its next open."""
     probe = path.with_name(f".{path.name}.probe")
     try:
         probe.write_text(rendered, encoding="utf-8")
@@ -243,6 +231,25 @@ def _rewrite_front_matter(path: Path, mutate) -> None:
     finally:
         probe.unlink(missing_ok=True)
     atomic_write(path, rendered)
+
+
+def _front_matter_span(lines: list[str]) -> tuple[int, int]:
+    """(first, last) indices of the lines between the `---` delimiters."""
+    if not lines or lines[0].strip() != "---":
+        raise ConfigError("MINDPALACE.md has no front-matter block")
+    for cursor in range(1, len(lines)):
+        if lines[cursor].strip() == "---":
+            return 1, cursor
+    raise ConfigError("MINDPALACE.md: unterminated front-matter block")
+
+
+def _yaml_flow(value: object) -> str:
+    """One-line YAML for a scalar or a list, matching the template's style."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_yaml_flow(v) for v in value) + "]"
+    return str(value)
 
 
 def add_edge_type(
@@ -254,28 +261,75 @@ def add_edge_type(
     domain: list[str] | None = None,
     range: list[str] | None = None,
 ) -> None:
-    """Adopt a proposed edge type into the vocabulary (docs/decisions/0001 §1)."""
+    """Adopt a proposed edge type into the vocabulary (docs/decisions/0001 §1).
 
-    def mutate(data: dict) -> None:
-        if name in data["edge_types"]:
-            raise ConfigError(f"{path.name}: edge type {name!r} already exists")
-        spec: dict = {"directed": bool(directed), "cluster_weight": float(cluster_weight)}
-        if domain:
-            spec["domain"] = list(domain)
-        if range:
-            spec["range"] = list(range)
-        data["edge_types"][name] = spec
-
-    _rewrite_front_matter(path, mutate)
+    Edits the file textually -- one line appended to the `edge_types:` block
+    -- rather than re-dumping the YAML, which would strip every comment the
+    template ships and reflow every mapping. The result is validated by
+    `load_config` before it is written.
+    """
+    config = load_config(path)
+    if name in config.edge_types:
+        raise ConfigError(f"{path.name}: edge type {name!r} already exists")
+    raw = path.read_text(encoding="utf-8")
+    lines = raw.splitlines(keepends=True)
+    first, last = _front_matter_span(lines)
+    # `range` is shadowed by the keyword argument of the same name.
+    header = next(
+        (i for i, line in enumerate(lines) if first <= i < last and re.match(r"^edge_types:\s*$", line)),
+        None,
+    )
+    if header is None:
+        raise ConfigError(f"{path.name}: edge_types must be a block mapping to add to")
+    # The block runs until the next unindented, non-comment, non-blank line.
+    stop = header + 1
+    while stop < last and (
+        lines[stop].startswith((" ", "\t")) or not lines[stop].strip() or lines[stop].lstrip().startswith("#")
+    ):
+        stop += 1
+    # Insert after the last *item* line, not after trailing comments/blanks.
+    insert_at = stop
+    while insert_at > header + 1 and (
+        not lines[insert_at - 1].strip() or lines[insert_at - 1].lstrip().startswith("#")
+    ):
+        insert_at -= 1
+    sibling = lines[insert_at - 1] if insert_at - 1 > header else "  "
+    indent = sibling[: len(sibling) - len(sibling.lstrip())] or "  "
+    spec = [f"directed: {_yaml_flow(bool(directed))}", f"cluster_weight: {float(cluster_weight)}"]
+    if domain:
+        spec.append(f"domain: {_yaml_flow(list(domain))}")
+    if range:
+        spec.append(f"range: {_yaml_flow(list(range))}")
+    lines.insert(insert_at, f"{indent}{name}: {{{', '.join(spec)}}}\n")
+    _validated_write(path, "".join(lines))
 
 
 def add_entity_type(path: Path, name: str) -> None:
-    def mutate(data: dict) -> None:
-        if name in data["entity_types"]:
-            raise ConfigError(f"{path.name}: entity type {name!r} already exists")
-        data["entity_types"].append(name)
-
-    _rewrite_front_matter(path, mutate)
+    config = load_config(path)
+    if name in config.entity_types:
+        raise ConfigError(f"{path.name}: entity type {name!r} already exists")
+    raw = path.read_text(encoding="utf-8")
+    lines = raw.splitlines(keepends=True)
+    first, last = _front_matter_span(lines)
+    for i in range(first, last):
+        flow = re.match(r"^(entity_types:\s*\[)(.*)(\]\s*)$", lines[i])
+        if flow:
+            items = flow.group(2).strip()
+            joined = f"{items}, {name}" if items else name
+            lines[i] = f"{flow.group(1)}{joined}{flow.group(3)}"
+            break
+        if re.match(r"^entity_types:\s*$", lines[i]):
+            # Block style: append a `- name` line after the last item.
+            stop = i + 1
+            while stop < last and lines[stop].lstrip().startswith("-"):
+                stop += 1
+            sibling = lines[stop - 1] if stop - 1 > i else "  - x"
+            indent = sibling[: len(sibling) - len(sibling.lstrip())] or "  "
+            lines.insert(stop, f"{indent}- {name}\n")
+            break
+    else:
+        raise ConfigError(f"{path.name}: could not find entity_types to add to")
+    _validated_write(path, "".join(lines))
 
 
 def scaffold(paths: VaultPaths) -> None:

@@ -23,7 +23,7 @@ from mindpalace.graph.duplicates import (
     propose_near_duplicates,
     propose_similar_entities,
 )
-from mindpalace.graph.integrity import check_entity_types
+from mindpalace.graph.integrity import check_entity_types, check_signatures
 from mindpalace.ids import slugify
 from mindpalace.index import db, vectors
 from mindpalace.models import Capture, Note, capture_from_markdown, note_from_markdown
@@ -531,6 +531,50 @@ def _entity_profiles(notes: list[Note], tables: GraphTables) -> dict[str, str]:
     return profiles
 
 
+def _merged_page_issues(
+    store: VaultStore, tables: GraphTables, entity_pages: list
+) -> tuple[list[tuple[str, str, str]], set[str]]:
+    """An entity page whose slug has been merged away (docs/decisions/0001
+    §5) is orphaned: rebuild never deletes Tier 2, so the file stays, but it
+    must not be indexed as a live entity or read as one. Report it and hand
+    back the slugs so `sync` skips them."""
+    canonical = {
+        merged: entity.slug
+        for entity in tables.entities.values()
+        for merged in entity.merged_from
+    }
+    issues: list[tuple[str, str, str]] = []
+    orphaned: set[str] = set()
+    for page in entity_pages:
+        target = canonical.get(page.slug)
+        if target is None:
+            continue
+        orphaned.add(page.slug)
+        issues.append(
+            (
+                _relative(store, store.paths.entity_path(page.slug)),
+                "merged_entity_page",
+                f"{page.slug!r} was merged into {target!r}; this page is no "
+                f"longer an entity. Move any prose worth keeping to "
+                f"entities/{target}.md and delete this file, or unmerge",
+            )
+        )
+    return issues, orphaned
+
+
+def _signature_issues(
+    store: VaultStore, tables: GraphTables, config: Config, note_paths: dict[str, str]
+) -> list[tuple[str, str, str]]:
+    return [
+        (
+            note_paths.get(tables.assertions[f.assertion_id].note_id, ".mindpalace"),
+            "signature_violation",
+            f.detail,
+        )
+        for f in check_signatures(tables, config)
+    ]
+
+
 def _render_index(
     captures: list[Capture], notes: list[Note], tables: GraphTables
 ) -> str:
@@ -601,11 +645,16 @@ def sync(
     entity_pages, entity_issues, entity_degraded = _load_entity_pages(store)
     issues.extend(entity_issues)
     degraded.extend(entity_degraded)
+    merged_issues, orphaned = _merged_page_issues(store, tables, entity_pages)
+    issues.extend(merged_issues)
     for page in entity_pages:
+        if page.slug in orphaned:
+            continue
         documents.append((f"e_{page.slug}", "entity", page.slug, page.description))
     issues.extend(_ambiguous_alias_issues(store, entity_pages))
     issues.extend(_near_duplicate_issues(store, tables, entity_pages))
     issues.extend(_entity_type_issues(store, folded_notes, tables, config))
+    issues.extend(_signature_issues(store, tables, config, note_paths))
 
     reports, report_issues, report_degraded = _load_reports(store)
     issues.extend(report_issues)

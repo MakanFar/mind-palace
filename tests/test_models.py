@@ -242,3 +242,13 @@ def test_note_drop_ledger_round_trips():
     assert "reason: missing_field" in text
     assert note_from_markdown(text) == note
     assert note_from_markdown(note_to_markdown(NOTE)).drops == ()
+
+
+def test_validity_rejects_impossible_dates_and_trailing_junk():
+    from mindpalace.models import is_valid_validity
+
+    assert is_valid_validity("2026-02-28", allow_unknown=False)
+    assert not is_valid_validity("2026-13", allow_unknown=False)
+    assert not is_valid_validity("2026-02-30", allow_unknown=False)
+    assert not is_valid_validity("2026\n", allow_unknown=False)
+    assert not is_valid_validity("unknown", allow_unknown=False)
