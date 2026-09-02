@@ -70,34 +70,39 @@ def test_write_note_assigns_assertion_ids_and_leaves_them_proposed(session):
     assert assertion["status"] == "proposed"
 
 
-def test_write_note_rejects_an_unknown_edge_type(session):
+def test_write_note_keeps_an_unknown_edge_type_as_a_proposal(session):
+    """docs/decisions/0001 §1: the model's wording is kept, not refused."""
     capture = save_capture(session, "A thought.")
-    with pytest.raises(ToolError, match="invented"):
-        write_note(
-            session,
-            derived_from=capture["id"],
-            content="Body.",
-            relationship_assertions=[
-                {
-                    "source": "a",
-                    "target": "b",
-                    "type": "invented",
-                    "strength": 5,
-                    "description": "x",
-                }
-            ],
-        )
+    result = write_note(
+        session,
+        derived_from=capture["id"],
+        content="Body.",
+        relationship_assertions=[
+            {
+                "source": "a",
+                "target": "b",
+                "type": "invented",
+                "strength": 5,
+                "description": "x",
+            }
+        ],
+    )
+    [assertion] = result["relationship_assertions"]
+    assert assertion["type"] is None
+    assert assertion["proposed_type"] == "invented"
+    assert result["dropped"] == []
 
 
-def test_write_note_rejects_an_unknown_entity_type(session):
+def test_write_note_keeps_an_unknown_entity_type_as_a_proposal(session):
     capture = save_capture(session, "A thought.")
-    with pytest.raises(ToolError, match="teapot"):
-        write_note(
-            session,
-            derived_from=capture["id"],
-            content="Body.",
-            entities=[{"name": "a", "type": "teapot", "description": "x"}],
-        )
+    result = write_note(
+        session,
+        derived_from=capture["id"],
+        content="Body.",
+        entities=[{"name": "a", "type": "teapot", "description": "x"}],
+    )
+    [entity] = result["entities"]
+    assert entity == {"name": "a", "type": None, "proposed_type": "teapot"}
 
 
 def test_write_note_rejects_a_missing_capture(session):
@@ -127,45 +132,56 @@ def test_write_note_rejects_empty_content(session):
         write_note(session, derived_from=capture["id"], content="  ")
 
 
-def test_write_note_rejects_a_name_that_normalises_to_nothing(session):
+def test_write_note_drops_a_name_that_normalises_to_nothing(session):
+    """docs/decisions/0001 §2: the item is dropped with a reason; the note
+    is still written."""
     capture = save_capture(session, "A thought.")
-    with pytest.raises(ToolError, match="empty slug"):
-        write_note(
-            session,
-            derived_from=capture["id"],
-            content="Body.",
-            entities=[{"name": "!!!", "type": "concept", "description": "x"}],
-        )
+    result = write_note(
+        session,
+        derived_from=capture["id"],
+        content="Body.",
+        entities=[{"name": "!!!", "type": "concept", "description": "x"}],
+    )
+    assert result["entities"] == []
+    [drop] = result["dropped"]
+    assert drop["kind"] == "entity" and drop["reason"] == "empty_slug"
+    assert (session.paths.root / result["path"]).exists()
 
 
-def test_write_note_rejects_out_of_range_strength(session):
+def test_write_note_drops_an_out_of_range_strength_and_keeps_the_note(session):
+    """docs/decisions/0001 §2: drop the item, record why, write the rest."""
     capture = save_capture(session, "A thought.")
-    with pytest.raises(ToolError, match="1-10"):
-        write_note(
-            session,
-            derived_from=capture["id"],
-            content="Body.",
-            relationship_assertions=[
-                {
-                    "source": "a",
-                    "target": "b",
-                    "type": "contradicts",
-                    "strength": 99,
-                    "description": "x",
-                }
-            ],
-        )
+    result = write_note(
+        session,
+        derived_from=capture["id"],
+        content="Body.",
+        relationship_assertions=[
+            {
+                "source": "a",
+                "target": "b",
+                "type": "contradicts",
+                "strength": 99,
+                "description": "x",
+            }
+        ],
+    )
+    assert result["relationship_assertions"] == []
+    [drop] = result["dropped"]
+    assert drop["reason"] == "bad_strength" and "1-10" in drop["detail"]
 
 
-def test_write_note_reports_a_missing_field_as_a_tool_error(session):
-    """A KeyError traceback tells the assistant nothing it can act on."""
+def test_write_note_records_a_missing_field_in_the_drop_ledger(session):
+    """A KeyError traceback tells the assistant nothing it can act on; a
+    drop naming the field does."""
     capture = save_capture(session, "A thought.")
-    with pytest.raises(ToolError, match="missing 'description'"):
-        write_note(
-            session,
-            derived_from=capture["id"],
-            content="Body.",
-            relationship_assertions=[
-                {"source": "a", "target": "b", "type": "contradicts"}
-            ],
-        )
+    result = write_note(
+        session,
+        derived_from=capture["id"],
+        content="Body.",
+        relationship_assertions=[
+            {"source": "a", "target": "b", "type": "contradicts"}
+        ],
+    )
+    [drop] = result["dropped"]
+    assert drop["reason"] == "missing_field" and drop["detail"] == "description"
+    assert "drops:" in (session.paths.root / result["path"]).read_text()

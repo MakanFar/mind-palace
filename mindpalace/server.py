@@ -29,6 +29,8 @@ TOOL_NAMES = (
     "graph_stats",
     "propose_relationship",
     "resolve_assertion",
+    "adopt_type",
+    "merge_entities",
     "review_queue",
     "cluster",
     "write_community_report",
@@ -71,7 +73,12 @@ def build_server(session: Session) -> MCPServer:
         claim_assertions: list[dict] | None = None,
     ) -> dict:
         """Record your analysis of a capture plus the entities, relationships,
-        and claims you extracted. All assertions enter as proposed."""
+        and claims you extracted. All assertions enter as proposed. A type
+        outside the vocabulary is kept as a proposal, not refused; a bad item
+        is dropped with a reason and the rest is written. A claim may carry
+        valid_from / valid_to (YYYY, YYYY-MM, YYYY-MM-DD; valid_to may be
+        "unknown") and supersedes (a claim id it corrects). Show the user the
+        returned `landed` line, not what you intended."""
         return _run(
             session,
             tools.write_note,
@@ -107,9 +114,11 @@ def build_server(session: Session) -> MCPServer:
         return _run(session, tools.neighbors, identifier, depth, edge_types)
 
     @server.tool(name="get_entity")
-    def _get_entity(name: str) -> dict:
-        """Fetch an entity by name or alias, with its claims and neighbours."""
-        return _run(session, tools.get_entity, name)
+    def _get_entity(name: str, as_of: str | None = None) -> dict:
+        """Fetch an entity by name, alias, or merged-away name, with its claims
+        and neighbours. Pass as_of (YYYY, YYYY-MM, YYYY-MM-DD) to see only the
+        claims that held at that date."""
+        return _run(session, tools.get_entity, name, as_of)
 
     @server.tool(name="graph_stats")
     def _graph_stats() -> dict:
@@ -121,7 +130,9 @@ def build_server(session: Session) -> MCPServer:
     def _propose_relationship(
         source: str, target: str, type: str, description: str, strength: int = 5
     ) -> dict:
-        """Propose a link spotted outside extraction. Enters as proposed."""
+        """Propose a link spotted outside extraction. Enters as proposed. An
+        unknown type is kept as a proposal; a signature violation is swapped
+        (direction_corrected) or untyped, never silently accepted."""
         return _run(
             session,
             tools.propose_relationship,
@@ -141,9 +152,50 @@ def build_server(session: Session) -> MCPServer:
         stated reason."""
         return _run(session, tools.resolve_assertion, identifier, action, reason)
 
+    @server.tool(name="adopt_type")
+    def _adopt_type(
+        kind: str,
+        proposed: str,
+        name: str,
+        directed: bool | None = None,
+        cluster_weight: float = 1.0,
+        domain: list[str] | None = None,
+        range: list[str] | None = None,
+        action: str = "adopt",
+    ) -> dict:
+        """Adopt a proposed wording (see review_queue's `vocabulary`) into the
+        vocabulary as edge or entity type `name`, adding it to MINDPALACE.md
+        if new (a new edge type needs `directed`). Every assertion carrying
+        that wording is retyped on the next fold; note files are untouched.
+        action="revoke" withdraws the mapping. Call on the user's instruction."""
+        return _run(
+            session,
+            tools.adopt_type,
+            kind,
+            proposed,
+            name,
+            directed,
+            cluster_weight,
+            domain,
+            range,
+            action,
+        )
+
+    @server.tool(name="merge_entities")
+    def _merge_entities(
+        duplicate: str, canonical: str, action: str = "merge", reason: str | None = None
+    ) -> dict:
+        """Record that two entities are one (action="merge": duplicate folds
+        into canonical on every rebuild, reversible with "unmerge") or that a
+        flagged pair is genuinely different ("keep", so the similarity lint
+        stops asking). Logged, never applied to note files. Call on the
+        user's instruction."""
+        return _run(session, tools.merge_entities, duplicate, canonical, action, reason)
+
     @server.tool(name="review_queue")
     def _review_queue(limit: int = 20) -> dict:
-        """Pending proposals and vault issues, in separate sections."""
+        """Pending proposals, vocabulary proposals (wordings with no type yet),
+        recent extraction drops, and vault issues, in separate sections."""
         return _run(session, tools.review_queue, limit)
 
     @server.tool(name="cluster")

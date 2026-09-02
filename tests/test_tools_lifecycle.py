@@ -54,9 +54,12 @@ def test_propose_relationship_creates_a_proposed_assertion(session):
     assert result["id"].startswith("x_")
 
 
-def test_propose_relationship_rejects_an_unknown_type(session):
-    with pytest.raises(ToolError, match="invented"):
-        propose_relationship(session, "a", "b", "invented", "x")
+def test_propose_relationship_keeps_an_unknown_type_as_a_proposal(session):
+    result = propose_relationship(session, "a", "b", "invented", "because")
+    assert result["type"] is None
+    assert result["proposed_type"] == "invented"
+    assert result["status"] == "proposed"
+    assert "untyped" in result["landed"]
 
 
 def test_resolve_assertion_confirms(with_assertion):

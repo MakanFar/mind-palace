@@ -47,7 +47,9 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS entities (
     slug TEXT PRIMARY KEY,
     type TEXT NOT NULL,
-    rank INTEGER NOT NULL DEFAULT 0
+    rank INTEGER NOT NULL DEFAULT 0,
+    -- Comma-joined slugs merged into this one (docs/decisions/0001 §5).
+    merged_from TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS entity_sources (

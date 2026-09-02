@@ -10,16 +10,23 @@ from datetime import UTC, datetime
 
 from mindpalace.citations import extract_ids, unresolvable
 from mindpalace.cluster import Community, match_lineages, partition, should_cluster
+from mindpalace.config import ConfigError, add_edge_type, add_entity_type, load_config
 from mindpalace.frontmatter import FrontMatterError
+from mindpalace.graph.fold import MergeCycleError, resolve_merges
 from mindpalace.ids import UnknownIdError, id_kind, new_id, slugify
 from mindpalace.models import (
+    VALIDITY_UNKNOWN,
     Capture,
     ClaimAssertion,
     CommunityReport,
+    Drop,
     EntityInstance,
     Note,
     RelationshipAssertion,
+    is_valid_validity,
+    validity_precision,
 )
+from mindpalace.oplog import MERGE_ACTIONS, VOCABULARY_ACTIONS, VOCABULARY_KINDS
 from mindpalace.index.sync import fold_notes_with_quarantine
 from mindpalace.rebuild import (
     community_input_hash,
@@ -42,6 +49,9 @@ class ToolError(ValueError):
 
 
 STRENGTH_RANGE = range(1, 11)
+#: An "entity name" longer than this is a sentence the model failed to
+#: reduce to a name (Utopia's `not_an_entity_name`, docs/decisions/0001 §2).
+MAX_NAME_WORDS = 6
 
 
 def _require(condition: bool, message: str) -> None:
@@ -82,7 +92,8 @@ def _edge_vocabulary(session: Session) -> dict[str, str]:
 
 def _known_entities(session: Session, limit: int = 40) -> list[dict]:
     rows = session.conn.execute(
-        "SELECT slug, type, rank FROM entities ORDER BY rank DESC, slug LIMIT ?",
+        "SELECT slug, type, rank, merged_from FROM entities "
+        "ORDER BY rank DESC, slug LIMIT ?",
         (limit,),
     ).fetchall()
     entities = []
@@ -93,12 +104,16 @@ def _known_entities(session: Session, limit: int = 40) -> list[dict]:
             # A malformed page must not break every other entity's listing
             # here (spec §10); it is already surfaced via vault_issues.
             page = None
+        aliases = list(page.user.get("aliases", [])) if page else []
+        # A merged-away name is an alias in every sense that matters to the
+        # extractor: reuse the canonical one, never resurrect the duplicate.
+        aliases += [m for m in row["merged_from"].split(",") if m]
         entities.append(
             {
                 "name": row["slug"],
                 "type": row["type"],
                 "rank": row["rank"],
-                "aliases": (page.user.get("aliases", []) if page else []),
+                "aliases": aliases,
             }
         )
     return entities
@@ -120,6 +135,321 @@ def _previously_dismissed(session: Session) -> list[dict]:
         }
         for row in rows
     ]
+
+
+def _rebuild(session: Session, scope: str = "all"):
+    """Every write tool rebuilds through here so the vocabulary and merge
+    logs (docs/decisions/0001 §1, §5) reach the fold on every call."""
+    return rebuild(
+        session.conn,
+        session.store,
+        session.config,
+        session.embedder,
+        session.statuses(),
+        scope=scope,
+        **session.overlays(),
+    )
+
+
+class _Ledger:
+    """Collects the items `write_note` refuses (docs/decisions/0001 §2).
+
+    Dropping one item and keeping the rest is the whole point: a single
+    malformed entry used to fail the entire note, and nothing recorded what
+    was lost.
+    """
+
+    def __init__(self) -> None:
+        self.drops: list[Drop] = []
+
+    def drop(self, kind: str, reason: str, detail: str, example: object = None) -> None:
+        self.drops.append(
+            Drop(
+                kind=kind,
+                reason=reason,
+                detail=detail,
+                example=None if example is None else str(example)[:200],
+            )
+        )
+
+
+def _entity_type_in_graph(session: Session, slug: str) -> str | None:
+    row = session.conn.execute(
+        "SELECT type FROM entities WHERE slug = ?", (slug,)
+    ).fetchone()
+    if row is None or row["type"] == "unknown":
+        return None
+    return row["type"]
+
+
+def _apply_signature(
+    session: Session,
+    source: str,
+    target: str,
+    edge_type: str,
+    local_types: dict[str, str | None],
+) -> tuple[str, str, str | None, bool]:
+    """Enforce the edge type's domain/range at the write boundary
+    (docs/decisions/0001 §3).
+
+    Returns (source, target, type-or-None, direction_corrected). Endpoint
+    types come from the note being written first, then the graph; an
+    endpoint of unknown type never violates. Directed: if the pair is
+    invalid as given but valid swapped, swap and flag. Otherwise the type is
+    dropped and the endpoints and rationale stay -- the caller records the
+    `domain_mismatch` drop.
+    """
+    spec = session.config.edge_types[edge_type]
+    if spec.domain is None and spec.range is None:
+        return source, target, edge_type, False
+
+    def type_of(slug: str) -> str | None:
+        if slug in local_types:
+            return local_types[slug]
+        return _entity_type_in_graph(session, slug)
+
+    def fits(entity_type: str | None, allowed: tuple[str, ...] | None) -> bool:
+        return allowed is None or entity_type is None or entity_type in allowed
+
+    s_type, t_type = type_of(source), type_of(target)
+    if not spec.directed:
+        if fits(s_type, spec.domain) and fits(t_type, spec.domain):
+            return source, target, edge_type, False
+        return source, target, None, False
+    if fits(s_type, spec.domain) and fits(t_type, spec.range):
+        return source, target, edge_type, False
+    if fits(t_type, spec.domain) and fits(s_type, spec.range):
+        return target, source, edge_type, True
+    return source, target, None, False
+
+
+def _validate_entities(
+    session: Session, entities, ledger: _Ledger
+) -> list[EntityInstance]:
+    built: list[EntityInstance] = []
+    for entity in entities:
+        example = entity.get("name") if isinstance(entity, dict) else entity
+        missing = [f for f in ("name", "type", "description") if f not in entity]
+        if missing:
+            ledger.drop("entity", "missing_field", ", ".join(missing), example)
+            continue
+        name = str(entity["name"])
+        if len(name.split()) > MAX_NAME_WORDS:
+            ledger.drop(
+                "entity", "not_an_entity_name",
+                f"{len(name.split())} words; a name, not a sentence", name,
+            )
+            continue
+        slug = slugify(name)
+        if not slug:
+            ledger.drop("entity", "empty_slug", "name normalises to nothing", name)
+            continue
+        declared = entity["type"]
+        if declared in session.config.entity_types:
+            built.append(EntityInstance(name=slug, type=declared, description=entity["description"]))
+        else:
+            built.append(
+                EntityInstance(
+                    name=slug, type=None, description=entity["description"],
+                    proposed_type=str(declared),
+                )
+            )
+    return built
+
+
+def _validate_relationships(
+    session: Session, assertions, ledger: _Ledger, local_types: dict[str, str | None]
+) -> list[RelationshipAssertion]:
+    built: list[RelationshipAssertion] = []
+    for assertion in assertions:
+        example = (
+            f"{assertion.get('source')} -> {assertion.get('target')}"
+            if isinstance(assertion, dict) else assertion
+        )
+        missing = [f for f in ("source", "target", "type", "description") if f not in assertion]
+        if missing:
+            ledger.drop("relationship", "missing_field", ", ".join(missing), example)
+            continue
+        strength = assertion.get("strength", 5)
+        if not isinstance(strength, int) or strength not in STRENGTH_RANGE:
+            ledger.drop("relationship", "bad_strength", f"strength {strength!r} is not 1-10", example)
+            continue
+        source, target = slugify(str(assertion["source"])), slugify(str(assertion["target"]))
+        if not source or not target:
+            ledger.drop("relationship", "empty_slug", "an endpoint normalises to nothing", example)
+            continue
+        if source == target:
+            ledger.drop("relationship", "self_loop", "source and target are the same entity", example)
+            continue
+        corrected = False
+        proposed = None
+        edge_type = assertion["type"]
+        if edge_type in session.config.edge_types:
+            source, target, edge_type, corrected = _apply_signature(
+                session, source, target, edge_type, local_types
+            )
+            if edge_type is None:
+                proposed = str(assertion["type"])
+                ledger.drop(
+                    "relationship", "domain_mismatch",
+                    f"{proposed!r} is not declared between these entity types in "
+                    f"either direction; the type was dropped, the link kept",
+                    example,
+                )
+        else:
+            proposed = str(edge_type)
+            edge_type = None
+        built.append(
+            RelationshipAssertion(
+                id=new_id("x_"),
+                source=source,
+                target=target,
+                type=edge_type,
+                strength=int(strength),
+                description=assertion["description"],
+                proposed_type=proposed,
+                direction_corrected=corrected,
+            )
+        )
+    return built
+
+
+def _at_or_before(left: str, right: str) -> bool:
+    """Compare two validity strings of possibly different precision on their
+    common prefix, so "2026-03" neither precedes nor follows "2026-03-15"."""
+    n = min(len(left), len(right))
+    return left[:n] <= right[:n]
+
+
+def _validate_claims(session: Session, claims, ledger: _Ledger) -> list[ClaimAssertion]:
+    built: list[ClaimAssertion] = []
+    for claim in claims:
+        example = claim.get("text") if isinstance(claim, dict) else claim
+        missing = [f for f in ("subject", "text") if f not in claim]
+        if missing:
+            ledger.drop("claim", "missing_field", ", ".join(missing), example)
+            continue
+        if not str(claim["text"]).strip():
+            ledger.drop("claim", "empty_text", "claim text is empty", claim.get("subject"))
+            continue
+        subject = slugify(str(claim["subject"]))
+        if not subject:
+            ledger.drop("claim", "empty_slug", "subject normalises to nothing", example)
+            continue
+        valid_from = _validity_string(claim.get("valid_from"))
+        valid_to = _validity_string(claim.get("valid_to"))
+        if not is_valid_validity(valid_from, allow_unknown=False):
+            ledger.drop(
+                "claim", "bad_validity",
+                f"valid_from {valid_from!r} is not YYYY, YYYY-MM or YYYY-MM-DD", example,
+            )
+            continue
+        if not is_valid_validity(valid_to, allow_unknown=True):
+            ledger.drop(
+                "claim", "bad_validity",
+                f"valid_to {valid_to!r} is not YYYY, YYYY-MM, YYYY-MM-DD or 'unknown'",
+                example,
+            )
+            continue
+        if (
+            valid_from is not None
+            and valid_to not in (None, VALIDITY_UNKNOWN)
+            and not _at_or_before(valid_from, valid_to)
+        ):
+            ledger.drop(
+                "claim", "bad_validity",
+                f"valid_from {valid_from} is after valid_to {valid_to}", example,
+            )
+            continue
+        supersedes = claim.get("supersedes")
+        if supersedes is not None:
+            known = session.conn.execute(
+                "SELECT 1 FROM claims WHERE id = ?", (supersedes,)
+            ).fetchone()
+            if known is None:
+                ledger.drop(
+                    "claim", "unknown_supersedes",
+                    f"{supersedes!r} is not an existing claim id", example,
+                )
+                continue
+        built.append(
+            ClaimAssertion(
+                id=new_id("k_"),
+                subject=subject,
+                text=claim["text"],
+                valid_from=valid_from,
+                valid_to=valid_to,
+                supersedes=supersedes,
+            )
+        )
+    return built
+
+
+def _validity_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    return str(value)
+
+
+def _pair(source: str, edge_type: str | None, proposed: str | None, target: str) -> str:
+    label = edge_type if edge_type is not None else f"(untyped: {proposed})"
+    return f"{source}|{label}|{target}"
+
+
+def _plural(count: int, noun: str) -> str:
+    if count == 1:
+        return f"1 {noun}"
+    return f"{count} {'entities' if noun == 'entity' else noun + 's'}"
+
+
+def _landed(
+    entities: list[EntityInstance],
+    relationships: list[RelationshipAssertion],
+    claims: list[ClaimAssertion],
+    drops: list[Drop],
+) -> str:
+    """One line saying what actually entered the vault
+    (docs/decisions/0001 §7). The assistant shows this, not its intent."""
+    untyped_entities = sum(1 for e in entities if e.type is None)
+    untyped_rels = sum(1 for r in relationships if r.type is None)
+    corrected = sum(1 for r in relationships if r.direction_corrected)
+    parts = []
+    entity_notes = [f"{untyped_entities} untyped"] if untyped_entities else []
+    parts.append(_plural(len(entities), "entity") + (f" ({', '.join(entity_notes)})" if entity_notes else ""))
+    rel_notes = []
+    if untyped_rels:
+        rel_notes.append(f"{untyped_rels} untyped")
+    if corrected:
+        rel_notes.append(f"{corrected} direction-corrected")
+    parts.append(_plural(len(relationships), "relationship") + (f" ({', '.join(rel_notes)})" if rel_notes else ""))
+    parts.append(_plural(len(claims), "claim"))
+    return f"{', '.join(parts)}; {len(drops)} dropped"
+
+
+def _relationship_payload(a: RelationshipAssertion) -> dict:
+    return {
+        "id": a.id,
+        "pair": _pair(a.source, a.type, a.proposed_type, a.target),
+        "source": a.source,
+        "target": a.target,
+        "type": a.type,
+        "proposed_type": a.proposed_type,
+        "direction_corrected": a.direction_corrected,
+        "status": "proposed",
+    }
+
+
+def _claim_payload(c: ClaimAssertion) -> dict:
+    return {
+        "id": c.id,
+        "subject": c.subject,
+        "valid_from": c.valid_from,
+        "valid_to": c.valid_to,
+        "supersedes": c.supersedes,
+        "status": "proposed",
+    }
 
 
 def save_capture(
@@ -162,105 +492,60 @@ def write_note(
     relationship_assertions: list[dict] | tuple = (),
     claim_assertions: list[dict] | tuple = (),
 ) -> dict:
+    """Note-level failures raise; item-level failures are dropped and
+    recorded in the note's `drops:` ledger (docs/decisions/0001 §2)."""
     _require(bool(content.strip()), "note content is empty")
 
     known_captures = {capture.id for capture in session.store.iter_captures()}
     _require(derived_from in known_captures, f"no such capture: {derived_from}")
 
-    for entity in entities:
-        for field in ("name", "type", "description"):
-            _require(field in entity, f"entity entry is missing {field!r}: {entity}")
-        _require(
-            entity["type"] in session.config.entity_types,
-            f"unknown entity type {entity['type']!r}; "
-            f"choose from {session.config.entity_types}",
-        )
-        _require_slug(entity["name"], "entity name")
-
-    for assertion in relationship_assertions:
-        for field in ("source", "target", "type", "description"):
-            _require(
-                field in assertion, f"relationship is missing {field!r}: {assertion}"
-            )
-        _require(
-            assertion["type"] in session.config.edge_types,
-            f"unknown edge type {assertion['type']!r}; "
-            f"choose from {sorted(session.config.edge_types)}",
-        )
-        strength = assertion.get("strength", 5)
-        _require(
-            isinstance(strength, int) and strength in STRENGTH_RANGE,
-            f"strength must be an integer 1-10, got {strength!r}",
-        )
-        _require_slug(assertion["source"], "relationship source")
-        _require_slug(assertion["target"], "relationship target")
-
-    for claim in claim_assertions:
-        for field in ("subject", "text"):
-            _require(field in claim, f"claim is missing {field!r}: {claim}")
-        _require(bool(claim["text"].strip()), "claim text is empty")
-        _require_slug(claim["subject"], "claim subject")
+    ledger = _Ledger()
+    built_entities = _validate_entities(session, entities, ledger)
+    local_types = {e.name: e.type for e in built_entities}
+    built_relationships = _validate_relationships(
+        session, relationship_assertions, ledger, local_types
+    )
+    built_claims = _validate_claims(session, claim_assertions, ledger)
 
     note_id = new_id("n_")
-    built_relationships = tuple(
-        RelationshipAssertion(
-            id=new_id("x_"),
-            source=slugify(a["source"]),
-            target=slugify(a["target"]),
-            type=a["type"],
-            strength=int(a.get("strength", 5)),
-            description=a["description"],
-        )
-        for a in relationship_assertions
-    )
-    built_claims = tuple(
-        ClaimAssertion(id=new_id("k_"), subject=slugify(c["subject"]), text=c["text"])
-        for c in claim_assertions
-    )
     note = Note(
         id=note_id,
         derived_from=derived_from,
         created=_timestamp(_now()),
         author="llm",
         body=content,
-        entities=tuple(
-            EntityInstance(
-                name=slugify(e["name"]), type=e["type"], description=e["description"]
-            )
-            for e in entities
-        ),
-        relationship_assertions=built_relationships,
-        claim_assertions=built_claims,
+        entities=tuple(built_entities),
+        relationship_assertions=tuple(built_relationships),
+        claim_assertions=tuple(built_claims),
+        drops=tuple(ledger.drops),
     )
 
     slug = slugify(content.splitlines()[0] if content.strip() else note_id)
     with session.operation({"tool": "write_note", "note": note_id}):
         path = session.store.write_note(note, slug or note_id)
-        rebuild(
-            session.conn,
-            session.store,
-            session.config,
-            session.embedder,
-            session.statuses(),
-        )
+        _rebuild(session)
 
+    landed = _landed(built_entities, built_relationships, built_claims, ledger.drops)
     return {
         "id": note_id,
         "path": _relative(session, path),
-        "entities": [e.name for e in note.entities],
-        "relationship_assertions": [
-            {
-                "id": a.id,
-                "pair": f"{a.source}|{a.type}|{a.target}",
-                "status": "proposed",
-            }
-            for a in built_relationships
+        "entities": [
+            {"name": e.name, "type": e.type, "proposed_type": e.proposed_type}
+            for e in built_entities
         ],
-        "claim_assertions": [
-            {"id": c.id, "subject": c.subject, "status": "proposed"}
-            for c in built_claims
+        "relationship_assertions": [_relationship_payload(a) for a in built_relationships],
+        "claim_assertions": [_claim_payload(c) for c in built_claims],
+        "dropped": [
+            {"kind": d.kind, "reason": d.reason, "detail": d.detail, "example": d.example}
+            for d in ledger.drops
         ],
-        "next": "Nothing further is required. Proposals wait in review_queue.",
+        "landed": landed,
+        "next": (
+            f"Tell the user what landed, not what you intended: {landed}. "
+            f"An untyped item kept the wording you gave it and waits as a "
+            f"vocabulary proposal; a direction-corrected one was swapped to fit "
+            f"the edge type's signature. Proposals wait in review_queue."
+        ),
     }
 
 
@@ -272,8 +557,13 @@ def _tables(session: Session):
     `write_community_report` down with it (spec §10). See
     `mindpalace.index.sync.fold_notes_with_quarantine`.
     """
+    overlays = session.overlays()
     notes, notes_by_id, tables, _issues = fold_notes_with_quarantine(
-        session.store, session.config, session.statuses()
+        session.store,
+        session.config,
+        session.statuses(),
+        overlays["adoptions"],
+        overlays["merges"],
     )
     return notes, notes_by_id, tables
 
@@ -383,6 +673,13 @@ def _resolve_slug(session: Session, name: str) -> str | None:
     look the ambiguous name up.
     """
     slug = slugify(name)
+    # A merged-away slug resolves to its canonical entity
+    # (docs/decisions/0001 §5); a cycle in a hand-edited log is already a
+    # vault_issue, so here it just means "no merge applies".
+    try:
+        slug = resolve_merges(session.merges.merges()).get(slug, slug)
+    except MergeCycleError:
+        pass
     row = session.conn.execute(
         "SELECT slug FROM entities WHERE slug = ?", (slug,)
     ).fetchone()
@@ -408,10 +705,41 @@ def _resolve_slug(session: Session, name: str) -> str | None:
     return matches[0] if matches else None
 
 
-def get_entity(session: Session, name: str) -> dict:
+def _claim_row(record) -> dict:
+    return {
+        "id": record["id"],
+        "text": record["text"],
+        "status": record["status"],
+        "valid_from": record["valid_from"],
+        "valid_to": record["valid_to"],
+        "valid_from_precision": validity_precision(record["valid_from"]),
+        "valid_to_precision": validity_precision(record["valid_to"]),
+        "supersedes": record["supersedes"],
+    }
+
+
+def _holds_at(claim: dict, as_of: str) -> bool:
+    """Whether a claim's validity interval contains `as_of`
+    (docs/decisions/0001 §4). No bound means unbounded on that side;
+    `valid_to: unknown` means it ended some time we cannot name, so it is
+    never excluded on that evidence."""
+    if claim["valid_from"] is not None and not _at_or_before(claim["valid_from"], as_of):
+        return False
+    valid_to = claim["valid_to"]
+    if valid_to is None or valid_to == VALIDITY_UNKNOWN:
+        return True
+    return _at_or_before(as_of, valid_to)
+
+
+def get_entity(session: Session, name: str, as_of: str | None = None) -> dict:
     slug = _resolve_slug(session, name)
     if slug is None:
         raise ToolError(f"no entity matching {name!r}")
+    if as_of is not None:
+        _require(
+            is_valid_validity(as_of, allow_unknown=False),
+            f"as_of must be YYYY, YYYY-MM or YYYY-MM-DD, got {as_of!r}",
+        )
 
     try:
         page = session.store.read_entity_page(slug)
@@ -421,21 +749,27 @@ def get_entity(session: Session, name: str) -> dict:
         # the same shape as "no page written yet" (spec §10).
         page = None
     row = session.conn.execute(
-        "SELECT type, rank FROM entities WHERE slug = ?", (slug,)
+        "SELECT type, rank, merged_from FROM entities WHERE slug = ?", (slug,)
     ).fetchone()
     claims = [
-        dict(record)
+        _claim_row(record)
         for record in session.conn.execute(
-            "SELECT id, text, status FROM claims WHERE subject = ?", (slug,)
+            "SELECT id, text, status, valid_from, valid_to, supersedes "
+            "FROM claims WHERE subject = ? ORDER BY id",
+            (slug,),
         )
     ]
+    if as_of is not None:
+        claims = [c for c in claims if _holds_at(c, as_of)]
     return {
         "slug": slug,
         "type": row["type"] if row else (page.type if page else "unknown"),
         "rank": row["rank"] if row else 0,
+        "merged_from": [m for m in row["merged_from"].split(",") if m] if row else [],
         "description": page.description if page else "",
         "stale": page.stale if page else True,
         "user": page.user if page else {},
+        "as_of": as_of,
         "claims": claims,
         "neighbours": neighbors(session, f"e_{slug}")["neighbours"],
     }
@@ -474,6 +808,19 @@ def graph_stats(session: Session) -> dict:
             "SELECT COUNT(*) FROM aggregates WHERE traversable = 1"
         ),
         "claims": count("SELECT COUNT(*) FROM claims"),
+        "superseded_claims": count("SELECT COUNT(*) FROM claims WHERE status = 'superseded'"),
+        "untyped_assertions": count("SELECT COUNT(*) FROM assertions WHERE type IS NULL"),
+        "vocabulary_proposals": count("SELECT COUNT(*) FROM vocabulary_proposals"),
+        "drops": {
+            "total": count("SELECT COUNT(*) FROM drops"),
+            "by_reason": {
+                row["reason"]: row["n"]
+                for row in session.conn.execute(
+                    "SELECT reason, COUNT(*) AS n FROM drops GROUP BY reason ORDER BY reason"
+                )
+            },
+        },
+        "merges": len(session.merges.merges()),
         "communities": communities,
         "stale_entity_pages": stale_pages,
         "stale_reports": stale_reports,
@@ -504,23 +851,33 @@ def propose_relationship(
     description: str,
     strength: int = 5,
 ) -> dict:
-    _require(
-        type in session.config.edge_types,
-        f"unknown edge type {type!r}; choose from {sorted(session.config.edge_types)}",
-    )
+    """One assertion, so a hard failure raises rather than dropping: there
+    would be nothing left to write. An unknown type is not a failure -- it
+    is kept as a proposal (docs/decisions/0001 §1) -- and a signature
+    violation is corrected or untyped exactly as in `write_note` (§3)."""
     _require(
         isinstance(strength, int) and strength in STRENGTH_RANGE,
         f"strength must be an integer 1-10, got {strength!r}",
     )
     _require(bool(description.strip()), "a proposed relationship needs a rationale")
+    source_slug = _require_slug(source, "relationship source")
+    target_slug = _require_slug(target, "relationship target")
+    _require(source_slug != target_slug, "source and target are the same entity")
 
-    assertion = RelationshipAssertion(
-        id=new_id("x_"),
-        source=_require_slug(source, "relationship source"),
-        target=_require_slug(target, "relationship target"),
-        type=type,
-        strength=int(strength),
-        description=description,
+    ledger = _Ledger()
+    [assertion] = _validate_relationships(
+        session,
+        [
+            {
+                "source": source_slug,
+                "target": target_slug,
+                "type": type,
+                "description": description,
+                "strength": strength,
+            }
+        ],
+        ledger,
+        {},
     )
     note = Note(
         id=new_id("n_"),
@@ -529,22 +886,119 @@ def propose_relationship(
         author="user",
         body=f"Relationship proposed outside extraction: {description}",
         relationship_assertions=(assertion,),
+        drops=tuple(ledger.drops),
     )
     with session.operation({"tool": "propose_relationship", "note": note.id}):
         session.store.write_note(note, f"link-{assertion.source}-{assertion.target}")
-        rebuild(
-            session.conn,
-            session.store,
-            session.config,
-            session.embedder,
-            session.statuses(),
-        )
+        _rebuild(session)
+    payload = _relationship_payload(assertion)
+    payload["note"] = note.id
+    payload["dropped"] = [
+        {"kind": d.kind, "reason": d.reason, "detail": d.detail, "example": d.example}
+        for d in ledger.drops
+    ]
+    payload["landed"] = _landed([], [assertion], [], ledger.drops)
+    return payload
+
+
+def adopt_type(
+    session: Session,
+    kind: str,
+    proposed: str,
+    name: str,
+    directed: bool | None = None,
+    cluster_weight: float = 1.0,
+    domain: list[str] | None = None,
+    range: list[str] | None = None,
+    action: str = "adopt",
+) -> dict:
+    """Promote a proposed wording into the vocabulary (docs/decisions/0001 §1).
+
+    Adds `name` to MINDPALACE.md if it is not there yet, then records
+    `proposed -> name` in `vocabulary.jsonl`; the next fold retypes every
+    assertion (or entity) that carried that wording. Note files are never
+    rewritten. `action="revoke"` withdraws the mapping and leaves the type
+    in the config: a type that has been used is history, not clutter.
+    """
+    _require(kind in VOCABULARY_KINDS, f"kind must be one of {sorted(VOCABULARY_KINDS)}, got {kind!r}")
+    _require(action in VOCABULARY_ACTIONS, f"action must be one of {sorted(VOCABULARY_ACTIONS)}, got {action!r}")
+    key = _require_slug(proposed, "proposed wording")
+    _require(bool(name.strip()), "the adopted type needs a name")
+
+    waiting = session.conn.execute(
+        "SELECT ids FROM vocabulary_proposals WHERE kind = ? AND proposed = ?",
+        (kind, key),
+    ).fetchone()
+    waiting_ids = [i for i in waiting["ids"].split(",") if i] if waiting else []
+
+    with session.operation({"tool": "adopt_type", "kind": kind, "proposed": key, "action": action}) as op_id:
+        if action == "adopt":
+            try:
+                if kind == "edge" and name not in session.config.edge_types:
+                    _require(
+                        directed is not None,
+                        f"{name!r} is a new edge type; say whether it is directed",
+                    )
+                    add_edge_type(
+                        session.paths.mindpalace_md, name,
+                        directed=directed, cluster_weight=cluster_weight,
+                        domain=domain, range=range,
+                    )
+                elif kind == "entity" and name not in session.config.entity_types:
+                    add_entity_type(session.paths.mindpalace_md, name)
+            except ConfigError as exc:
+                raise ToolError(str(exc)) from exc
+            session.config = load_config(session.paths.mindpalace_md)
+        session.vocabulary.append(kind, key, name, action, "adopt_type", op_id)
+        _rebuild(session)
+
     return {
-        "id": assertion.id,
-        "note": note.id,
-        "pair": f"{assertion.source}|{assertion.type}|{assertion.target}",
-        "status": "proposed",
+        "kind": kind,
+        "proposed": key,
+        "adopted": name,
+        "action": action,
+        "retyped": waiting_ids,
     }
+
+
+def merge_entities(
+    session: Session,
+    duplicate: str,
+    canonical: str,
+    action: str = "merge",
+    reason: str | None = None,
+) -> dict:
+    """Record an identity decision in `merges.jsonl` (docs/decisions/0001 §5).
+
+    `merge` folds `duplicate` into `canonical` on every rebuild from now on;
+    `unmerge` reverses it; `keep` says the two are different so the
+    similarity lint stops asking. The note files are untouched, so the
+    decision is exactly as reversible as any other line in a log.
+    """
+    _require(action in MERGE_ACTIONS, f"action must be one of {sorted(MERGE_ACTIONS)}, got {action!r}")
+    dup = _require_slug(duplicate, "duplicate")
+    canon = _require_slug(canonical, "canonical")
+    _require(dup != canon, f"{dup!r} cannot be merged into itself")
+
+    if action == "merge":
+        current = session.merges.merges()
+        known = {row["slug"] for row in session.conn.execute("SELECT slug FROM entities")}
+        known |= set(current) | set(current.values())
+        for slug in (dup, canon):
+            _require(slug in known, f"no entity {slug!r} in the graph")
+        try:
+            resolve_merges({**current, dup: canon})
+        except MergeCycleError as exc:
+            raise ToolError(
+                f"merging {dup!r} into {canon!r} would create a cycle: {exc}"
+            ) from exc
+
+    with session.operation({"tool": "merge_entities", "duplicate": dup, "canonical": canon, "action": action}) as op_id:
+        session.merges.append(dup, canon, action, "merge_entities", op_id, reason)
+        _rebuild(session)
+
+    status = {"merge": "merged", "unmerge": "unmerged", "keep": "kept"}[action]
+    return {"duplicate": dup, "canonical": canon, "status": status, "reason": reason}
 
 
 def resolve_assertion(
@@ -564,13 +1018,7 @@ def resolve_assertion(
         {"tool": "resolve_assertion", "assertion": identifier, "action": action}
     ) as op_id:
         session.decisions.append(identifier, action, "resolve_assertion", op_id, reason)
-        rebuild(
-            session.conn,
-            session.store,
-            session.config,
-            session.embedder,
-            session.statuses(),
-        )
+        _rebuild(session)
 
     return {"id": identifier, "status": VALID_ACTIONS[action], "reason": reason}
 
@@ -602,7 +1050,10 @@ def review_queue(session: Session, limit: int = 20) -> dict:
         {
             "id": row["id"],
             "kind": "relationship",
-            "pair": f"{row['source']}|{row['type']}|{row['target']}",
+            "pair": _pair(row["source"], row["type"], row["proposed_type"], row["target"]),
+            "type": row["type"],
+            "proposed_type": row["proposed_type"],
+            "direction_corrected": bool(row["direction_corrected"]),
             "strength": row["strength"],
             "why": row["description"],
             "note": row["note_id"],
@@ -610,7 +1061,8 @@ def review_queue(session: Session, limit: int = 20) -> dict:
             "target_snippet": _endpoint_snippet(session, row["target"]),
         }
         for row in session.conn.execute(
-            "SELECT id, note_id, source, target, type, strength, description "
+            "SELECT id, note_id, source, target, type, proposed_type, "
+            "direction_corrected, strength, description "
             "FROM assertions WHERE status = 'proposed' "
             "ORDER BY strength DESC, id LIMIT ?",
             (limit,),
@@ -622,12 +1074,45 @@ def review_queue(session: Session, limit: int = 20) -> dict:
             "kind": "claim",
             "subject": row["subject"],
             "text": row["text"],
+            "valid_from": row["valid_from"],
+            "valid_to": row["valid_to"],
+            "supersedes": row["supersedes"],
             "note": row["note_id"],
             "subject_snippet": _endpoint_snippet(session, row["subject"]),
         }
         for row in session.conn.execute(
-            "SELECT id, note_id, subject, text FROM claims "
-            "WHERE status = 'proposed' ORDER BY id LIMIT ?",
+            "SELECT id, note_id, subject, text, valid_from, valid_to, supersedes "
+            "FROM claims WHERE status = 'proposed' ORDER BY id LIMIT ?",
+            (limit,),
+        )
+    ]
+    # Wordings the vocabulary has no type for (docs/decisions/0001 §1). The
+    # remedy is `adopt_type`; the count says which ones are worth it.
+    vocabulary = [
+        {
+            "kind": row["kind"],
+            "proposed": row["proposed"],
+            "count": row["count"],
+            "example": row["example"],
+            "ids": [i for i in row["ids"].split(",") if i],
+        }
+        for row in session.conn.execute(
+            "SELECT kind, proposed, count, example, ids FROM vocabulary_proposals "
+            "ORDER BY count DESC, kind, proposed LIMIT ?",
+            (limit,),
+        )
+    ]
+    drops = [
+        {
+            "note": row["note_id"],
+            "kind": row["kind"],
+            "reason": row["reason"],
+            "detail": row["detail"],
+            "example": row["example"],
+        }
+        for row in session.conn.execute(
+            "SELECT note_id, kind, reason, detail, example FROM drops "
+            "ORDER BY note_id DESC LIMIT ?",
             (limit,),
         )
     ]
@@ -653,7 +1138,12 @@ def review_queue(session: Session, limit: int = 20) -> dict:
         if report.stale
     ]
 
-    return {"proposals": proposals, "vault_issues": issues}
+    return {
+        "proposals": proposals,
+        "vocabulary": vocabulary,
+        "drops": drops,
+        "vault_issues": issues,
+    }
 
 
 def _stored_communities(session: Session) -> list[Community]:
@@ -874,14 +1364,7 @@ def rebuild_tool(session: Session, scope: str = "all") -> dict:
     if scope not in {"cache", "related_blocks", "all"}:
         raise ToolError(f"scope must be cache, related_blocks, or all; got {scope!r}")
     with session.operation({"tool": "rebuild", "scope": scope}):
-        report = rebuild(
-            session.conn,
-            session.store,
-            session.config,
-            session.embedder,
-            session.statuses(),
-            scope=scope,
-        )
+        report = _rebuild(session, scope)
     return {
         "scope": scope,
         "notes_synced": report.synced,

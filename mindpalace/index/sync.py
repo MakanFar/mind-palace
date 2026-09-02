@@ -473,15 +473,26 @@ def _similar_entity_issues(
     return issues
 
 
-def _vocabulary_proposals(notes: list[Note]) -> list[tuple[str, str, int, str, str]]:
-    """(kind, normalised proposal, count, one example, comma-joined ids)."""
+def _vocabulary_proposals(
+    notes: list[Note],
+    config: Config,
+    adoptions: Mapping[str, Mapping[str, str]] | None,
+) -> list[tuple[str, str, int, str, str]]:
+    """(kind, normalised proposal, count, one example, comma-joined ids).
+
+    A wording already adopted onto a configured type is no longer a
+    proposal; one adopted onto a type that has since left the config is."""
     tally: dict[tuple[str, str], list] = {}
+    configured = {"edge": set(config.edge_types), "entity": set(config.entity_types)}
 
     def record(kind: str, wording: str | None, example: str, item_id: str) -> None:
         if not wording:
             return
         key = (kind, slugify(wording))
         if not key[1]:
+            return
+        adopted = (adoptions or {}).get(kind, {}).get(key[1])
+        if adopted in configured[kind]:
             return
         entry = tally.setdefault(key, [0, example, []])
         entry[0] += 1
@@ -625,7 +636,7 @@ def sync(
         for note in folded_notes
         for drop in note.drops
     ]
-    proposals = _vocabulary_proposals(folded_notes)
+    proposals = _vocabulary_proposals(folded_notes, config, adoptions)
 
     with conn:
         for table in (
@@ -653,8 +664,8 @@ def sync(
 
         for entity in tables.entities.values():
             conn.execute(
-                "INSERT INTO entities (slug, type, rank) VALUES (?, ?, ?)",
-                (entity.slug, entity.type, entity.rank),
+                "INSERT INTO entities (slug, type, rank, merged_from) VALUES (?, ?, ?, ?)",
+                (entity.slug, entity.type, entity.rank, ",".join(entity.merged_from)),
             )
             conn.executemany(
                 "INSERT INTO entity_sources (slug, note_id) VALUES (?, ?)",

@@ -42,7 +42,7 @@ def call(session, name: str, arguments: dict | None = None) -> dict:
 
 def test_all_fifteen_tools_are_registered(session):
     assert registered_names(session) == set(TOOL_NAMES)
-    assert len(TOOL_NAMES) == 15
+    assert len(TOOL_NAMES) == 17
 
 
 def test_every_tool_has_a_description(session):
@@ -90,7 +90,12 @@ def test_graph_stats_round_trips_through_the_real_server(session):
 
 def test_review_queue_round_trips_through_the_real_server(session):
     payload = call(session, "review_queue", {"limit": 5})
-    assert payload == {"proposals": [], "vault_issues": []}
+    assert payload == {
+        "proposals": [],
+        "vocabulary": [],
+        "drops": [],
+        "vault_issues": [],
+    }
 
 
 def test_local_search_round_trips_through_the_real_server(session):
@@ -179,3 +184,37 @@ def test_the_session_lock_is_held_for_a_tool_calls_full_duration(session, monkey
     # And now that the call has returned, the lock must be free again.
     assert session.lock.acquire(blocking=False) is True
     session.lock.release()
+
+
+def test_adopt_and_merge_round_trip_through_the_real_server(session):
+    capture = call(session, "save_capture", {"text": "Star Wars is on GeForce Now."})
+    note = call(
+        session,
+        "write_note",
+        {
+            "derived_from": capture["id"],
+            "content": "Availability note.",
+            "entities": [
+                {"name": "star-wars", "type": "concept", "description": "game"},
+                {"name": "starwars", "type": "concept", "description": "game"},
+            ],
+            "relationship_assertions": [
+                {"source": "star-wars", "target": "geforce-now", "type": "available on",
+                 "description": "playable there"}
+            ],
+        },
+    )
+    assert note["landed"].startswith("2 entities, 1 relationship (1 untyped)")
+    queue = call(session, "review_queue", {"limit": 5})
+    assert queue["vocabulary"][0]["proposed"] == "available-on"
+    adopted = call(
+        session,
+        "adopt_type",
+        {"kind": "edge", "proposed": "available on", "name": "available-on", "directed": True},
+    )
+    assert adopted["retyped"] == [note["relationship_assertions"][0]["id"]]
+    merged = call(session, "merge_entities", {"duplicate": "starwars", "canonical": "star-wars"})
+    assert merged["status"] == "merged"
+    entity = call(session, "get_entity", {"name": "starwars", "as_of": "2026"})
+    assert entity["slug"] == "star-wars"
+    assert entity["merged_from"] == ["starwars"]
