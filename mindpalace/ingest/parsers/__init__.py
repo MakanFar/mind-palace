@@ -37,4 +37,8 @@ def parse_bytes(name: str, data: bytes) -> Document:
 
 
 # Each parser module registers itself on import. Add new ones here.
+from mindpalace.ingest.parsers import html as _html  # noqa: E402,F401
+from mindpalace.ingest.parsers import office as _office  # noqa: E402,F401
+from mindpalace.ingest.parsers import pdf as _pdf  # noqa: E402,F401
+from mindpalace.ingest.parsers import tables as _tables  # noqa: E402,F401
 from mindpalace.ingest.parsers import text as _text  # noqa: E402,F401
