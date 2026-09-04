@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
-
-#: Bumped whenever SCHEMA changes shape. The cache is delete-and-rebuild by
-#: construction, so a mismatch is not migrated: the tables are dropped and
-#: recreated, and the next sync repopulates them from Tier 1.
-SCHEMA_VERSION = 2
 
 TABLES = frozenset(
     {
@@ -156,6 +152,18 @@ CREATE INDEX IF NOT EXISTS idx_assertions_note ON assertions(note_id);
 """
 
 
+#: Derived from the schema text, not maintained by hand. The cache is
+#: delete-and-rebuild by construction, so a mismatch is not migrated: the
+#: tables are dropped and recreated, and the next sync repopulates them from
+#: Tier 1. A hand-bumped number was tried first and failed in the obvious
+#: way -- a column was added after the bump, a server built from that
+#: in-between commit stamped the vault with the new number and the old shape,
+#: and every later open failed on the first insert with "no column named".
+#: Hashing the text means no one has to remember. Masked to 31 bits because
+#: `PRAGMA user_version` is a signed 32-bit integer.
+SCHEMA_VERSION = int(hashlib.sha256(SCHEMA.encode("utf-8")).hexdigest()[:8], 16) & 0x7FFFFFFF
+
+
 def connect(path: Path) -> sqlite3.Connection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     # check_same_thread=False: the MCP runtime dispatches every synchronous
@@ -187,10 +195,11 @@ def connect(path: Path) -> sqlite3.Connection:
 
 def create_schema(conn: sqlite3.Connection) -> None:
     """Create the tables, first dropping every one of them if the file was
-    written by a different schema version. `CREATE TABLE IF NOT EXISTS`
+    written by a different schema text. `CREATE TABLE IF NOT EXISTS`
     alone would leave an old table missing the new columns and fail on the
     first insert; the version pragma is what lets an upgrade be a rebuild
-    rather than a crash."""
+    rather than a crash. `communities` is kept if its own columns still
+    match, since `sync` never repopulates it (see below)."""
     current = conn.execute("PRAGMA user_version").fetchone()[0]
     if current != SCHEMA_VERSION:
         existing = {
@@ -201,9 +210,16 @@ def create_schema(conn: sqlite3.Connection) -> None:
         }
         # `communities` is written by `cluster`, not by `sync`, so dropping it
         # would orphan every existing report until someone reclusters -- and
-        # reclustering mints new lineage ids. Its shape has not changed;
-        # leave it alone.
-        for table in sorted((TABLES - {"communities"}) & existing):
+        # reclustering mints new lineage ids. Keep it unless its own shape
+        # moved.
+        keep: set[str] = set()
+        if "communities" in existing:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(communities)")
+            }
+            if columns == {"lineage_id", "level", "parent", "members"}:
+                keep.add("communities")
+        for table in sorted((TABLES - keep) & existing):
             conn.execute(f"DROP TABLE IF EXISTS {table}")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.executescript(SCHEMA)

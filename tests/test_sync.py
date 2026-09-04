@@ -859,3 +859,25 @@ def test_a_schema_upgrade_keeps_the_communities_table(tmp_path):
     connection = db.connect(path)
     db.create_schema(connection)
     assert connection.execute("SELECT COUNT(*) FROM communities").fetchone()[0] == 1
+
+
+def test_a_schema_text_change_forces_a_rebuild_even_at_the_same_hand_version(tmp_path, monkeypatch):
+    """The failure that hit the real vault: a column added to SCHEMA after the
+    version was stamped. The version must follow the text, not a hand count."""
+    path = tmp_path / ".graph" / "mindpalace.db"
+    connection = db.connect(path)
+    db.create_schema(connection)
+    connection.execute("ALTER TABLE entities DROP COLUMN merged_from")
+    connection.commit()
+    connection.close()
+    # Same code, same version: the stale shape survives, as it did in the wild.
+    connection = db.connect(path)
+    db.create_schema(connection)
+    assert "merged_from" not in {r[1] for r in connection.execute("PRAGMA table_info(entities)")}
+    connection.close()
+    # Any change to the schema text changes the version and rebuilds.
+    monkeypatch.setattr(db, "SCHEMA", db.SCHEMA + "\n-- shape moved\n")
+    monkeypatch.setattr(db, "SCHEMA_VERSION", db.SCHEMA_VERSION + 1)
+    connection = db.connect(path)
+    db.create_schema(connection)
+    assert "merged_from" in {r[1] for r in connection.execute("PRAGMA table_info(entities)")}
