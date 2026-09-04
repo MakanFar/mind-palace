@@ -1,6 +1,6 @@
 # 0002 · One document for every format
 
-- **Status**: approved in design, implementing on `feat/document-ir`, 2026-09-04
+- **Status**: implemented on `feat/document-ir`, 2026-09-04; deviations from the design listed at the end
 - **Related**: [0001](0001-what-we-borrowed-from-utopia.md) for the fold constraint every
   durable thing obeys; PRD §6.1 (text units) and §7.1 (content handling by medium).
   Utopia's `utopia-ingest` crate is the reference for the format list and the chunk budget.
@@ -120,3 +120,20 @@ The citation id pattern accepts the `u_` prefix so reports can cite a unit.
 
 How a file arrives without a person naming its path. That is the connector question
 and it is explicitly deferred.
+
+## Deviations found while implementing
+
+- **Unit ids of a typed capture.** `save_capture` keeps the user's text verbatim
+  rather than storing the IR's rendering, so its unit offsets are mapped back onto the
+  original string. If the mapping cannot find a unit's text (it always can for text
+  the parser itself produced), the capture falls back to a single unit rather than
+  storing offsets that do not line up.
+- **Locator of a plain-text unit.** The spec said "no locator, the unit offsets are
+  enough". In the cache, a unit's locator is read off the nearest `## Page N`-style
+  heading at or before it, so plain-text units simply have none; nothing was added.
+- **Overlap is exact, even mid-word.** The chunker steps back exactly 150 characters
+  into the previous unit for an oversized paragraph. A word-boundary overlap would
+  have been prettier and less predictable; the overlap is a retrieval aid, not prose.
+- **Nested HTML tables** render once, inside the outermost table, rather than three
+  times as the reference implementation would have; found by the parser's implementer.
+- **`Heading0` in DOCX** clamps to level 1 instead of crashing into the text fallback.
