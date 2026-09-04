@@ -22,6 +22,7 @@ TABLES = frozenset(
         "vault_issues",
         "drops",
         "vocabulary_proposals",
+        "text_units",
     }
 )
 
@@ -107,6 +108,18 @@ CREATE TABLE IF NOT EXISTS drops (
     detail TEXT NOT NULL,
     example TEXT
 );
+
+-- Derived from each capture's `units` offsets (docs/decisions/0002).
+CREATE TABLE IF NOT EXISTS text_units (
+    id TEXT PRIMARY KEY,
+    capture_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    locator TEXT,
+    text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_text_units_capture ON text_units(capture_id);
 
 -- Out-of-vocabulary wordings, counted by normalised form (0001 §1).
 CREATE TABLE IF NOT EXISTS vocabulary_proposals (

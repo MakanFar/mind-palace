@@ -881,3 +881,27 @@ def test_a_schema_text_change_forces_a_rebuild_even_at_the_same_hand_version(tmp
     connection = db.connect(path)
     db.create_schema(connection)
     assert "merged_from" in {r[1] for r in connection.execute("PRAGMA table_info(entities)")}
+
+
+def test_multi_unit_captures_are_indexed_by_unit_not_by_body(conn, vault, config):
+    from datetime import UTC, datetime
+
+    _, store = vault
+    body = "## Page 1\n\nalpha text here\n\n## Page 2\n\nbeta text here"
+    a_end = body.index("## Page 2")
+    store.write_capture(
+        Capture("c_01", "2026-09-04T00:00:00Z", "file", None, body, units=((0, a_end), (a_end, len(body)))),
+        datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    store.write_capture(
+        Capture("c_02", "2026-09-04T00:01:00Z", "manual", None, "single"),
+        datetime(2026, 9, 4, 0, 1, tzinfo=UTC),
+    )
+    sync(conn, store, config, StubEmbedder(), {})
+    units = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM text_units")}
+    assert set(units) == {"u_01_0000", "u_01_0001", "u_02_0000"}
+    assert units["u_01_0001"]["locator"] == "Page 2" and units["u_01_0001"]["text"].startswith("## Page 2")
+    assert units["u_01_0000"]["locator"] == "Page 1"
+    docs = {r["doc_id"]: r["kind"] for r in conn.execute("SELECT doc_id, kind FROM docs")}
+    assert docs["u_01_0000"] == "unit" and docs["u_01_0001"] == "unit"
+    assert "c_01" not in docs and docs["c_02"] == "capture" and "u_02_0000" not in docs

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -24,7 +25,7 @@ from mindpalace.graph.duplicates import (
     propose_similar_entities,
 )
 from mindpalace.graph.integrity import check_entity_types, check_signatures
-from mindpalace.ids import slugify
+from mindpalace.ids import slugify, unit_id
 from mindpalace.index import db, vectors
 from mindpalace.models import Capture, Note, capture_from_markdown, note_from_markdown
 from mindpalace.vault.store import VaultStore
@@ -331,6 +332,40 @@ def fold_notes_with_quarantine(
     return folded_notes, notes_by_id, tables, issues
 
 
+_LOCATOR_HEADING = re.compile(r"^## ((?:Page|Slide|Sheet|Section|Line) .+)$", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class CaptureUnit:
+    id: str
+    capture_id: str
+    ordinal: int
+    start: int
+    end: int
+    locator: str | None
+    text: str
+
+
+def capture_units(capture: Capture) -> list[CaptureUnit]:
+    """The units of one capture (docs/decisions/0002 §Storage). A capture
+    with no recorded offsets is one unit spanning its whole text. The
+    locator is the nearest `## Page N`-style heading at or before the unit."""
+    spans = capture.units or ((0, len(capture.text)),)
+    units: list[CaptureUnit] = []
+    for ordinal, (start, end) in enumerate(spans):
+        text = capture.text[start:end]
+        heading = _LOCATOR_HEADING.search(text)
+        if heading is not None:
+            locator = heading.group(1)
+        else:
+            before = _LOCATOR_HEADING.findall(capture.text[:start])
+            locator = before[-1] if before else None
+        units.append(
+            CaptureUnit(unit_id(capture.id, ordinal), capture.id, ordinal, start, end, locator, text)
+        )
+    return units
+
+
 def _first_line(text: str) -> str:
     for line in text.splitlines():
         if line.strip():
@@ -625,8 +660,20 @@ def sync(
         degraded.append(note_sources[note_id])
 
     documents: list[tuple[str, str, str, str]] = []
+    all_units: list[CaptureUnit] = []
     for capture in captures:
-        documents.append((capture.id, "capture", _first_line(capture.text), capture.text))
+        units = capture_units(capture)
+        all_units.extend(units)
+        if len(units) == 1:
+            documents.append((capture.id, "capture", _first_line(capture.text), capture.text))
+            continue
+        # A long capture is searched by unit so a hit lands on a page or a
+        # section, and its body is not indexed as well, so it never comes
+        # back twice for one query.
+        for unit in units:
+            documents.append(
+                (unit.id, "unit", unit.locator or _first_line(capture.text), unit.text)
+            )
     for note in folded_notes:
         # Assertion descriptions ride along in the note's searchable text rather
         # than becoming their own documents: they must be findable (spec §8.1)
@@ -700,6 +747,7 @@ def sync(
             "vault_issues",
             "drops",
             "vocabulary_proposals",
+            "text_units",
         ):
             conn.execute(f"DELETE FROM {table}")
         vectors.clear(conn)
@@ -756,6 +804,11 @@ def sync(
                 ),
             )
 
+        conn.executemany(
+            "INSERT INTO text_units (id, capture_id, ordinal, start, end, locator, text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(u.id, u.capture_id, u.ordinal, u.start, u.end, u.locator, u.text) for u in all_units],
+        )
         conn.executemany(
             "INSERT INTO drops (note_id, kind, reason, detail, example) "
             "VALUES (?, ?, ?, ?, ?)",

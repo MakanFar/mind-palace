@@ -178,3 +178,32 @@ def test_search_global_wraps_retrieval(populated):
     result = search_global(session, "data exhaustion")
     assert result["available"] is False
     assert "No communities exist yet" in result["note"]
+
+
+def test_read_returns_a_text_unit_and_search_finds_it(session):
+    from datetime import UTC, datetime
+
+    from mindpalace.models import Capture
+    from mindpalace.tools import graph_stats, read, search_local
+
+    from mindpalace.tools import save_capture
+
+    # BM25's IDF is zero on a two-document corpus (see the retrieval tests),
+    # so give the index enough unrelated material for a real match to clear
+    # the abstain floor.
+    for i in range(10):
+        save_capture(session, f"unrelated filler number {i} about gardening and trains")
+    body = "## Page 1\n\nsourdough hydration ratios\n\n## Page 2\n\nzeta"
+    cut = body.index("## Page 2")
+    session.store.write_capture(
+        Capture("c_01", "2026-09-04T00:00:00Z", "file", None, body, units=((0, cut), (cut, len(body)))),
+        datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    session.resync()
+    unit = read(session, "u_01_0000")
+    assert unit["kind"] == "text_unit" and unit["capture"] == "c_01" and unit["locator"] == "Page 1"
+    assert "sourdough" in unit["text"]
+    hits = search_local(session, "sourdough hydration", k=3)["hits"]
+    assert hits and hits[0]["id"] == "u_01_0000" and hits[0]["kind"] == "unit"
+    stats = graph_stats(session)
+    assert stats["text_units"] == 12 and stats["attachments"] == 0

@@ -636,6 +636,20 @@ def read(session: Session, identifier: str) -> dict:
                 "related": page.related,
                 "user": page.user,
             }
+    elif kind == "text_unit":
+        row = session.conn.execute(
+            "SELECT capture_id, ordinal, locator, text FROM text_units WHERE id = ?",
+            (identifier,),
+        ).fetchone()
+        if row is not None:
+            return {
+                "id": identifier,
+                "kind": "text_unit",
+                "capture": row["capture_id"],
+                "ordinal": row["ordinal"],
+                "locator": row["locator"],
+                "text": row["text"],
+            }
     elif kind == "community":
         try:
             report = session.store.read_report(identifier)
@@ -848,6 +862,8 @@ def graph_stats(session: Session) -> dict:
             "SELECT COUNT(*) FROM aggregates WHERE traversable = 1"
         ),
         "claims": count("SELECT COUNT(*) FROM claims"),
+        "text_units": count("SELECT COUNT(*) FROM text_units"),
+        "attachments": sum(1 for p in session.paths.attachments.glob("*") if p.is_file()),
         "superseded_claims": count("SELECT COUNT(*) FROM claims WHERE status = 'superseded'"),
         "untyped_assertions": count("SELECT COUNT(*) FROM assertions WHERE type IS NULL"),
         "vocabulary_proposals": count("SELECT COUNT(*) FROM vocabulary_proposals"),

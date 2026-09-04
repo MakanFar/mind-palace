@@ -13,7 +13,7 @@ from mindpalace.index import vectors
 
 # LOCAL_KINDS includes "unparsed" so a file we could not parse is still
 # reachable by search rather than silently absent from the vault.
-LOCAL_KINDS = ("capture", "note", "entity", "unparsed")
+LOCAL_KINDS = ("capture", "unit", "note", "entity", "unparsed")
 RRF_K = 60
 CANDIDATES = 40
 TOKEN = re.compile(r"[A-Za-z0-9]+")
