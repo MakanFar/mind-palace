@@ -922,3 +922,33 @@ def test_provenance_is_projected_into_the_cache(conn, vault, config):
     sync(conn, store, config, StubEmbedder(), {})
     rows = {(r["item_id"], r["unit_id"]) for r in conn.execute("SELECT item_id, unit_id FROM provenance")}
     assert rows == {("e_a", "u_50_0000"), ("e_a", "u_50_0001"), ("e_b", "u_50_0001"), ("x_50", "u_50_0001")}
+
+
+def test_a_duplicate_capture_id_is_quarantined_not_fatal(conn, vault, config):
+    from datetime import UTC, datetime
+
+    paths, store = vault
+    written = store.write_capture(
+        Capture("c_dup", "2026-09-04T00:00:00Z", "manual", None, "first"),
+        datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    (paths.captures / (written.stem + " (copy).md")).write_text(written.read_text())
+    report = sync(conn, store, config, StubEmbedder(), {})
+    assert conn.execute("SELECT COUNT(*) FROM text_units WHERE capture_id = 'c_dup'").fetchone()[0] == 1
+    kinds = {issue[1] for issue in report.issues}
+    assert "duplicate_capture_id" in kinds
+
+
+def test_a_unit_straddling_a_page_boundary_keeps_the_page_it_starts_on(conn, vault, config):
+    from datetime import UTC, datetime
+
+    _, store = vault
+    body = "## Page 1\n\nstart on one\n\n## Page 2\n\nend on two"
+    cut = body.index("start")
+    store.write_capture(
+        Capture("c_s", "2026-09-04T00:00:00Z", "file", None, body, units=((0, cut), (cut, len(body)))),
+        datetime(2026, 9, 4, tzinfo=UTC),
+    )
+    sync(conn, store, config, StubEmbedder(), {})
+    locators = {r["ordinal"]: r["locator"] for r in conn.execute("SELECT ordinal, locator FROM text_units WHERE capture_id = 'c_s'")}
+    assert locators == {0: "Page 1", 1: "Page 1"}

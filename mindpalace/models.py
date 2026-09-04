@@ -254,7 +254,7 @@ def capture_from_markdown(text: str) -> Capture:
         parser=data.get("parser"),
         parser_version=data.get("parser_version"),
         metadata=dict(data.get("metadata") or {}),
-        units=tuple((int(s), int(e)) for s, e in data.get("units", [])),
+        units=tuple((int(s), int(e)) for s, e in (data.get("units") or [])),
     )
 
 

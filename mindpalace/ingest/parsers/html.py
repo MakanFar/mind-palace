@@ -10,6 +10,7 @@ from mindpalace.ingest.parsers.text import decode, make_source
 
 _DROP = ("script", "style", "noscript", "nav", "header", "footer", "aside")
 _BLOCK_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "pre", "table")
+_NESTING_TAGS = list(_BLOCK_TAGS)
 
 
 def _root(soup: BeautifulSoup) -> Tag:
@@ -50,6 +51,11 @@ def parse_html(name: str, data: bytes) -> Document:
     for el in root.find_all(_BLOCK_TAGS):
         if el.find_parent("table") is not None:
             continue  # anything inside a table is rendered by the outermost table block
+        # An element nested inside another block element (a <p> in an <li>,
+        # a nested list, a table in a cell) is already covered by the
+        # outermost one's text; emitting it too would duplicate content.
+        if el.find_parent(_NESTING_TAGS) is not None:
+            continue
         if el.name == "table":
             blocks.append(table_block(_table_rows(el), locator=section))
             continue

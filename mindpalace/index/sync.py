@@ -126,13 +126,30 @@ def _load_sources(
     issues: list[tuple[str, str, str]] = []
     degraded: list[tuple[str, str]] = []
 
+    seen_ids: dict[str, str] = {}
     for path in sorted(store.paths.captures.glob("*.md")):
         raw = path.read_text(encoding="utf-8")
         try:
-            captures.append(capture_from_markdown(raw))
+            capture = capture_from_markdown(raw)
         except Exception as exc:
             issues.append((_relative(store, path), "malformed_capture", str(exc)))
             degraded.append((_relative(store, path), raw))
+            continue
+        # A copied file (Obsidian, Dropbox) carries the same id. Unit ids
+        # derive from the capture id, so admitting both would collide in
+        # `text_units`; keep the first, report the rest, keep it searchable.
+        if capture.id in seen_ids:
+            issues.append(
+                (
+                    _relative(store, path),
+                    "duplicate_capture_id",
+                    f"capture id {capture.id!r} is already used by {seen_ids[capture.id]}",
+                )
+            )
+            degraded.append((_relative(store, path), raw))
+            continue
+        seen_ids[capture.id] = _relative(store, path)
+        captures.append(capture)
 
     notes, note_issues, note_degraded, note_sources = _load_notes(store)
     issues.extend(note_issues)
@@ -354,7 +371,10 @@ def capture_units(capture: Capture) -> list[CaptureUnit]:
     units: list[CaptureUnit] = []
     for ordinal, (start, end) in enumerate(spans):
         text = capture.text[start:end]
-        heading = _LOCATOR_HEADING.search(text)
+        # The page a unit *starts* on: a heading at its very start, else
+        # the last one before it. A heading further inside the unit belongs
+        # to the text after it, not to the unit as a whole.
+        heading = _LOCATOR_HEADING.match(text.lstrip())
         if heading is not None:
             locator = heading.group(1)
         else:

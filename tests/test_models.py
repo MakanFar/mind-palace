@@ -293,3 +293,10 @@ def test_text_unit_ids_round_trip_and_default_empty():
     text = note_to_markdown(note)
     assert text.count("text_unit_ids") == 2
     assert note_from_markdown(text) == note
+
+
+def test_a_null_units_key_reads_as_no_units():
+    from mindpalace.models import capture_from_markdown
+
+    text = "---\nid: c_1\ncreated: '2026-01-01T00:00:00Z'\nsource: manual\nunits: null\n---\n\nhello\n"
+    assert capture_from_markdown(text).units == ()

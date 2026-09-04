@@ -97,7 +97,15 @@ def render_block(block: Block) -> str:
     return block.text
 
 
-def locator_heading(locator: Locator) -> str:
+#: Locator kinds that get a synthetic heading in the body. A `section`
+#: locator names a heading that is already in the text, so rendering it
+#: again would print every heading twice.
+RENDERED_LOCATORS = frozenset({"page", "slide", "sheet", "line"})
+
+
+def locator_heading(locator: Locator) -> str | None:
+    if locator.kind not in RENDERED_LOCATORS:
+        return None
     return f"## {LOCATOR_TITLES[locator.kind]} {locator.label}"
 
 
@@ -110,6 +118,8 @@ def to_markdown(document: Document) -> str:
     for block in document.blocks:
         if block.locator is not None and block.locator != current:
             current = block.locator
-            parts.append(locator_heading(current))
+            heading = locator_heading(current)
+            if heading is not None:
+                parts.append(heading)
         parts.append(render_block(block))
     return "\n\n".join(parts) + "\n" if parts else ""

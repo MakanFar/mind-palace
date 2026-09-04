@@ -62,8 +62,11 @@ class VaultStore:
         return path
 
     def find_capture_by_sha256(self, sha256: str) -> Capture | None:
+        """Only captures that hold an attachment count as "this file is
+        already here" (docs/decisions/0002 §Storage). A typed capture whose
+        bytes happen to match is a different thing: it was never parsed."""
         for capture in self.iter_captures():
-            if capture.sha256 == sha256:
+            if capture.attachment and capture.sha256 == sha256:
                 return capture
         return None
 

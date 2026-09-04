@@ -22,7 +22,9 @@ from mindpalace.ingest.ir import (
 
 UNIT_BUDGET = 1200
 UNIT_OVERLAP = 150
-_SENTENCE_END = re.compile(r"[.!?。！？](?=\s|$)")
+# Latin sentence ends need trailing whitespace ("3.5" is not an end); CJK
+# full-width stops are ends on their own, since CJK text carries no spaces.
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)|[。！？]")
 _SEPARATOR = "\n\n"
 
 
@@ -54,7 +56,9 @@ def _layout(document: Document) -> list[_Item]:
         prefix = ""
         if block.locator is not None and block.locator != current:
             current = block.locator
-            prefix = locator_heading(current) + _SEPARATOR
+            heading = locator_heading(current)
+            if heading is not None:
+                prefix = heading + _SEPARATOR
         if not first:
             cursor += len(_SEPARATOR)
         first = False
@@ -86,17 +90,20 @@ def _split_oversized(body: str, item: _Item) -> list[tuple[int, int]]:
             pieces.append((cursor, cut))
             cursor = cut
         elif block.kind == "paragraph":
+            # The next piece starts UNIT_OVERLAP back from this cut, so the
+            # cut must land more than UNIT_OVERLAP past the cursor or the
+            # loop would rediscover the same sentence end forever and emit
+            # one junk unit per character.
             ends = [m.end() for m in _SENTENCE_END.finditer(window)]
-            if ends:
-                cut = cursor + ends[-1]
-            else:
+            cut = cursor + ends[-1] if ends else None
+            if cut is None or cut - cursor <= UNIT_OVERLAP:
                 space = window.rfind(" ")
-                cut = cursor + space if space > 0 else limit
+                cut = cursor + space if space > UNIT_OVERLAP else limit
             pieces.append((cursor, cut))
             # Exactly UNIT_OVERLAP back, even mid-word: the overlap is a
             # retrieval aid, and a stable size is worth more than a clean
             # word boundary. `continue` skips the whitespace trim below.
-            cursor = max(cut - UNIT_OVERLAP, cursor + 1)
+            cursor = cut - UNIT_OVERLAP
             continue
         else:
             newline = window.rfind("\n")
@@ -183,16 +190,35 @@ def split_text(body: str) -> list[tuple[int, int]]:
         {},
         tuple(Block("paragraph", p) for p in paragraphs),
     )
-    rendered = to_markdown(document)
     units = to_text_units(document)
-    spans: list[tuple[int, int]] = []
-    cursor = 0
-    for unit in units:
-        text = rendered[unit.start:unit.end].strip()
-        at = body.find(text, cursor)
+    if len(units) <= 1:
+        return [(0, len(body))]
+    # Map rendered offsets back onto the original paragraph by paragraph.
+    # Rendering only changes what sits *between* paragraphs (any run of
+    # blank-ish lines becomes one "\n\n"), so each paragraph's text is
+    # identical in both and a rendered offset inside paragraph i maps by
+    # a constant shift; an offset in a separator maps to the next start.
+    rendered_starts: list[int] = []
+    original_starts: list[int] = []
+    cursor_r = 0
+    cursor_o = 0
+    for paragraph in paragraphs:
+        rendered_starts.append(cursor_r)
+        at = body.find(paragraph, cursor_o)
         if at < 0:
             return [(0, len(body))]
-        spans.append((at, at + len(text)))
-        cursor = at + 1
+        original_starts.append(at)
+        cursor_r += len(paragraph) + len(_SEPARATOR)
+        cursor_o = at + len(paragraph)
+
+    def to_original(offset: int) -> int:
+        for i in range(len(paragraphs) - 1, -1, -1):
+            start = rendered_starts[i]
+            if offset >= start:
+                within = min(offset - start, len(paragraphs[i]))
+                return original_starts[i] + within
+        return 0
+
+    spans = [(to_original(u.start), to_original(u.end)) for u in units]
     spans[-1] = (spans[-1][0], len(body))
     return spans

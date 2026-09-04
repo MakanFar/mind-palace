@@ -72,3 +72,48 @@ def test_split_text_matches_a_paragraph_only_document():
     long = "\n\n".join("w" * 500 for _ in range(5))
     spans = split_text(long)
     assert spans[0][0] == 0 and spans[-1][1] == len(long) and len(spans) >= 2
+
+
+# ---- review findings ----
+
+
+def test_a_short_sentence_before_a_long_unbroken_run_does_not_loop():
+    text = "Table 3 lists every measured value for the second cohort of the trial. " + " ".join(["abcd"] * 400)
+    d = doc(Block("paragraph", text))
+    body = to_markdown(d)
+    units = to_text_units(d)
+    assert 2 <= len(units) <= 4
+    for a, b in zip(units, units[1:]):
+        assert b.start > a.start and b.end > a.end
+    assert units[-1].end == len(body)
+
+
+def test_cjk_sentence_ends_count_without_trailing_whitespace():
+    text = "".join(f"第{i}句话到此结束。" for i in range(200))
+    d = doc(Block("paragraph", text))
+    body = to_markdown(d)
+    units = to_text_units(d)
+    assert len(units) > 1
+    for u in units[:-1]:
+        assert body[u.end - 1] == "。"
+
+
+def test_split_text_survives_crlf_and_triple_newline_separators():
+    paragraphs = ["sentence " + "w" * 300 for _ in range(8)]
+    for sep in ("\r\n\r\n", "\n\n\n", "\n \n"):
+        text = sep.join(paragraphs)
+        spans = split_text(text)
+        assert len(spans) >= 2, sep
+        assert spans[0][0] == 0 and spans[-1][1] == len(text)
+        for start, end in spans:
+            assert text[start:end].strip().startswith("sentence")
+
+
+def test_section_locators_are_not_rendered_as_extra_headings():
+    d = doc(
+        Block("heading", "Intro", level=1, locator=Locator("section", "Intro", 1)),
+        Block("paragraph", "Body.", locator=Locator("section", "Intro", 1)),
+    )
+    assert to_markdown(d) == "# Intro\n\nBody.\n"
+    [unit] = to_text_units(d)
+    assert unit.locator == Locator("section", "Intro", 1)

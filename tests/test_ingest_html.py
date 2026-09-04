@@ -33,3 +33,8 @@ def test_html_without_main_falls_back_to_body():
 
 def test_sniffing_finds_html_without_extension():
     assert parse_bytes("page", PAGE).source.parser == "html"
+
+
+def test_nested_block_elements_are_not_emitted_twice():
+    doc = parse_html("p.html", b"<html><body><ul><li><p>alpha</p></li><li>outer<ul><li>inner</li></ul></li></ul></body></html>")
+    assert [(b.kind, b.text) for b in doc.blocks] == [("list_item", "alpha"), ("list_item", "outer inner")]

@@ -677,6 +677,15 @@ def ingest_file(
     when = _now()
     capture_id = new_id("c_")
     capture, units = _capture_from_document(document, capture_id, when, source, why)
+    if not capture.text.strip():
+        # A scanned PDF or an image-only deck: the parser ran and found
+        # nothing. Storing an empty capture would hand the assistant nothing
+        # to extract and block a later re-ingest once OCR exists.
+        raise ToolError(
+            f"no text could be extracted from {file.name} (parser {capture.parser}"
+            f"{', ' + capture.metadata['parser_error'] if capture.metadata.get('parser_error') else ''}); "
+            f"nothing was stored. A scanned document needs OCR, which is not built yet."
+        )
     ext = file.suffix.lstrip(".").lower()
     with session.operation({"tool": "ingest_file", "capture": capture_id}):
         attachment = session.store.write_attachment(document.source.sha256, ext, data)
@@ -1524,7 +1533,23 @@ def write_community_report(
             table = "assertions"
         elif kind == "claim_assertion":
             table = "claims"
-        else:  # note, capture, community — all indexed as documents
+        elif kind == "capture":
+            # A long capture is indexed by its units, not by its id, so
+            # `docs` is the wrong place to look for it.
+            return (
+                session.conn.execute(
+                    "SELECT 1 FROM text_units WHERE capture_id = ?", (identifier,)
+                ).fetchone()
+                is not None
+            )
+        elif kind == "text_unit":
+            return (
+                session.conn.execute(
+                    "SELECT 1 FROM text_units WHERE id = ?", (identifier,)
+                ).fetchone()
+                is not None
+            )
+        else:  # note, community — indexed as documents
             return (
                 session.conn.execute(
                     "SELECT 1 FROM docs WHERE doc_id = ?", (identifier,)

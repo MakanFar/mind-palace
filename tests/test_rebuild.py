@@ -519,3 +519,24 @@ def test_entity_input_hash_is_stable_across_runs(store, config):
     second = entity_input_hash(tables.entities["scaling-laws"], tables, notes_by_id)
 
     assert first == second
+
+
+def test_hashes_are_unchanged_for_items_without_unit_provenance():
+    """An upgrade must not flip every page stale: the hash text only grows
+    when an item actually carries text_unit_ids."""
+    from mindpalace.graph.fold import FoldedAssertion, FoldedClaim, FoldedEntity, GraphTables
+    from mindpalace.rebuild import entity_input_hash
+    from mindpalace.atomic import content_hash
+
+    entity = FoldedEntity("a", "concept", 0, ("n_1",))
+    tables = GraphTables(
+        entities={"a": entity},
+        assertions={"x_1": FoldedAssertion("x_1", "n_1", "a", "b", "supports", 5, "d", "proposed")},
+        claims={"k_1": FoldedClaim("k_1", "n_1", "a", "t", "proposed")},
+    )
+    expected = content_hash("\n".join([
+        "type=concept",
+        f"assertion=x_1:proposed:5:supports:None:{content_hash('d')}",
+        f"claim=k_1:proposed:None:None:{content_hash('t')}",
+    ]))
+    assert entity_input_hash(entity, tables, {}) == expected

@@ -362,7 +362,15 @@ def test_attachments_are_written_once_and_found_by_hash(tmp_path):
     assert first.read_bytes() == b"data"
     assert store.find_capture_by_sha256("ab" * 32) is None
     when = datetime(2026, 9, 4, tzinfo=UTC)
-    store.write_capture(Capture("c_1", "2026-09-04T00:00:00Z", "file", None, "t", sha256="ab" * 32), when)
+    # A typed capture with a matching hash is not "this file is already
+    # here": only a capture that holds the attachment is.
+    store.write_capture(Capture("c_0", "2026-09-04T00:00:00Z", "manual", None, "t", sha256="ab" * 32), when)
+    assert store.find_capture_by_sha256("ab" * 32) is None
+    store.write_capture(
+        Capture("c_1", "2026-09-04T00:00:01Z", "file", None, "t", sha256="ab" * 32,
+                attachment="captures/attachments/" + "ab" * 32 + ".pdf"),
+        when.replace(minute=1),
+    )
     assert store.find_capture_by_sha256("ab" * 32).id == "c_1"
     # The attachments directory must not be mistaken for captures.
-    assert [c.id for c in store.iter_captures()] == ["c_1"]
+    assert [c.id for c in store.iter_captures()] == ["c_0", "c_1"]
