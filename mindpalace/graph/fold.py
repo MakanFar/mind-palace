@@ -111,6 +111,9 @@ class FoldedEntity:
     note_ids: tuple[str, ...]
     # Slugs folded into this one by `merges.jsonl` (docs/decisions/0001 §5).
     merged_from: tuple[str, ...] = ()
+    # Every unit that mentions this entity: its own instances plus the
+    # assertions and claims it is an endpoint of (docs/decisions/0002).
+    text_unit_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,7 @@ class FoldedAssertion:
     status: str
     proposed_type: str | None = None
     direction_corrected: bool = False
+    text_unit_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +143,7 @@ class FoldedClaim:
     valid_from: str | None = None
     valid_to: str | None = None
     supersedes: str | None = None
+    text_unit_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -222,13 +227,19 @@ def fold(
 
     entity_types: dict[str, str] = {}
     entity_notes: dict[str, list[str]] = {}
+    entity_units: dict[str, set[str]] = {}
     merged_from: dict[str, set[str]] = {}
     assertions: dict[str, FoldedAssertion] = {}
     claims: dict[str, FoldedClaim] = {}
     grouped: dict[str, list[FoldedAssertion]] = {}
     aggregate_shape: dict[str, tuple[str, str, str]] = {}
 
-    def touch(raw_slug: str, note_id: str, declared_type: str | None) -> None:
+    def touch(
+        raw_slug: str,
+        note_id: str,
+        declared_type: str | None,
+        units: Iterable[str] = (),
+    ) -> None:
         slug = canon(raw_slug)
         if slug != raw_slug:
             merged_from.setdefault(slug, set()).add(raw_slug)
@@ -237,6 +248,7 @@ def fold(
         note_ids = entity_notes.setdefault(slug, [])
         if note_id not in note_ids:
             note_ids.append(note_id)
+        entity_units.setdefault(slug, set()).update(units)
 
     for note in ordered:
         for instance in note.entities:
@@ -245,7 +257,7 @@ def fold(
                 declared = _adopted(adoptions, "entity", instance.proposed_type)
                 if declared is not None and declared not in config.entity_types:
                     declared = None
-            touch(slugify(instance.name), note.id, declared)
+            touch(slugify(instance.name), note.id, declared, instance.text_unit_ids)
 
         for raw in note.relationship_assertions:
             if raw.type is not None and raw.type not in config.edge_types:
@@ -258,8 +270,8 @@ def fold(
                     note_ids=(assertions[raw.id].note_id, note.id),
                 )
             source, target = canon(slugify(raw.source)), canon(slugify(raw.target))
-            touch(slugify(raw.source), note.id, None)
-            touch(slugify(raw.target), note.id, None)
+            touch(slugify(raw.source), note.id, None, raw.text_unit_ids)
+            touch(slugify(raw.target), note.id, None, raw.text_unit_ids)
 
             # An adoption may name a type that has since left the config.
             # That is not the note's fault: the proposal simply stands.
@@ -280,6 +292,7 @@ def fold(
                 status=_status(raw.id, statuses),
                 proposed_type=raw.proposed_type,
                 direction_corrected=raw.direction_corrected,
+                text_unit_ids=tuple(raw.text_unit_ids),
             )
             assertions[raw.id] = folded
             if edge_type is None:
@@ -306,7 +319,7 @@ def fold(
                     note_ids=(claims[raw_claim.id].note_id, note.id),
                 )
             subject = canon(slugify(raw_claim.subject))
-            touch(slugify(raw_claim.subject), note.id, None)
+            touch(slugify(raw_claim.subject), note.id, None, raw_claim.text_unit_ids)
             claims[raw_claim.id] = FoldedClaim(
                 id=raw_claim.id,
                 note_id=note.id,
@@ -316,6 +329,7 @@ def fold(
                 valid_from=raw_claim.valid_from,
                 valid_to=raw_claim.valid_to,
                 supersedes=raw_claim.supersedes,
+                text_unit_ids=tuple(raw_claim.text_unit_ids),
             )
 
     # Supersession takes effect on confirmation only: a proposed correction
@@ -354,6 +368,7 @@ def fold(
             rank=degree.get(slug, 0),
             note_ids=tuple(entity_notes[slug]),
             merged_from=tuple(sorted(merged_from.get(slug, ()))),
+            text_unit_ids=tuple(sorted(entity_units.get(slug, ()))),
         )
         for slug in sorted(entity_types)
     }

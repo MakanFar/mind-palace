@@ -77,7 +77,7 @@ def entity_input_hash(
         parts.append(
             f"assertion={assertion.id}:{assertion.status}:{assertion.strength}:"
             f"{assertion.type}:{assertion.proposed_type}:"
-            f"{content_hash(assertion.description)}"
+            f"{content_hash(assertion.description)}:{','.join(assertion.text_unit_ids)}"
         )
 
     for aggregate in sorted(tables.aggregates.values(), key=lambda item: item.key):
@@ -93,7 +93,7 @@ def entity_input_hash(
         if claim.subject == entity.slug:
             parts.append(
                 f"claim={claim.id}:{claim.status}:{claim.valid_from}:{claim.valid_to}:"
-                f"{content_hash(claim.text)}"
+                f"{content_hash(claim.text)}:{','.join(claim.text_unit_ids)}"
             )
 
     return content_hash("\n".join(parts))
@@ -144,7 +144,7 @@ def community_input_hash(
             continue
         parts.append(
             f"assertion={assertion.id}:{assertion.status}:{assertion.strength}:"
-            f"{content_hash(assertion.description)}"
+            f"{content_hash(assertion.description)}:{','.join(assertion.text_unit_ids)}"
         )
 
     for aggregate in sorted(tables.aggregates.values(), key=lambda item: item.key):
@@ -161,7 +161,7 @@ def community_input_hash(
         if claim.subject in membership:
             parts.append(
                 f"claim={claim.id}:{claim.status}:{claim.valid_from}:{claim.valid_to}:"
-                f"{content_hash(claim.text)}"
+                f"{content_hash(claim.text)}:{','.join(claim.text_unit_ids)}"
             )
 
     return content_hash("\n".join(parts))

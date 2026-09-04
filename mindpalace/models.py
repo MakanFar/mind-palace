@@ -52,6 +52,8 @@ class EntityInstance:
     type: str | None
     description: str
     proposed_type: str | None = None
+    # Units this was extracted from (docs/decisions/0002 §Provenance).
+    text_unit_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,7 @@ class RelationshipAssertion:
     # Endpoints were swapped at write time to satisfy the edge type's
     # domain/range (docs/decisions/0001 §3). Recorded so it is never silent.
     direction_corrected: bool = False
+    text_unit_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,7 @@ class ClaimAssertion:
     # Id of the claim this one corrects. Takes effect on confirmation: the
     # older claim then folds as `superseded` (docs/decisions/0001 §4).
     supersedes: str | None = None
+    text_unit_ids: tuple[str, ...] = ()
 
     @property
     def valid_from_precision(self) -> str | None:
@@ -277,6 +281,8 @@ def _entity_to_dict(e: EntityInstance) -> dict:
     out: dict = {"name": e.name, "type": e.type, "description": e.description}
     if e.proposed_type is not None:
         out["proposed_type"] = e.proposed_type
+    if e.text_unit_ids:
+        out["text_unit_ids"] = list(e.text_unit_ids)
     return out
 
 
@@ -295,6 +301,8 @@ def _relationship_to_dict(r: RelationshipAssertion) -> dict:
     # lines would bury the one that matters.
     if r.direction_corrected:
         out["direction_corrected"] = True
+    if r.text_unit_ids:
+        out["text_unit_ids"] = list(r.text_unit_ids)
     return out
 
 
@@ -304,6 +312,8 @@ def _claim_to_dict(c: ClaimAssertion) -> dict:
         value = getattr(c, key)
         if value is not None:
             out[key] = value
+    if c.text_unit_ids:
+        out["text_unit_ids"] = list(c.text_unit_ids)
     return out
 
 
@@ -340,6 +350,7 @@ def note_from_markdown(text: str) -> Note:
                 type=e.get("type"),
                 description=e["description"],
                 proposed_type=e.get("proposed_type"),
+                text_unit_ids=tuple(e.get("text_unit_ids", [])),
             )
             for e in data.get("entities", [])
         ),
@@ -353,6 +364,7 @@ def note_from_markdown(text: str) -> Note:
                 description=r["description"],
                 proposed_type=r.get("proposed_type"),
                 direction_corrected=bool(r.get("direction_corrected", False)),
+                text_unit_ids=tuple(r.get("text_unit_ids", [])),
             )
             for r in data.get("relationship_assertions", [])
         ),
@@ -364,6 +376,7 @@ def note_from_markdown(text: str) -> Note:
                 valid_from=_validity(c.get("valid_from")),
                 valid_to=_validity(c.get("valid_to")),
                 supersedes=c.get("supersedes"),
+                text_unit_ids=tuple(c.get("text_unit_ids", [])),
             )
             for c in data.get("claim_assertions", [])
         ),

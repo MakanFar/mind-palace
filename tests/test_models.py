@@ -274,3 +274,22 @@ def test_old_capture_without_new_keys_still_parses():
     old = "---\nid: c_1\ncreated: '2026-01-01T00:00:00Z'\nsource: manual\n---\n\nhello\n"
     capture = capture_from_markdown(old)
     assert capture.units == () and capture.attachment is None and capture.metadata == {}
+
+
+def test_text_unit_ids_round_trip_and_default_empty():
+    from mindpalace.models import (
+        ClaimAssertion, EntityInstance, Note, RelationshipAssertion,
+        note_from_markdown, note_to_markdown,
+    )
+
+    note = Note(
+        id="n_9", derived_from="c_9", created="2026-09-04T00:00:00Z", author="llm", body="B.",
+        entities=(EntityInstance("a", "concept", "d", text_unit_ids=("u_9_0001",)),),
+        relationship_assertions=(
+            RelationshipAssertion("x_9", "a", "b", "supports", 5, "d", text_unit_ids=("u_9_0001", "u_9_0002")),
+        ),
+        claim_assertions=(ClaimAssertion("k_9", "a", "t"),),
+    )
+    text = note_to_markdown(note)
+    assert text.count("text_unit_ids") == 2
+    assert note_from_markdown(text) == note

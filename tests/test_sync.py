@@ -905,3 +905,20 @@ def test_multi_unit_captures_are_indexed_by_unit_not_by_body(conn, vault, config
     docs = {r["doc_id"]: r["kind"] for r in conn.execute("SELECT doc_id, kind FROM docs")}
     assert docs["u_01_0000"] == "unit" and docs["u_01_0001"] == "unit"
     assert "c_01" not in docs and docs["c_02"] == "capture" and "u_02_0000" not in docs
+
+
+def test_provenance_is_projected_into_the_cache(conn, vault, config):
+    _, store = vault
+    store.write_note(
+        Note(
+            id="n_50", derived_from="c_50", created="2026-09-04T00:00:00Z", author="llm", body="B.",
+            entities=(EntityInstance("a", "concept", "d", text_unit_ids=("u_50_0000",)),),
+            relationship_assertions=(
+                RelationshipAssertion("x_50", "a", "b", "contradicts", 5, "d", text_unit_ids=("u_50_0001",)),
+            ),
+        ),
+        "a",
+    )
+    sync(conn, store, config, StubEmbedder(), {})
+    rows = {(r["item_id"], r["unit_id"]) for r in conn.execute("SELECT item_id, unit_id FROM provenance")}
+    assert rows == {("e_a", "u_50_0000"), ("e_a", "u_50_0001"), ("e_b", "u_50_0001"), ("x_50", "u_50_0001")}

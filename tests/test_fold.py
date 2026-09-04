@@ -470,3 +470,17 @@ def test_a_confirmed_superseding_claim_marks_the_old_one_superseded(config):
     confirmed = fold(notes, {"k_1": "confirm", "k_2": "confirm"}, config)
     assert confirmed.claims["k_1"].status == "superseded"
     assert confirmed.claims["k_2"].status == "confirmed"
+
+
+def test_fold_carries_unit_provenance_onto_entities_and_items(config):
+    note = make_note(
+        "n_1", "2026-01-01",
+        entities=[EntityInstance("a", "concept", "d", text_unit_ids=("u_1_0000",))],
+        relationships=[RelationshipAssertion("x_1", "a", "b", "supports", 5, "d", text_unit_ids=("u_1_0001",))],
+        claims=[ClaimAssertion("k_1", "b", "t", text_unit_ids=("u_1_0002",))],
+    )
+    tables = fold([note], {}, config)
+    assert tables.assertions["x_1"].text_unit_ids == ("u_1_0001",)
+    assert tables.claims["k_1"].text_unit_ids == ("u_1_0002",)
+    assert tables.entities["a"].text_unit_ids == ("u_1_0000", "u_1_0001")
+    assert tables.entities["b"].text_unit_ids == ("u_1_0001", "u_1_0002")

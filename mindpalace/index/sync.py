@@ -748,6 +748,7 @@ def sync(
             "drops",
             "vocabulary_proposals",
             "text_units",
+            "provenance",
         ):
             conn.execute(f"DELETE FROM {table}")
         vectors.clear(conn)
@@ -804,6 +805,16 @@ def sync(
                 ),
             )
 
+        provenance: list[tuple[str, str]] = []
+        for entity in tables.entities.values():
+            provenance += [(f"e_{entity.slug}", u) for u in entity.text_unit_ids]
+        for assertion in tables.assertions.values():
+            provenance += [(assertion.id, u) for u in assertion.text_unit_ids]
+        for claim in tables.claims.values():
+            provenance += [(claim.id, u) for u in claim.text_unit_ids]
+        conn.executemany(
+            "INSERT OR IGNORE INTO provenance (item_id, unit_id) VALUES (?, ?)", provenance
+        )
         conn.executemany(
             "INSERT INTO text_units (id, capture_id, ordinal, start, end, locator, text) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",

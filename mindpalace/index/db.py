@@ -23,6 +23,7 @@ TABLES = frozenset(
         "drops",
         "vocabulary_proposals",
         "text_units",
+        "provenance",
     }
 )
 
@@ -120,6 +121,13 @@ CREATE TABLE IF NOT EXISTS text_units (
     text TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_text_units_capture ON text_units(capture_id);
+
+-- item_id is x_.., k_.., or e_<slug>; unit_id a text unit (0002 §Provenance).
+CREATE TABLE IF NOT EXISTS provenance (
+    item_id TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    PRIMARY KEY (item_id, unit_id)
+);
 
 -- Out-of-vocabulary wordings, counted by normalised form (0001 §1).
 CREATE TABLE IF NOT EXISTS vocabulary_proposals (
