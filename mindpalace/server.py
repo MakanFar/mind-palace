@@ -20,6 +20,7 @@ from mindpalace.session import Session, VaultLockedError
 
 TOOL_NAMES = (
     "save_capture",
+    "ingest_file",
     "write_note",
     "local_search",
     "global_search",
@@ -63,6 +64,14 @@ def build_server(session: Session) -> MCPServer:
         """Save a thought verbatim and return the nearest existing material,
         the known entities, and what to extract next."""
         return _run(session, tools.save_capture, text, why, source)
+
+    @server.tool(name="ingest_file")
+    def _ingest_file(path: str, why: str | None = None, source: str = "file") -> dict:
+        """Ingest a local file (PDF, DOCX, PPTX, XLSX/XLS/ODS, CSV/TSV, HTML,
+        Markdown, text). Stores the original, renders it to a capture, splits
+        it into text units, and returns a preview plus what to extract next.
+        A file already in the vault returns its existing capture."""
+        return _run(session, tools.ingest_file, path, why, source)
 
     @server.tool(name="write_note")
     def _write_note(

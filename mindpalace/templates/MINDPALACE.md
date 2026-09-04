@@ -37,9 +37,18 @@ plain words rather than forcing the nearest configured one; it is kept as a
 proposal for the user to adopt. When a claim has a date, give valid_from and, if
 it ended, valid_to (YYYY, YYYY-MM or YYYY-MM-DD, or "unknown" for ended-but-
 unknown-when); never put the capture's own date in valid_to. When a claim
-corrects an earlier one, name it in supersedes. Afterwards, tell the user the
-`landed` line the tool returns, not what you meant to record.
+corrects an earlier one, name it in supersedes. For a long capture, read its
+units by id (u_…) and pass the ids you drew on as text_unit_ids on each entity,
+relationship, and claim. Afterwards, tell the user the `landed` line the tool
+returns, not what you meant to record.
 Proposing nothing is a valid outcome.
+
+## template: ingest_next
+This capture is long. Read its units by id (u_…) with `read` rather than the whole
+capture, then call write_note with this capture id and pass the unit ids you drew
+on as text_unit_ids on each entity, relationship, and claim. Extract entities with
+a type and a one-line description; propose a relationship only with a specific
+rationale citing both endpoints. Proposing nothing is a valid outcome.
 
 ## template: report_next
 Write one report per community using write_community_report. Ground every finding

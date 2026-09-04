@@ -6,14 +6,20 @@ nothing but wire them to the protocol.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 from mindpalace.citations import extract_ids, unresolvable
 from mindpalace.cluster import Community, match_lineages, partition, should_cluster
 from mindpalace.config import ConfigError, add_edge_type, add_entity_type, load_config
 from mindpalace.frontmatter import FrontMatterError
 from mindpalace.graph.fold import MergeCycleError, resolve_merges
-from mindpalace.ids import UnknownIdError, id_kind, new_id, slugify
+from mindpalace.ids import UnknownIdError, id_kind, new_id, slugify, unit_id
+from mindpalace.ingest.ir import to_markdown
+from mindpalace.ingest.parsers import parse_bytes
+from mindpalace.ingest.parsers.text import parse_text
+from mindpalace.ingest.units import TextUnit, split_text, to_text_units
 from mindpalace.models import (
     VALIDITY_UNKNOWN,
     Capture,
@@ -42,6 +48,12 @@ DEFAULT_EXTRACTION_NEXT = (
     "Read any nearest notes you need, then call write_note with this capture id. "
     "Propose a relationship only where you can give a specific rationale citing "
     "both endpoints. Proposing nothing is a valid outcome."
+)
+DEFAULT_INGEST_NEXT = (
+    "This capture is long. Read its units by id (u_...) with `read` rather than the "
+    "whole capture, then call write_note with this capture id and pass the unit ids "
+    "you drew on as text_unit_ids on each entity, relationship, and claim. "
+    "Proposing nothing is a valid outcome."
 )
 
 
@@ -239,8 +251,30 @@ def _apply_signature(
     return source, target, None, False
 
 
+def _units_of(item: dict, ledger: _Ledger, kind: str, example: object, allowed: set[str]) -> tuple[str, ...] | None:
+    """The item's `text_unit_ids`, or None after an `unknown_text_unit` drop.
+
+    Every id must be a string naming a unit of the note's own capture
+    (docs/decisions/0002 §Provenance): provenance pointing at another
+    capture, or at nothing, is worse than none."""
+    ids = item.get("text_unit_ids", [])
+    if ids is None:
+        return ()
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        ledger.drop(kind, "unknown_text_unit", "text_unit_ids must be a list of unit ids", example)
+        return None
+    unknown = [i for i in ids if i not in allowed]
+    if unknown:
+        ledger.drop(
+            kind, "unknown_text_unit",
+            f"{unknown} are not units of this note's capture", example,
+        )
+        return None
+    return tuple(dict.fromkeys(ids))
+
+
 def _validate_entities(
-    session: Session, entities, ledger: _Ledger
+    session: Session, entities, ledger: _Ledger, allowed_units: set[str] = frozenset()
 ) -> list[EntityInstance]:
     built: list[EntityInstance] = []
     for entity in entities:
@@ -264,19 +298,29 @@ def _validate_entities(
         if not slug:
             ledger.drop("entity", "empty_slug", "name normalises to nothing", name)
             continue
+        units = _units_of(entity, ledger, "entity", example, allowed_units)
+        if units is None:
+            continue
         if declared in session.config.entity_types:
-            built.append(EntityInstance(name=slug, type=declared, description=description))
+            built.append(
+                EntityInstance(name=slug, type=declared, description=description, text_unit_ids=units)
+            )
         else:
             built.append(
                 EntityInstance(
-                    name=slug, type=None, description=description, proposed_type=declared,
+                    name=slug, type=None, description=description,
+                    proposed_type=declared, text_unit_ids=units,
                 )
             )
     return built
 
 
 def _validate_relationships(
-    session: Session, assertions, ledger: _Ledger, local_types: dict[str, str | None]
+    session: Session,
+    assertions,
+    ledger: _Ledger,
+    local_types: dict[str, str | None],
+    allowed_units: set[str] = frozenset(),
 ) -> list[RelationshipAssertion]:
     built: list[RelationshipAssertion] = []
     for assertion in assertions:
@@ -306,6 +350,9 @@ def _validate_relationships(
         if source == target:
             ledger.drop("relationship", "self_loop", "source and target are the same entity", example)
             continue
+        units = _units_of(assertion, ledger, "relationship", example, allowed_units)
+        if units is None:
+            continue
         corrected = False
         proposed = None
         edge_type = raw_type
@@ -334,6 +381,7 @@ def _validate_relationships(
                 description=description,
                 proposed_type=proposed,
                 direction_corrected=corrected,
+                text_unit_ids=units,
             )
         )
     return built
@@ -346,7 +394,9 @@ def _at_or_before(left: str, right: str) -> bool:
     return left[:n] <= right[:n]
 
 
-def _validate_claims(session: Session, claims, ledger: _Ledger) -> list[ClaimAssertion]:
+def _validate_claims(
+    session: Session, claims, ledger: _Ledger, allowed_units: set[str] = frozenset()
+) -> list[ClaimAssertion]:
     built: list[ClaimAssertion] = []
     for claim in claims:
         example = claim.get("text") if isinstance(claim, dict) else claim
@@ -390,6 +440,9 @@ def _validate_claims(session: Session, claims, ledger: _Ledger) -> list[ClaimAss
                 f"valid_from {valid_from} is after valid_to {valid_to}", example,
             )
             continue
+        units = _units_of(claim, ledger, "claim", example, allowed_units)
+        if units is None:
+            continue
         supersedes = claim.get("supersedes")
         if supersedes is not None and not isinstance(supersedes, str):
             ledger.drop("claim", "bad_value", "supersedes must be a claim id string", example)
@@ -412,6 +465,7 @@ def _validate_claims(session: Session, claims, ledger: _Ledger) -> list[ClaimAss
                 valid_from=valid_from,
                 valid_to=valid_to,
                 supersedes=supersedes,
+                text_unit_ids=units,
             )
         )
     return built
@@ -487,6 +541,50 @@ def _claim_payload(c: ClaimAssertion) -> dict:
     }
 
 
+def _spans_as_units(spans: tuple[tuple[int, int], ...], text: str) -> list[TextUnit]:
+    if not spans:
+        return [TextUnit(0, 0, len(text), None)]
+    return [TextUnit(i, start, end, None) for i, (start, end) in enumerate(spans)]
+
+
+def _extraction_payload(session: Session, capture: Capture, units: list[TextUnit]) -> dict:
+    """What every capture entry point hands back so the assistant can extract:
+    the nearest existing material, the vocabularies, and the instruction.
+    A multi-unit capture also gets a unit preview and the long-form
+    instruction (docs/decisions/0002 §Tool surface)."""
+    nearest = local_search(
+        session.conn, session.embedder, capture.text[:2000], session.config, k=5
+    )
+    preview = []
+    for unit in units[:5]:
+        text = capture.text[unit.start:unit.end].strip()
+        preview.append(
+            {
+                "id": unit_id(capture.id, unit.ordinal),
+                "locator": (
+                    f"{unit.locator.kind} {unit.locator.label}" if unit.locator else None
+                ),
+                "first_line": text.splitlines()[0][:120] if text else "",
+            }
+        )
+    long = len(units) > 1
+    templates = session.config.templates
+    return {
+        "units": max(len(units), 1),
+        "unit_preview": preview,
+        "nearest": nearest["hits"],
+        "known_entities": _known_entities(session),
+        "previously_dismissed": _previously_dismissed(session),
+        "entity_types": session.config.entity_types,
+        "edge_vocabulary": _edge_vocabulary(session),
+        "next": (
+            templates.get("ingest_next", DEFAULT_INGEST_NEXT)
+            if long
+            else templates.get("extraction_next", DEFAULT_EXTRACTION_NEXT)
+        ),
+    }
+
+
 def save_capture(
     session: Session, text: str, why: str | None = None, source: str = "manual"
 ) -> dict:
@@ -495,28 +593,108 @@ def save_capture(
 
     when = _now()
     capture_id = new_id("c_")
+    # The typed text is stored verbatim, never re-rendered: the user's own
+    # words are not rewritten. The IR is used only to decide the unit spans,
+    # which are then mapped back onto the original (docs/decisions/0002 §IR).
+    document = parse_text("capture.txt", text.encode("utf-8"))
+    spans = tuple(split_text(text)) if len(to_text_units(document)) > 1 else ()
     capture = Capture(
-        id=capture_id, created=_timestamp(when), source=source, why=why, text=text
+        id=capture_id,
+        created=_timestamp(when),
+        source=source,
+        why=why,
+        text=text,
+        sha256=document.source.sha256,
+        mime="text/plain",
+        parser="text",
+        parser_version=document.source.parser_version,
+        units=spans,
     )
 
     with session.operation({"tool": "save_capture", "capture": capture_id}):
         path = session.store.write_capture(capture, when)
         session.resync()
 
-    nearest = local_search(session.conn, session.embedder, text, session.config, k=5)
+    payload = {"id": capture_id, "path": _relative(session, path)}
+    payload.update(_extraction_payload(session, capture, _spans_as_units(spans, text)))
+    return payload
 
-    return {
+
+def _capture_from_document(document, capture_id: str, when: datetime, source: str, why: str | None):
+    body = to_markdown(document)
+    units = to_text_units(document)
+    spans = tuple((u.start, u.end) for u in units) if len(units) > 1 else ()
+    capture = Capture(
+        id=capture_id,
+        created=_timestamp(when),
+        source=source,
+        why=why,
+        text=body.rstrip("\n"),
+        title=document.title,
+        sha256=document.source.sha256,
+        mime=document.source.mime,
+        parser=document.source.parser,
+        parser_version=document.source.parser_version,
+        metadata=dict(document.metadata),
+        units=spans,
+    )
+    return capture, units
+
+
+def ingest_file(
+    session: Session, path: str, why: str | None = None, source: str = "file"
+) -> dict:
+    """Ingest a local file through the Document IR (docs/decisions/0002).
+
+    The original bytes are kept as a content-addressed attachment, the
+    rendered markdown becomes the capture, and the unit offsets go into the
+    capture's front-matter. A file already in the vault (same sha256) returns
+    its existing capture and writes nothing.
+    """
+    file = Path(path).expanduser()
+    if not file.is_file():
+        raise ToolError(f"no such file: {path}")
+    data = file.read_bytes()
+    _require(bool(data), f"{file.name} is empty")
+    document = parse_bytes(file.name, data)
+
+    existing = session.store.find_capture_by_sha256(document.source.sha256)
+    if existing is not None:
+        payload = {
+            "id": existing.id,
+            "path": None,
+            "title": existing.title,
+            "attachment": existing.attachment,
+            "parser": existing.parser,
+            "parser_error": existing.metadata.get("parser_error"),
+            "duplicate": True,
+        }
+        payload.update(
+            _extraction_payload(session, existing, _spans_as_units(existing.units, existing.text))
+        )
+        return payload
+
+    when = _now()
+    capture_id = new_id("c_")
+    capture, units = _capture_from_document(document, capture_id, when, source, why)
+    ext = file.suffix.lstrip(".").lower()
+    with session.operation({"tool": "ingest_file", "capture": capture_id}):
+        attachment = session.store.write_attachment(document.source.sha256, ext, data)
+        capture = replace(capture, attachment=_relative(session, attachment))
+        written = session.store.write_capture(capture, when)
+        session.resync()
+
+    payload = {
         "id": capture_id,
-        "path": _relative(session, path),
-        "nearest": nearest["hits"],
-        "known_entities": _known_entities(session),
-        "previously_dismissed": _previously_dismissed(session),
-        "entity_types": session.config.entity_types,
-        "edge_vocabulary": _edge_vocabulary(session),
-        "next": session.config.templates.get(
-            "extraction_next", DEFAULT_EXTRACTION_NEXT
-        ),
+        "path": _relative(session, written),
+        "title": capture.title,
+        "attachment": capture.attachment,
+        "parser": capture.parser,
+        "parser_error": capture.metadata.get("parser_error"),
+        "duplicate": False,
     }
+    payload.update(_extraction_payload(session, capture, units))
+    return payload
 
 
 def write_note(
@@ -535,12 +713,18 @@ def write_note(
     _require(derived_from in known_captures, f"no such capture: {derived_from}")
 
     ledger = _Ledger()
-    built_entities = _validate_entities(session, entities, ledger)
+    allowed_units = {
+        row["id"]
+        for row in session.conn.execute(
+            "SELECT id FROM text_units WHERE capture_id = ?", (derived_from,)
+        )
+    }
+    built_entities = _validate_entities(session, entities, ledger, allowed_units)
     local_types = {e.name: e.type for e in built_entities}
     built_relationships = _validate_relationships(
-        session, relationship_assertions, ledger, local_types
+        session, relationship_assertions, ledger, local_types, allowed_units
     )
-    built_claims = _validate_claims(session, claim_assertions, ledger)
+    built_claims = _validate_claims(session, claim_assertions, ledger, allowed_units)
 
     note_id = new_id("n_")
     note = Note(

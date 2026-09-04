@@ -42,7 +42,7 @@ def call(session, name: str, arguments: dict | None = None) -> dict:
 
 def test_all_fifteen_tools_are_registered(session):
     assert registered_names(session) == set(TOOL_NAMES)
-    assert len(TOOL_NAMES) == 17
+    assert len(TOOL_NAMES) == 18
 
 
 def test_every_tool_has_a_description(session):
@@ -218,3 +218,10 @@ def test_adopt_and_merge_round_trip_through_the_real_server(session):
     entity = call(session, "get_entity", {"name": "starwars", "as_of": "2026"})
     assert entity["slug"] == "star-wars"
     assert entity["merged_from"] == ["starwars"]
+
+
+def test_ingest_file_round_trips_through_the_real_server(session, tmp_path):
+    src = tmp_path / "doc.txt"
+    src.write_text("hello from a file")
+    payload = call(session, "ingest_file", {"path": str(src)})
+    assert payload["id"].startswith("c_") and payload["units"] == 1
