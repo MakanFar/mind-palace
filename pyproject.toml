@@ -10,6 +10,10 @@ dependencies = [
     "fastembed>=0.4",
     "graspologic>=3.4",
     "networkx>=3.0",
+    "pypdf>=6.16.2",
+    "python-calamine>=0.8.2",
+    "beautifulsoup4>=4.15.0",
+    "charset-normalizer>=3.4.9",
 ]
 
 [dependency-groups]
