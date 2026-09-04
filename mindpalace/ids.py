@@ -14,6 +14,7 @@ PREFIXES: dict[str, str] = {
     "k_": "claim_assertion",
     "e_": "entity",
     "g_": "community",
+    "u_": "text_unit",
     "op_": "operation",
 }
 
@@ -56,3 +57,15 @@ def aggregate_key(
     if symmetric:
         left, right = sorted((left, right))
     return f"r:{left}|{edge_type}|{right}"
+
+
+def unit_id(capture_id: str, ordinal: int) -> str:
+    """`u_<capture ulid>_<ordinal>` (docs/decisions/0002 §Storage). Derived,
+    never minted: the same capture and ordinal always name the same unit."""
+    return f"u_{capture_id.removeprefix('c_')}_{ordinal:04d}"
+
+
+def unit_parent(identifier: str) -> tuple[str, int]:
+    body = identifier.removeprefix("u_")
+    ulid, _, ordinal = body.rpartition("_")
+    return f"c_{ulid}", int(ordinal)

@@ -105,11 +105,23 @@ class Drop:
 
 @dataclass(frozen=True)
 class Capture:
+    """Tier 1. The file-derived fields (docs/decisions/0002 §Storage) are all
+    optional so a capture written before them still parses; `units == ()`
+    means one unit spanning the whole text."""
+
     id: str
     created: str
     source: str
     why: str | None
     text: str
+    title: str | None = None
+    attachment: str | None = None
+    sha256: str | None = None
+    mime: str | None = None
+    parser: str | None = None
+    parser_version: int | None = None
+    metadata: dict = field(default_factory=dict)
+    units: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -209,9 +221,17 @@ def _timestamp(value: object, record_id: object) -> str:
 
 
 def capture_to_markdown(capture: Capture) -> str:
-    data = {"id": capture.id, "created": capture.created, "source": capture.source}
+    data: dict = {"id": capture.id, "created": capture.created, "source": capture.source}
     if capture.why is not None:
         data["why"] = capture.why
+    for key in ("title", "attachment", "sha256", "mime", "parser", "parser_version"):
+        value = getattr(capture, key)
+        if value is not None:
+            data[key] = value
+    if capture.metadata:
+        data["metadata"] = dict(capture.metadata)
+    if capture.units:
+        data["units"] = [[start, end] for start, end in capture.units]
     return render(data, capture.text)
 
 
@@ -223,6 +243,14 @@ def capture_from_markdown(text: str) -> Capture:
         source=data["source"],
         why=data.get("why"),
         text=body.rstrip("\n"),
+        title=data.get("title"),
+        attachment=data.get("attachment"),
+        sha256=data.get("sha256"),
+        mime=data.get("mime"),
+        parser=data.get("parser"),
+        parser_version=data.get("parser_version"),
+        metadata=dict(data.get("metadata") or {}),
+        units=tuple((int(s), int(e)) for s, e in data.get("units", [])),
     )
 
 

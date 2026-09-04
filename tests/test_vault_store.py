@@ -343,3 +343,26 @@ def test_write_report_detects_a_concurrent_edit(store):
     read_for_edit.summary = "My conflicting edit."
     with pytest.raises(ConflictError):
         store.write_report(read_for_edit)
+
+
+def test_attachments_are_written_once_and_found_by_hash(tmp_path):
+    from datetime import UTC, datetime
+
+    from mindpalace.models import Capture
+    from mindpalace.vault.paths import VaultPaths
+    from mindpalace.vault.store import VaultStore
+
+    paths = VaultPaths(tmp_path)
+    for d in paths.all_directories():
+        d.mkdir(parents=True, exist_ok=True)
+    store = VaultStore(paths)
+    first = store.write_attachment("ab" * 32, "pdf", b"data")
+    assert first == paths.attachments / ("ab" * 32 + ".pdf") and first.read_bytes() == b"data"
+    assert store.write_attachment("ab" * 32, "pdf", b"other") == first
+    assert first.read_bytes() == b"data"
+    assert store.find_capture_by_sha256("ab" * 32) is None
+    when = datetime(2026, 9, 4, tzinfo=UTC)
+    store.write_capture(Capture("c_1", "2026-09-04T00:00:00Z", "file", None, "t", sha256="ab" * 32), when)
+    assert store.find_capture_by_sha256("ab" * 32).id == "c_1"
+    # The attachments directory must not be mistaken for captures.
+    assert [c.id for c in store.iter_captures()] == ["c_1"]

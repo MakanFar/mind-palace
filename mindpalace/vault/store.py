@@ -50,6 +50,23 @@ class VaultStore:
         for path in sorted(self.paths.captures.glob("*.md")):
             yield self.read_capture(path)
 
+    def write_attachment(self, sha256: str, ext: str, data: bytes) -> Path:
+        """Content-addressed, so writing the same bytes twice is a no-op and
+        different bytes can never land on one path."""
+        path = self.paths.attachment_path(sha256, ext)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_bytes(data)
+            tmp.replace(path)
+        return path
+
+    def find_capture_by_sha256(self, sha256: str) -> Capture | None:
+        for capture in self.iter_captures():
+            if capture.sha256 == sha256:
+                return capture
+        return None
+
     def write_note(self, note: Note, slug: str) -> Path:
         path = self.paths.note_path(note.id, slug)
         cas_write(path, note_to_markdown(note), None)

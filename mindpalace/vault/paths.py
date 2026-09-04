@@ -21,6 +21,8 @@ class VaultPaths:
         self.mindpalace_md = self.root / "MINDPALACE.md"
         self.index_md = self.root / "index.md"
         self.captures = self.root / "captures"
+        # Original files, content-addressed (docs/decisions/0002 §Storage).
+        self.attachments = self.captures / "attachments"
         self.notes = self.root / "notes"
         self.entities = self.root / "entities"
         self.communities = self.root / "communities"
@@ -34,6 +36,10 @@ class VaultPaths:
     def capture_path(self, capture_id: str, created: datetime) -> Path:
         suffix = capture_id[-SUFFIX_LENGTH:]
         return self.captures / f"{created:%Y-%m-%d-%H%M}-{suffix}.md"
+
+    def attachment_path(self, sha256: str, ext: str) -> Path:
+        suffix = f".{ext.lstrip('.')}" if ext else ""
+        return self.attachments / f"{sha256}{suffix}"
 
     def note_path(self, note_id: str, slug: str) -> Path:
         return self.notes / f"{note_id}-{_truncate_slug(slugify(slug))}.md"
@@ -49,6 +55,7 @@ class VaultPaths:
     def all_directories(self) -> list[Path]:
         return [
             self.captures,
+            self.attachments,
             self.notes,
             self.entities,
             self.communities,

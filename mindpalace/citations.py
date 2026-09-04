@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable, Iterable
 
 CITATION_PATTERN = re.compile(r"\[Data:([^\]]*)\]")
-ID_PATTERN = re.compile(r"\b((?:e|x|k|n|c|g)_[A-Za-z0-9\-]+)\b")
+ID_PATTERN = re.compile(r"\b((?:e|x|k|n|c|g|u)_[A-Za-z0-9\-_]+)\b")
 
 
 class CitationError(ValueError):

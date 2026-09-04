@@ -252,3 +252,25 @@ def test_validity_rejects_impossible_dates_and_trailing_junk():
     assert not is_valid_validity("2026-02-30", allow_unknown=False)
     assert not is_valid_validity("2026\n", allow_unknown=False)
     assert not is_valid_validity("unknown", allow_unknown=False)
+
+
+def test_capture_round_trips_attachment_fields_and_units():
+    from mindpalace.models import Capture, capture_from_markdown, capture_to_markdown
+
+    capture = Capture(
+        id="c_01", created="2026-09-04T00:00:00Z", source="file", why=None, text="## Page 1\n\nbody",
+        title="Paper", attachment="captures/attachments/ab.pdf", sha256="ab" * 32,
+        mime="application/pdf", parser="pdf", parser_version=1,
+        metadata={"page_count": 1}, units=((0, 8), (8, 16)),
+    )
+    text = capture_to_markdown(capture)
+    assert "units:" in text and "- - 0" in text
+    assert capture_from_markdown(text) == capture
+
+
+def test_old_capture_without_new_keys_still_parses():
+    from mindpalace.models import capture_from_markdown
+
+    old = "---\nid: c_1\ncreated: '2026-01-01T00:00:00Z'\nsource: manual\n---\n\nhello\n"
+    capture = capture_from_markdown(old)
+    assert capture.units == () and capture.attachment is None and capture.metadata == {}

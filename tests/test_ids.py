@@ -72,3 +72,18 @@ def test_directed_aggregate_key_preserves_order():
     reverse = aggregate_key("scaling-laws", "supports", "chinchilla", symmetric=False)
     assert forward != reverse
     assert forward == "r:chinchilla|supports|scaling-laws"
+
+
+def test_unit_ids_derive_from_the_capture_and_back():
+    from mindpalace.ids import id_kind, unit_id, unit_parent
+
+    uid = unit_id("c_01M1J7GBR4BDB8W06P0QFMM87G", 3)
+    assert uid == "u_01M1J7GBR4BDB8W06P0QFMM87G_0003"
+    assert id_kind(uid) == "text_unit"
+    assert unit_parent(uid) == ("c_01M1J7GBR4BDB8W06P0QFMM87G", 3)
+
+
+def test_citations_accept_unit_ids():
+    from mindpalace.citations import extract_ids
+
+    assert extract_ids("[Data: Units (u_01ABC_0001)]") == ["u_01ABC_0001"]
