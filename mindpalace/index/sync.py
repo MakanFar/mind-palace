@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from datetime import UTC, datetime
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,7 @@ from mindpalace.graph.duplicates import (
 )
 from mindpalace.graph.integrity import check_entity_types, check_signatures
 from mindpalace.ids import slugify, unit_id
+from mindpalace.index.graph_export import build_graph_export, write_graph_export
 from mindpalace.index import db, vectors
 from mindpalace.models import Capture, Note, capture_from_markdown, note_from_markdown
 from mindpalace.vault.store import VaultStore
@@ -119,9 +121,11 @@ def _load_sources(
     list[tuple[str, str, str]],
     list[tuple[str, str]],
     dict[str, tuple[str, str]],
+    dict[str, str],
 ]:
     """Parse every Tier 1 source file, degrading rather than dropping on
-    failure. See `_load_notes` for the notes half of this."""
+    failure. See `_load_notes` for the notes half of this. The last item
+    maps capture id -> relative path, for the graph export."""
     captures: list[Capture] = []
     issues: list[tuple[str, str, str]] = []
     degraded: list[tuple[str, str]] = []
@@ -155,7 +159,7 @@ def _load_sources(
     issues.extend(note_issues)
     degraded.extend(note_degraded)
 
-    return captures, notes, issues, degraded, note_sources
+    return captures, notes, issues, degraded, note_sources, seen_ids
 
 
 def _load_entity_pages(
@@ -665,7 +669,7 @@ def sync(
 ) -> SyncReport:
     """`adoptions`, `merges`, `kept` are the folded vocabulary and merge logs
     (see `Session.overlays`). Defaulted so a caller that has none still syncs."""
-    captures, notes, issues, degraded, note_sources = _load_sources(store)
+    captures, notes, issues, degraded, note_sources, capture_paths = _load_sources(store)
 
     note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
     tables, excluded_notes = _fold_with_quarantine(
@@ -882,6 +886,35 @@ def sync(
             vectors.store(conn, doc_id, kind, embedder.model_id, vector)
 
     atomic_write(store.paths.index_md, _render_index(captures, folded_notes, tables))
+
+    # The window's data (docs/decisions/0003). Communities are read back
+    # because `cluster` owns that table; everything else is in hand.
+    communities = [
+        {
+            "lineage_id": r["lineage_id"],
+            "level": r["level"],
+            "parent": r["parent"],
+            "members": r["members"].split(",") if r["members"] else [],
+        }
+        for r in conn.execute("SELECT lineage_id, level, parent, members FROM communities")
+    ]
+    write_graph_export(
+        store.paths.graph_json,
+        build_graph_export(
+            tables,
+            config,
+            captures,
+            capture_paths,
+            {note.id: note for note in folded_notes},
+            note_paths,
+            all_units,
+            communities,
+            proposals,
+            entity_pages,
+            reports,
+            datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        ),
+    )
 
     return SyncReport(
         notes=len(folded_notes),

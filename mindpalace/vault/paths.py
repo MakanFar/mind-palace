@@ -27,6 +27,8 @@ class VaultPaths:
         self.entities = self.root / "entities"
         self.communities = self.root / "communities"
         self.graph_db = self.root / ".graph" / "mindpalace.db"
+        # The Obsidian window's data (docs/decisions/0003). Tier 3 like the db.
+        self.graph_json = self.root / ".graph" / "graph.json"
         self.decisions_log = self.root / ".mindpalace" / "decisions.jsonl"
         self.op_log = self.root / ".mindpalace" / "log.jsonl"
         self.vocabulary_log = self.root / ".mindpalace" / "vocabulary.jsonl"
