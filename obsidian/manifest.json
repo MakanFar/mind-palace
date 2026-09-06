@@ -1,0 +1,9 @@
+{
+  "id": "mind-palace",
+  "name": "Mind Palace",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "A window into the palace: the vault's entity graph, with proposals you can confirm or dismiss.",
+  "author": "Makan",
+  "isDesktopOnly": true
+}
