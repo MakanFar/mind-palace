@@ -60,7 +60,7 @@ export class MindPalaceView extends ItemView {
     root.empty();
     root.addClass("mp-root");
     const top = root.createDiv();
-    this.topbar = new Topbar(top, (state) => this.onFilters(state));
+    this.topbar = new Topbar(top, (state) => this.onFilters(state), () => this.canvas?.fit());
     this.notice = root.createDiv({ cls: "mp-notice" });
     this.notice.hide();
     this.body = root.createDiv({ cls: "mp-body" });

@@ -75,6 +75,7 @@ export class GraphCanvas {
   private panning: { x: number; y: number; tx: number; ty: number } | null = null;
   private moved = false;
   private frame = 0;
+  private autoFit = true;
   private readonly observer: ResizeObserver;
   private neighbours = new Map<string, Set<string>>();
   private signature = "";
@@ -208,6 +209,31 @@ export class GraphCanvas {
     this.schedule();
   }
 
+  /** Pan and zoom so every visible node is on screen with a margin. Runs on
+   *  its own while a fresh layout settles, and on demand from the top bar;
+   *  the first manual pan, zoom, or drag switches the automatic part off. */
+  fit(): void {
+    const shown = this.nodes.filter((n) => this.visible(n) && n.x !== undefined && n.y !== undefined);
+    if (!shown.length) return;
+    const xs = shown.map((n) => n.x as number);
+    const ys = shown.map((n) => n.y as number);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const { width, height } = this.size();
+    const margin = 40;
+    const spanX = Math.max(maxX - minX, 1);
+    const spanY = Math.max(maxY - minY, 1);
+    const k = Math.min(2, Math.max(0.2, Math.min((width - 2 * margin) / spanX, (height - 2 * margin) / spanY)));
+    this.transform = {
+      k,
+      x: width / 2 - ((minX + maxX) / 2) * k,
+      y: height / 2 - ((minY + maxY) / 2) * k,
+    };
+    this.schedule();
+  }
+
   destroy(): void {
     this.simulation?.stop();
     this.observer.disconnect();
@@ -233,7 +259,16 @@ export class GraphCanvas {
       .force("charge", forceManyBody<Node>().strength(-80))
       .force("center", forceCenter(width / 2, height / 2))
       .force("collide", forceCollide<Node>().radius((n) => n.radius + 2))
-      .on("tick", () => this.schedule());
+      .on("tick", () => {
+        if (this.autoFit) this.fit();
+        else this.schedule();
+      })
+      .on("end", () => {
+        if (this.autoFit) this.fit();
+      });
+    // A re-laid-out graph deserves a fresh fit, unless the reader has taken
+    // the viewport into their own hands since the last one.
+    if (alpha >= 1) this.autoFit = true;
   }
 
   // ---- geometry --------------------------------------------------------
@@ -305,6 +340,7 @@ export class GraphCanvas {
     this.canvas.addEventListener("mousedown", (event) => {
       const hit = this.hit(event.clientX, event.clientY);
       this.moved = false;
+      this.autoFit = false;
       if (hit?.kind === "entity") {
         this.dragging = this.byslug.get(hit.slug) ?? null;
         if (this.dragging) {
@@ -320,6 +356,7 @@ export class GraphCanvas {
     window.addEventListener("mouseup", this.onUp);
     this.canvas.addEventListener("wheel", (event) => {
       event.preventDefault();
+      this.autoFit = false;
       const factor = Math.exp(-event.deltaY * 0.0015);
       const next = Math.min(6, Math.max(0.2, this.transform.k * factor));
       const rect = this.canvas.getBoundingClientRect();
