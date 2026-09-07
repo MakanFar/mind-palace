@@ -6,9 +6,19 @@
    minmax(0, 1fr): a bare 1fr has an `auto` minimum, which lets the panel's
    content height dictate the row and left the graph a third of the tab tall. */
 .workspace-leaf-content .mp-root {
+  /* Pinned to the leaf's box rather than sized by `height: 100%`: that
+     percentage resolved as auto in practice, so the view grew and shrank
+     with the panel's content. `.workspace-leaf-content` is positioned, and
+     the view header above sits in flow, hence the top offset. */
+  position: absolute;
+  top: var(--header-height);
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: auto;
+  width: auto;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  height: 100%;
   padding: 0;
   overflow: hidden;
 }
