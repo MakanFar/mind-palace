@@ -58,3 +58,56 @@ def test_graph_json_is_rewritten_on_every_sync_and_is_tier_three(session):
     session.paths.graph_json.unlink()
     session.resync()
     assert session.paths.graph_json.exists()
+
+
+def test_a_missing_graph_json_is_regenerated_on_open(tmp_path):
+    with Session(tmp_path, init=True, embedder=StubEmbedder()) as first:
+        save_capture(first, "one")
+        first.paths.graph_json.unlink()
+    with Session(tmp_path, embedder=StubEmbedder()) as second:
+        assert second.paths.graph_json.exists()
+
+
+def test_cluster_refreshes_graph_json(session):
+    from mindpalace.tools import cluster_tool, propose_relationship
+
+    write_note(session, save_capture(session, "x")["id"], "Body.", entities=[
+        {"name": "a", "type": "concept", "description": "d"}, {"name": "b", "type": "concept", "description": "d"}])
+    link = propose_relationship(session, "a", "b", "relates-to", "because")
+    resolve_assertion(session, link["id"], "confirm")
+    assert json.loads(session.paths.graph_json.read_text())["communities"] == []
+    cluster_tool(session, force=True)
+    communities = json.loads(session.paths.graph_json.read_text())["communities"]
+    assert communities and set(communities[0]["members"]) >= {"a", "b"}
+
+
+def test_a_decision_appended_during_sync_is_still_drift(tmp_path):
+    """The Obsidian plugin appends without the vault lock. A line landing while
+    sync is embedding must not be hashed as already folded."""
+    from mindpalace.index.sync import has_drift
+
+    class SlowEmbedder(StubEmbedder):
+        def __init__(self, hook):
+            super().__init__()
+            self.hook = hook
+
+        def embed(self, texts):
+            self.hook()
+            return super().embed(texts)
+
+    state = {"session": None, "fired": False}
+
+    def append_during_embed():
+        s = state["session"]
+        if s is None or state["fired"]:
+            return
+        state["fired"] = True
+        s.paths.decisions_log.parent.mkdir(exist_ok=True)
+        with s.paths.decisions_log.open("a") as f:
+            f.write('{"action":"confirm","assertion":"x_late","op":"obsidian_1","reason":null,"ts":"t","via":"obsidian"}\n')
+
+    with Session(tmp_path, init=True, embedder=SlowEmbedder(append_during_embed)) as s:
+        state["session"] = s
+        save_capture(s, "one")  # the resync inside fires the hook mid-embed
+        assert state["fired"]
+        assert has_drift(s.conn, s.store)

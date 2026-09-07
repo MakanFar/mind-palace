@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { applyOverlay, decisionLine, foldDecisions } from "./decisions";
@@ -82,5 +85,60 @@ describe("decisionLine", () => {
   it("round-trips through foldDecisions", () => {
     const line = decisionLine("k_9", "dismiss", "not true", new Date(), "id");
     expect(foldDecisions(line).get("k_9")).toBe("dismiss");
+  });
+});
+
+describe("applyOverlay, review findings", () => {
+  it("never resurrects a superseded claim from its own old confirm", () => {
+    const g: GraphData = {
+      ...emptyGraph(),
+      claims: [{ ...graph.claims[0], id: "k_old", status: "superseded" }],
+    };
+    const out = applyOverlay(g, new Map([["k_old", "confirm"]]));
+    expect(out.claims[0].status).toBe("superseded");
+  });
+
+  it("derives traversable and weight from statuses, so a dismissal retracts them", () => {
+    const g: GraphData = {
+      ...emptyGraph(),
+      edges: [{
+        ...graph.edges[0], traversable: true, weight: 1,
+        assertions: [
+          { ...graph.edges[0].assertions[0], id: "x_c", status: "confirmed" },
+          { ...graph.edges[0].assertions[0], id: "x_p", status: "proposed" },
+        ],
+      }],
+    };
+    const out = applyOverlay(g, new Map([["x_c", "dismiss"]]));
+    expect(out.edges[0].traversable).toBe(false);
+    expect(out.edges[0].weight).toBe(0);
+    const both = applyOverlay(g, new Map([["x_p", "confirm"]]));
+    expect(both.edges[0].weight).toBe(2);
+  });
+});
+
+describe("decisionLine, review findings", () => {
+  it("escapes the line separators Python's splitlines would break on", () => {
+    const line = decisionLine("x_1", "dismiss", "a\u2028b\u2029c\u0085d", new Date(0), "id");
+    expect(line).not.toMatch(/[\u2028\u2029\u0085]/);
+    expect(JSON.parse(line).reason).toBe("a\u2028b\u2029c\u0085d");
+    expect(line.split("\n").length).toBe(2);
+  });
+});
+
+describe("conformance with the Python DecisionLog", () => {
+  const fixture = readFileSync(resolve(__dirname, "../../tests/fixtures/decisions-conformance.jsonl"), "utf8");
+
+  it("folds the shared fixture to the same map, torn final line included", () => {
+    const overlay = foldDecisions(fixture);
+    expect([...overlay.entries()]).toEqual([["x_1", "confirm"], ["k_2", "confirm"]]);
+  });
+
+  it("treats a torn line before a trailing newline as final, like splitlines()", () => {
+    expect(foldDecisions('{"action":"confirm","assertion":"x","op":"o","ts":"t","via":"v"}\n{"bad\n').get("x")).toBe("confirm");
+  });
+
+  it("rejects a line missing the keys Python reads", () => {
+    expect(() => foldDecisions('{"assertion":"x_1","action":"confirm"}')).toThrow(/missing op, ts, via/);
   });
 });

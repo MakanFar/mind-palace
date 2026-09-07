@@ -11,7 +11,10 @@ export interface TopbarState {
   focus: string | null;
 }
 
+let instances = 0;
+
 export class Topbar {
+  private readonly listId = `mp-entities-${++instances}`;
   private state: TopbarState = { query: "", hiddenTypes: new Set(), showProposed: true, asOf: null, focus: null };
   private readonly legend: HTMLElement;
   private readonly datalist: HTMLDataListElement;
@@ -24,9 +27,9 @@ export class Topbar {
     container.classList.add("mp-topbar");
     const search = container.createEl("input", {
       cls: "mp-search",
-      attr: { type: "search", placeholder: "focus an entity…", list: "mp-entities" },
+      attr: { type: "search", placeholder: "focus an entity…", list: this.listId },
     });
-    this.datalist = container.createEl("datalist", { attr: { id: "mp-entities" } });
+    this.datalist = container.createEl("datalist", { attr: { id: this.listId } });
     search.addEventListener("input", () => {
       this.state.query = search.value;
       this.state.focus = this.slugs.has(search.value) ? search.value : null;

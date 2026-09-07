@@ -1,6 +1,6 @@
 # 0003 · A window into the palace
 
-- **Status**: approved in design, implementing on `feat/obsidian-view`, 2026-09-06
+- **Status**: implemented on `feat/obsidian-view`, 2026-09-06; deviations listed at the end
 - **Related**: PRD §7.3 (the graph is the one job that needs a visual surface, and it is
   a thin window, not an app), §9 (rent surfaces, own the store); [0001](0001-what-we-borrowed-from-utopia.md)
   for review-gating and the decision log the window writes to; [0002](0002-one-document-for-every-format.md)
@@ -148,3 +148,29 @@ Python: `sync` writes `graph.json`, and a test checks it against the same tables
 SQLite cache holds. Plugin: Vitest unit tests for the `graph.json` reader, the decision
 overlay (including a dismissed-then-confirmed sequence), and the `decisions.jsonl` line
 writer; one manual pass in Obsidian against the real vault before merge.
+
+## Deviations found while implementing
+
+- **Traversability and weight are derived from statuses, not OR-ed with the export.**
+  The design said "graph.json says so OR any member confirmed"; that is monotone and could
+  not retract a dismissal made in the window. The plugin now uses the fold's own rule
+  (traversable iff any member confirmed, weight = confirmed count), so it needs nothing
+  from the export it cannot recompute.
+- **A superseded claim is never overwritten by the overlay.** "Superseded" is derived by
+  the Python fold from a later confirmed claim; the log still holds the old claim's own
+  confirm, which would otherwise resurrect it.
+- **The two readers of `decisions.jsonl` are held to one rule.** The plugin requires the
+  same keys Python reads, treats the final line the way `splitlines()` does, and escapes
+  U+2028, U+2029 and U+0085 in reasons. `tests/fixtures/decisions-conformance.jsonl` is
+  read by both test suites.
+- **`sync` hashes source files before folding and embedding**, so a line the window
+  appends during the slow embed is still seen as drift on the next open. The window
+  still takes no lock.
+- **Opening a session regenerates a missing `graph.json`**, and `cluster` re-syncs, so
+  "run the server once" is true as written.
+- **The layout only re-heats when the node or edge set changes**, the viewport recentres
+  only when the focus changes, and the panel re-renders only when the selected item's
+  data changed, so a poll during review does not disturb the reader.
+- **"Open page" checks the file exists first**; entity pages appear only after a rebuild,
+  and opening a missing link would have created a blank note the sync then reports as
+  malformed. A future export can carry the page path directly.

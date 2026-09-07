@@ -78,6 +78,10 @@ export class GraphCanvas {
   private frame = 0;
   private readonly observer: ResizeObserver;
   private neighbours = new Map<string, Set<string>>();
+  private signature = "";
+  private lastFocus: string | null = null;
+  private readonly onMove = (event: MouseEvent): void => this.handleMove(event);
+  private readonly onUp = (event: MouseEvent): void => this.handleUp(event);
 
   constructor(
     private readonly container: HTMLElement,
@@ -108,11 +112,16 @@ export class GraphCanvas {
         radius: radiusFor(entity.rank),
         x: old?.x,
         y: old?.y,
-        vx: 0,
-        vy: 0,
+        vx: old?.vx ?? 0,
+        vy: old?.vy ?? 0,
+        fx: old?.fx,
+        fy: old?.fy,
       };
     });
     this.byslug = new Map(this.nodes.map((n) => [n.slug, n]));
+    // A reload during a drag must not leave the drag pinned to a node the
+    // simulation no longer owns.
+    if (this.dragging) this.dragging = this.byslug.get(this.dragging.slug) ?? null;
     this.links = [];
     for (const edge of graph.edges) {
       if (!this.byslug.has(edge.source) || !this.byslug.has(edge.target)) continue;
@@ -139,7 +148,21 @@ export class GraphCanvas {
       this.adjacent(link.sourceSlug).add(link.targetSlug);
       this.adjacent(link.targetSlug).add(link.sourceSlug);
     }
-    this.restart();
+    // graph.json is rewritten on every server write, and the view polls it.
+    // Only a change in *structure* is worth re-heating the layout; a status
+    // flip or a new description just redraws in place.
+    const signature = [
+      this.nodes.map((n) => n.slug).sort().join(","),
+      this.links.map((l) => `${l.id}:${l.sourceSlug}:${l.targetSlug}`).sort().join(","),
+    ].join("|");
+    if (signature !== this.signature) {
+      this.signature = signature;
+      this.restart(previous.size > 0 ? 0.4 : 1);
+    } else {
+      this.simulation?.nodes(this.nodes);
+      (this.simulation?.force("link") as ReturnType<typeof forceLink<Node, Link>> | undefined)?.links(this.links);
+      this.schedule();
+    }
   }
 
   private link(edge: GraphEdge): Link {
@@ -166,7 +189,9 @@ export class GraphCanvas {
 
   setFilters(filters: CanvasFilters): void {
     this.filters = filters;
-    if (filters.focus && this.byslug.has(filters.focus)) {
+    const focusChanged = filters.focus !== this.lastFocus;
+    this.lastFocus = filters.focus;
+    if (focusChanged && filters.focus && this.byslug.has(filters.focus)) {
       const node = this.byslug.get(filters.focus)!;
       const { width, height } = this.size();
       this.transform = {
@@ -187,15 +212,18 @@ export class GraphCanvas {
     this.simulation?.stop();
     this.observer.disconnect();
     cancelAnimationFrame(this.frame);
+    window.removeEventListener("mousemove", this.onMove);
+    window.removeEventListener("mouseup", this.onUp);
     this.canvas.remove();
   }
 
   // ---- simulation ------------------------------------------------------
 
-  private restart(): void {
+  private restart(alpha: number): void {
     this.simulation?.stop();
     const { width, height } = this.size();
     this.simulation = forceSimulation<Node, Link>(this.nodes)
+      .alpha(alpha)
       .force(
         "link",
         forceLink<Node, Link>(this.links)
@@ -281,7 +309,24 @@ export class GraphCanvas {
         this.panning = { x: event.clientX, y: event.clientY, tx: this.transform.x, ty: this.transform.y };
       }
     });
-    window.addEventListener("mousemove", (event) => {
+    window.addEventListener("mousemove", this.onMove);
+    window.addEventListener("mouseup", this.onUp);
+    this.canvas.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const factor = Math.exp(-event.deltaY * 0.0015);
+      const next = Math.min(6, Math.max(0.2, this.transform.k * factor));
+      const rect = this.canvas.getBoundingClientRect();
+      const px = event.clientX - rect.left;
+      const py = event.clientY - rect.top;
+      this.transform.x = px - ((px - this.transform.x) * next) / this.transform.k;
+      this.transform.y = py - ((py - this.transform.y) * next) / this.transform.k;
+      this.transform.k = next;
+      this.schedule();
+    }, { passive: false });
+  }
+
+  private handleMove(event: MouseEvent): void {
+    {
       if (this.dragging) {
         const p = this.toGraph(event.clientX, event.clientY);
         this.dragging.fx = p.x;
@@ -303,8 +348,11 @@ export class GraphCanvas {
         this.callbacks.onHover(hit);
         this.schedule();
       }
-    });
-    window.addEventListener("mouseup", (event) => {
+    }
+  }
+
+  private handleUp(event: MouseEvent): void {
+    {
       if (this.dragging) {
         this.dragging.fx = null;
         this.dragging.fy = null;
@@ -317,19 +365,7 @@ export class GraphCanvas {
         this.panning = null;
         if (!this.moved) this.select(this.hit(event.clientX, event.clientY));
       }
-    });
-    this.canvas.addEventListener("wheel", (event) => {
-      event.preventDefault();
-      const factor = Math.exp(-event.deltaY * 0.0015);
-      const next = Math.min(6, Math.max(0.2, this.transform.k * factor));
-      const rect = this.canvas.getBoundingClientRect();
-      const px = event.clientX - rect.left;
-      const py = event.clientY - rect.top;
-      this.transform.x = px - ((px - this.transform.x) * next) / this.transform.k;
-      this.transform.y = py - ((py - this.transform.y) * next) / this.transform.k;
-      this.transform.k = next;
-      this.schedule();
-    }, { passive: false });
+    }
   }
 
   private select(selection: Selection | null): void {
@@ -431,7 +467,9 @@ export class GraphCanvas {
 
     ctx.globalAlpha = 1;
     ctx.fillStyle = text;
-    ctx.font = `${11 / this.transform.k}px var(--font-interface, sans-serif)`;
+    // A `var()` inside ctx.font is silently rejected and the default 10px
+    // font kept; resolve the family the same way the colours are resolved.
+    ctx.font = `${11 / this.transform.k}px ${cssVar(this.container, "--font-interface", "sans-serif")}`;
     for (const node of this.nodes) {
       if (!this.visible(node)) continue;
       const emphasised = inNodes ? inNodes.has(node.slug) : false;

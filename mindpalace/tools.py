@@ -1452,6 +1452,9 @@ def cluster_tool(session: Session, force: bool = False) -> dict:
         # it to the next rebuild would let global_search serve an obsolete report
         # as `present` in the meantime.
         stale_reports = mark_stale_reports(session.conn, session.store, tables)
+        # And the Obsidian window reads communities from graph.json, which
+        # only `sync` writes (docs/decisions/0003 §Part 1).
+        session.resync()
 
     payload = []
     for community in matched:

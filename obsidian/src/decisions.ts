@@ -14,19 +14,30 @@ export type Overlay = Map<string, Action>;
 
 const STATUS = { confirm: "confirmed", dismiss: "dismissed" } as const;
 
+const REQUIRED_KEYS = ["op", "ts", "assertion", "action", "via"] as const;
+
 export function foldDecisions(text: string): Overlay {
   const overlay: Overlay = new Map();
-  const lines = text.split("\n");
+  // Python reads this file with `splitlines()`, under which a trailing
+  // newline does not produce an empty last line. Match that, so "the final
+  // line" means the same physical line on both sides.
+  const lines = text.replace(/\n+$/, "").split("\n");
   lines.forEach((line, index) => {
     if (!line.trim()) return;
-    let record: { assertion?: unknown; action?: unknown };
+    let record: Record<string, unknown>;
     try {
-      record = JSON.parse(line) as { assertion?: unknown; action?: unknown };
+      record = JSON.parse(line) as Record<string, unknown>;
     } catch {
       // A torn final line is a crash artefact from an interrupted append:
       // skip it. Anything earlier is real corruption and must be seen.
       if (index === lines.length - 1) return;
       throw new Error(`decisions.jsonl: malformed JSON at line ${index + 1}`);
+    }
+    // The same keys Python's DecisionLog.entries reads: a line missing one
+    // would crash the server, so it must not quietly count here either.
+    const missing = REQUIRED_KEYS.filter((key) => !(key in record));
+    if (missing.length) {
+      throw new Error(`decisions.jsonl: line ${index + 1} is missing ${missing.join(", ")}`);
     }
     if (
       typeof record.assertion === "string" &&
@@ -40,18 +51,20 @@ export function foldDecisions(text: string): Overlay {
 
 export function applyOverlay(graph: GraphData, overlay: Overlay): GraphData {
   const restatus = <T extends { id: string; status: string }>(item: T): T => {
+    // "superseded" is derived by the Python fold from a *later* confirmed
+    // claim, never from this log; the log still holds the old claim's own
+    // confirm, which must not resurrect it.
+    if (item.status === "superseded") return item;
     const action = overlay.get(item.id);
     return action ? { ...item, status: STATUS[action] } : item;
   };
   const edges = graph.edges.map((edge) => {
     const assertions = edge.assertions.map(restatus);
-    return {
-      ...edge,
-      assertions,
-      // The only structural fact the plugin derives: an edge becomes
-      // traversable the moment any member assertion is confirmed.
-      traversable: edge.traversable || assertions.some((a) => a.status === "confirmed"),
-    };
+    // Same rule as the fold: traversable iff any member is confirmed, and
+    // weight is the confirmed count. Derived from the statuses alone, so a
+    // dismissal made here can retract what graph.json still says.
+    const confirmed = assertions.filter((a) => a.status === "confirmed").length;
+    return { ...edge, assertions, traversable: confirmed > 0, weight: confirmed };
   });
   return {
     ...graph,
@@ -77,7 +90,13 @@ export function decisionLine(
     ts: now.toISOString().replace(/\.\d{3}Z$/, "Z"),
     via: "obsidian",
   };
-  return JSON.stringify(record) + "\n";
+  // Python reads the file with `splitlines()`, which also breaks on U+2028,
+  // U+2029 and U+0085. JSON.stringify leaves those raw; escape them so a
+  // reason typed in the panel can never split a record in two.
+  const json = JSON.stringify(record).replace(/[\u2028\u2029\u0085]/g, (ch) =>
+    "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"),
+  );
+  return json + "\n";
 }
 
 export function randomId(): string {

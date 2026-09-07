@@ -32,6 +32,7 @@ export class MindPalaceView extends ItemView {
   private selection: Selection | null = null;
   private filters: TopbarState | null = null;
   private stamps = { graph: -1, decisions: -1 };
+  private panelSnapshot = "";
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -68,7 +69,7 @@ export class MindPalaceView extends ItemView {
       onHover: () => undefined,
     });
     this.panel = new Panel(panelHost, {
-      openFile: (path) => void this.app.workspace.openLinkText(path, "", true),
+      openFile: (path) => void this.openFile(path),
       select: (selection) => this.onSelect(selection),
       decide: (assertion, action, reason) => this.decide(assertion, action, reason),
     });
@@ -107,7 +108,31 @@ export class MindPalaceView extends ItemView {
     this.topbar?.setGraph(this.graph);
     this.canvas?.setGraph(this.graph);
     if (this.filters) this.canvas?.setFilters(this.filters);
-    this.panel?.show(this.selection, this.graph, this.filters?.asOf ?? null);
+    if (!Panel.resolves(this.selection, this.graph)) {
+      // A merge or adoption can retire the selected key between reloads.
+      this.selection = null;
+      this.canvas?.setSelection(null);
+    }
+    this.showPanel();
+  }
+
+  private showPanel(): void {
+    const asOf = this.filters?.asOf ?? null;
+    const snapshot = Panel.snapshot(this.selection, this.graph, asOf);
+    if (snapshot === this.panelSnapshot) return;
+    this.panelSnapshot = snapshot;
+    this.panel?.show(this.selection, this.graph, asOf);
+  }
+
+  private async openFile(path: string): Promise<void> {
+    // `openLinkText` creates a blank note for an unresolved path, which
+    // would then parse as a malformed entity page. Entity pages only exist
+    // after a rebuild, so check first.
+    if (!(await this.app.vault.adapter.exists(path))) {
+      new Notice(`Mind Palace: ${path} does not exist yet (run rebuild to write entity pages).`);
+      return;
+    }
+    await this.app.workspace.openLinkText(path, "", true);
   }
 
   private async decide(assertion: string, action: Action, reason: string | null): Promise<void> {
@@ -121,7 +146,7 @@ export class MindPalaceView extends ItemView {
       else await adapter.write(decisionsPath, line);
     } catch (error) {
       new Notice(`Mind Palace: could not write the decision: ${(error as Error).message}`);
-      return;
+      throw error;
     }
     new Notice(`Mind Palace: ${action === "confirm" ? "confirmed" : "dismissed"} ${assertion}`);
     await this.reload(true);
@@ -133,14 +158,14 @@ export class MindPalaceView extends ItemView {
     if (sameSelection(selection, this.selection) && selection !== null) return;
     this.selection = selection;
     this.canvas?.setSelection(selection);
-    this.panel?.show(selection, this.graph, this.filters?.asOf ?? null);
+    this.showPanel();
   }
 
   private onFilters(state: TopbarState): void {
     this.filters = state;
     this.canvas?.setFilters({ hiddenTypes: state.hiddenTypes, showProposed: state.showProposed, focus: state.focus });
     if (state.focus) this.onSelect({ kind: "entity", slug: state.focus });
-    else this.panel?.show(this.selection, this.graph, state.asOf);
+    else this.showPanel();
   }
 
   private showNotice(text: string): void {

@@ -204,3 +204,17 @@ def test_keep_only_undoes_a_merge_of_that_same_pair(tmp_path):
     log.append("a", "b", "keep", "t", "op_2")
     assert log.merges() == {"a": "c"}
     assert log.kept() == {("a", "b")}
+
+
+def test_decision_log_conformance_fixture_folds_the_same_as_the_plugin():
+    """tests/fixtures/decisions-conformance.jsonl is also read by the Obsidian
+    plugin's Vitest suite; both must fold it to the same map and tolerate the
+    torn final line the same way."""
+    from pathlib import Path
+
+    from mindpalace.oplog import DecisionLog
+
+    fixture = Path(__file__).parent / "fixtures" / "decisions-conformance.jsonl"
+    log = DecisionLog(fixture)
+    assert log.status_map() == {"x_1": "confirm", "k_2": "confirm"}
+    assert [d.via for d in log.entries()] == ["resolve_assertion", "obsidian", "resolve_assertion"]

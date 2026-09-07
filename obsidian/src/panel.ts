@@ -52,10 +52,42 @@ export class Panel {
     } else if (selection.kind === "edge") {
       const edge = graph.edges.find((e) => e.key === selection.key);
       if (edge) this.renderEdge(edge, graph);
+      else this.gone("That edge is no longer in the graph (a merge or a re-sync changed it).");
     } else {
       const item = graph.untyped.find((u) => u.id === selection.id);
       if (item) this.renderUntyped(item, graph);
+      else this.gone("That assertion is no longer untyped, or is no longer in the graph.");
     }
+  }
+
+  /** A fingerprint of everything the panel would render for a selection, so
+   *  a poll that changed nothing relevant does not wipe a half-typed reason. */
+  static snapshot(selection: Selection | null, graph: GraphData, asOf: string | null): string {
+    if (!selection) return JSON.stringify(["none", graph.vocabulary]);
+    if (selection.kind === "entity") {
+      const slug = selection.slug;
+      return JSON.stringify([
+        asOf,
+        graph.entities.find((e) => e.slug === slug) ?? null,
+        graph.claims.filter((c) => c.subject === slug),
+        graph.edges.filter((e) => e.source === slug || e.target === slug),
+        graph.untyped.filter((u) => u.source === slug || u.target === slug),
+      ]);
+    }
+    if (selection.kind === "edge") return JSON.stringify(graph.edges.find((e) => e.key === selection.key) ?? null);
+    return JSON.stringify(graph.untyped.find((u) => u.id === selection.id) ?? null);
+  }
+
+  /** Whether a selection still resolves in this graph. */
+  static resolves(selection: Selection | null, graph: GraphData): boolean {
+    if (!selection) return true;
+    if (selection.kind === "entity") return graph.entities.some((e) => e.slug === selection.slug);
+    if (selection.kind === "edge") return graph.edges.some((e) => e.key === selection.key);
+    return graph.untyped.some((u) => u.id === selection.id);
+  }
+
+  private gone(text: string): void {
+    this.container.createEl("p", { cls: "mp-muted", text });
   }
 
   // ---- entity ----------------------------------------------------------
@@ -201,7 +233,13 @@ export class Panel {
     const dismiss = row.createEl("button", { cls: "mp-dismiss", text: "Dismiss" });
     const act = (action: Action) => async () => {
       confirm.disabled = dismiss.disabled = true;
-      await this.actions.decide(assertion, action, reason.value.trim() || null);
+      try {
+        await this.actions.decide(assertion, action, reason.value.trim() || null);
+      } finally {
+        // A successful decide re-renders the panel and replaces these
+        // buttons; a failed one must hand them back.
+        confirm.disabled = dismiss.disabled = false;
+      }
     };
     confirm.addEventListener("click", act("confirm"));
     dismiss.addEventListener("click", act("dismiss"));

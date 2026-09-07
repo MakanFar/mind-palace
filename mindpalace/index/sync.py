@@ -669,6 +669,14 @@ def sync(
 ) -> SyncReport:
     """`adoptions`, `merges`, `kept` are the folded vocabulary and merge logs
     (see `Session.overlays`). Defaulted so a caller that has none still syncs."""
+    # Hash every source file now, before the fold and the slow embed. The
+    # Obsidian window appends to decisions.jsonl without the vault lock; a
+    # line landing during the embed must be hashed as *not yet* folded, or
+    # `has_drift` would never notice it (docs/decisions/0003 §Part 2).
+    source_hashes = [
+        (_relative(store, path), content_hash(path.read_text(encoding="utf-8")))
+        for path in _iter_source_files(store)
+    ]
     captures, notes, issues, degraded, note_sources, capture_paths = _load_sources(store)
 
     note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
@@ -778,11 +786,7 @@ def sync(
         vectors.clear(conn)
         db.write_meta(conn, embedder.model_id, embedder.dim)
 
-        for path in _iter_source_files(store):
-            conn.execute(
-                "INSERT INTO files (path, hash) VALUES (?, ?)",
-                (_relative(store, path), content_hash(path.read_text(encoding="utf-8"))),
-            )
+        conn.executemany("INSERT INTO files (path, hash) VALUES (?, ?)", source_hashes)
 
         for entity in tables.entities.values():
             conn.execute(

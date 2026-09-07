@@ -83,6 +83,12 @@ class Session:
             self.opened = True
             self._verify_cache_model()
             self.heal()
+            if not self.paths.graph_json.exists():
+                # Tier 3 like the db, but not covered by the model check or
+                # by drift: a deleted export would otherwise stay missing
+                # until the next write, and the Obsidian window promises
+                # that opening the server once is enough.
+                self.resync()
         except BaseException:
             # A failed open must leave nothing behind: the descriptor opened
             # above, and any connection made after it, both belong to a
