@@ -83,6 +83,9 @@ export class MindPalaceView extends ItemView {
     this.body = root.createDiv({ cls: "mp-body" });
     Object.assign(this.body.style, {
       display: "grid",
+      // The hidden notice leaves auto-placement's second row vacant.
+      // Keep the body in the flexible row even when the notice is absent.
+      gridRow: "3",
       gridTemplateColumns: "minmax(0, 1fr) 320px",
       gridTemplateRows: "minmax(0, 1fr)",
       minHeight: "0",

@@ -83,6 +83,8 @@
 
 .mp-body {
   display: grid;
+  /* Hiding the notice must not move the body into its content-sized row. */
+  grid-row: 3;
   grid-template-columns: minmax(0, 1fr) 320px;
   grid-template-rows: minmax(0, 1fr);
   min-height: 0;
