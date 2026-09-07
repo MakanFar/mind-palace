@@ -91,6 +91,9 @@ export class GraphCanvas {
   ) {
     this.canvas = document.createElement("canvas");
     this.canvas.className = "mp-canvas";
+    // Out of flow, so the canvas never feeds its own height back into the
+    // grid row it is sized from (see view.ts for why this is inline).
+    Object.assign(this.canvas.style, { position: "absolute", inset: "0", display: "block" });
     container.appendChild(this.canvas);
     const ctx = this.canvas.getContext("2d");
     if (!ctx) throw new Error("mind-palace: canvas 2d context unavailable");

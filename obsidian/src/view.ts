@@ -59,13 +59,43 @@ export class MindPalaceView extends ItemView {
     const root = this.contentEl;
     root.empty();
     root.addClass("mp-root");
+    // The sizing rules are set here as well as in styles.css. Obsidian
+    // resolves the view content's percentage height as auto in some
+    // layouts, and a stale stylesheet after a reload leaves the view
+    // sized by the panel's content; inline styles hold either way.
+    Object.assign(root.style, {
+      position: "absolute",
+      top: "var(--header-height)",
+      left: "0",
+      right: "0",
+      bottom: "0",
+      height: "auto",
+      width: "auto",
+      display: "grid",
+      gridTemplateRows: "auto auto minmax(0, 1fr)",
+      padding: "0",
+      overflow: "hidden",
+    } as Partial<CSSStyleDeclaration>);
     const top = root.createDiv();
     this.topbar = new Topbar(top, (state) => this.onFilters(state));
     this.notice = root.createDiv({ cls: "mp-notice" });
     this.notice.hide();
     this.body = root.createDiv({ cls: "mp-body" });
+    Object.assign(this.body.style, {
+      display: "grid",
+      gridTemplateColumns: "minmax(0, 1fr) 320px",
+      gridTemplateRows: "minmax(0, 1fr)",
+      minHeight: "0",
+    } as Partial<CSSStyleDeclaration>);
     const canvasHost = this.body.createDiv({ cls: "mp-canvas-host" });
+    Object.assign(canvasHost.style, {
+      position: "relative",
+      minHeight: "0",
+      minWidth: "0",
+      overflow: "hidden",
+    } as Partial<CSSStyleDeclaration>);
     const panelHost = this.body.createDiv();
+    Object.assign(panelHost.style, { minHeight: "0", overflowY: "auto" } as Partial<CSSStyleDeclaration>);
     this.canvas = new GraphCanvas(canvasHost, {
       onSelect: (selection) => this.onSelect(selection),
     });
