@@ -90,6 +90,16 @@ export interface GraphData {
 
 export const GRAPH_VERSION = 1;
 
+/** Whether a row still has anything to show: dismissed is drawn as nothing. */
+export function isLive(item: { status: Status }): boolean {
+  return item.status !== "dismissed";
+}
+
+/** An edge is live while any member assertion is. */
+export function isLiveEdge(edge: GraphEdge): boolean {
+  return edge.assertions.some(isLive);
+}
+
 export function parseGraph(text: string): GraphData {
   const data = JSON.parse(text) as Partial<GraphData>;
   if (data.version !== GRAPH_VERSION) {

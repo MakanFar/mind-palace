@@ -5,7 +5,7 @@ import { ItemView, Notice, type WorkspaceLeaf } from "obsidian";
 import { GraphCanvas, type Selection, sameSelection } from "./canvas";
 import { applyOverlay, decisionLine, foldDecisions, randomId, type Action } from "./decisions";
 import { emptyGraph, parseGraph, type GraphData } from "./graph";
-import { Panel } from "./panel";
+import { Panel, resolveSelection } from "./panel";
 import { Topbar, type TopbarState } from "./topbar";
 
 export const VIEW_TYPE = "mind-palace-graph";
@@ -32,7 +32,9 @@ export class MindPalaceView extends ItemView {
   private selection: Selection | null = null;
   private filters: TopbarState | null = null;
   private stamps = { graph: -1, decisions: -1 };
-  private panelSnapshot = "";
+  // Reloads overlap: the poll and a decide's forced reload can be in flight
+  // together, and a slower older read must not land on top of a newer one.
+  private generation = 0;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -66,7 +68,6 @@ export class MindPalaceView extends ItemView {
     const panelHost = this.body.createDiv();
     this.canvas = new GraphCanvas(canvasHost, {
       onSelect: (selection) => this.onSelect(selection),
-      onHover: () => undefined,
     });
     this.panel = new Panel(panelHost, {
       openFile: (path) => void this.openFile(path),
@@ -85,30 +86,37 @@ export class MindPalaceView extends ItemView {
   // ---- data ------------------------------------------------------------
 
   private async reload(force: boolean): Promise<void> {
+    const generation = ++this.generation;
     const { graphPath, decisionsPath } = this.settings();
     const adapter = this.app.vault.adapter;
-    const graphStat = await adapter.stat(graphPath);
+    const [graphStat, decisionsStat] = await Promise.all([adapter.stat(graphPath), adapter.stat(decisionsPath)]);
+    if (generation !== this.generation) return;
     if (!graphStat) {
       this.showNotice("No graph yet. Run the Mind Palace server once against this vault to write .graph/graph.json.");
       return;
     }
-    const decisionsStat = await adapter.stat(decisionsPath);
     const stamps = { graph: graphStat.mtime, decisions: decisionsStat?.mtime ?? 0 };
     if (!force && stamps.graph === this.stamps.graph && stamps.decisions === this.stamps.decisions) return;
     this.stamps = stamps;
+    let graph: GraphData;
     try {
-      const base = parseGraph(await adapter.read(graphPath));
-      const overlay = decisionsStat ? foldDecisions(await adapter.read(decisionsPath)) : new Map();
-      this.graph = applyOverlay(base, overlay);
-      this.hideNotice();
+      const [graphText, decisionsText] = await Promise.all([
+        adapter.read(graphPath),
+        decisionsStat ? adapter.read(decisionsPath) : Promise.resolve(""),
+      ]);
+      if (generation !== this.generation) return;
+      graph = applyOverlay(parseGraph(graphText), foldDecisions(decisionsText));
     } catch (error) {
+      if (generation !== this.generation) return;
       this.showNotice(`Could not read the graph: ${(error as Error).message}`);
       return;
     }
+    this.graph = graph;
+    this.hideNotice();
     this.topbar?.setGraph(this.graph);
     this.canvas?.setGraph(this.graph);
     if (this.filters) this.canvas?.setFilters(this.filters);
-    if (!Panel.resolves(this.selection, this.graph)) {
+    if (this.selection && !resolveSelection(this.selection, this.graph)) {
       // A merge or adoption can retire the selected key between reloads.
       this.selection = null;
       this.canvas?.setSelection(null);
@@ -117,11 +125,7 @@ export class MindPalaceView extends ItemView {
   }
 
   private showPanel(): void {
-    const asOf = this.filters?.asOf ?? null;
-    const snapshot = Panel.snapshot(this.selection, this.graph, asOf);
-    if (snapshot === this.panelSnapshot) return;
-    this.panelSnapshot = snapshot;
-    this.panel?.show(this.selection, this.graph, asOf);
+    this.panel?.show(this.selection, this.graph, this.filters?.asOf ?? null);
   }
 
   private async openFile(path: string): Promise<void> {
@@ -145,8 +149,10 @@ export class MindPalaceView extends ItemView {
       if (await adapter.exists(decisionsPath)) await adapter.append(decisionsPath, line);
       else await adapter.write(decisionsPath, line);
     } catch (error) {
+      // Reported here; the panel's only job on failure is to hand the
+      // buttons back, which it does whether or not this rejects.
       new Notice(`Mind Palace: could not write the decision: ${(error as Error).message}`);
-      throw error;
+      return;
     }
     new Notice(`Mind Palace: ${action === "confirm" ? "confirmed" : "dismissed"} ${assertion}`);
     await this.reload(true);
@@ -155,16 +161,19 @@ export class MindPalaceView extends ItemView {
   // ---- interaction -----------------------------------------------------
 
   private onSelect(selection: Selection | null): void {
-    if (sameSelection(selection, this.selection) && selection !== null) return;
+    if (sameSelection(selection, this.selection)) return;
     this.selection = selection;
     this.canvas?.setSelection(selection);
     this.showPanel();
   }
 
   private onFilters(state: TopbarState): void {
+    const previousFocus = this.filters?.focus ?? null;
     this.filters = state;
     this.canvas?.setFilters({ hiddenTypes: state.hiddenTypes, showProposed: state.showProposed, focus: state.focus });
-    if (state.focus) this.onSelect({ kind: "entity", slug: state.focus });
+    // A new focus selects its entity. Any other change (as-of, a type pill,
+    // the proposed toggle) keeps whatever is selected and just re-renders.
+    if (state.focus && state.focus !== previousFocus) this.onSelect({ kind: "entity", slug: state.focus });
     else this.showPanel();
   }
 

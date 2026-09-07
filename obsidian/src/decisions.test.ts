@@ -98,6 +98,20 @@ describe("applyOverlay, review findings", () => {
     expect(out.claims[0].status).toBe("superseded");
   });
 
+  it("retires the claim a newly confirmed claim supersedes, like the fold", () => {
+    const g: GraphData = {
+      ...emptyGraph(),
+      claims: [
+        { ...graph.claims[0], id: "k_old", status: "confirmed" },
+        { ...graph.claims[0], id: "k_new", status: "proposed", supersedes: "k_old" },
+      ],
+    };
+    const out = applyOverlay(g, new Map([["k_new", "confirm"]]));
+    expect(out.claims.map((c) => c.status)).toEqual(["superseded", "confirmed"]);
+    // A proposed correction retires nothing until someone agrees to it.
+    expect(applyOverlay(g, new Map()).claims[0].status).toBe("confirmed");
+  });
+
   it("derives traversable and weight from statuses, so a dismissal retracts them", () => {
     const g: GraphData = {
       ...emptyGraph(),

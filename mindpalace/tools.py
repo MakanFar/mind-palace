@@ -34,6 +34,7 @@ from mindpalace.models import (
     validity_precision,
 )
 from mindpalace.oplog import MERGE_ACTIONS, VOCABULARY_ACTIONS, VOCABULARY_KINDS
+from mindpalace.index import db
 from mindpalace.index.sync import fold_notes_with_quarantine
 from mindpalace.rebuild import (
     community_input_hash,
@@ -159,7 +160,7 @@ def _rebuild(session: Session, scope: str = "all"):
         session.store,
         session.config,
         session.embedder,
-        session.statuses(),
+        session.statuses,
         scope=scope,
         **session.overlays(),
     )
@@ -1403,17 +1404,7 @@ def review_queue(session: Session, limit: int = 20) -> dict:
 
 
 def _stored_communities(session: Session) -> list[Community]:
-    return [
-        Community(
-            lineage_id=row["lineage_id"],
-            level=row["level"],
-            members=frozenset(row["members"].split(",")) if row["members"] else frozenset(),
-            parent=row["parent"],
-        )
-        for row in session.conn.execute(
-            "SELECT lineage_id, level, parent, members FROM communities"
-        )
-    ]
+    return db.read_communities(session.conn)
 
 
 def cluster_tool(session: Session, force: bool = False) -> dict:
@@ -1452,9 +1443,10 @@ def cluster_tool(session: Session, force: bool = False) -> dict:
         # it to the next rebuild would let global_search serve an obsolete report
         # as `present` in the meantime.
         stale_reports = mark_stale_reports(session.conn, session.store, tables)
-        # And the Obsidian window reads communities from graph.json, which
-        # only `sync` writes (docs/decisions/0003 §Part 1).
-        session.resync()
+        # And the Obsidian window reads communities from graph.json
+        # (docs/decisions/0003 §Part 1). The cache already holds everything
+        # else, so rewrite the export rather than re-embed the vault.
+        session.export_graph()
 
     payload = []
     for community in matched:

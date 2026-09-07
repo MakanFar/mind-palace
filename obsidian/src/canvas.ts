@@ -17,7 +17,7 @@ import {
   type SimulationNodeDatum,
 } from "d3-force";
 
-import type { GraphData, GraphEdge, GraphUntyped } from "./graph";
+import { type GraphData, type GraphEdge, isLive, isLiveEdge } from "./graph";
 import { EDGE_STYLE, colourFor, radiusFor, type EdgeKind } from "./palette";
 
 export type Selection =
@@ -27,7 +27,6 @@ export type Selection =
 
 export interface CanvasCallbacks {
   onSelect(selection: Selection | null): void;
-  onHover(selection: Selection | null): void;
 }
 
 export interface CanvasFilters {
@@ -56,8 +55,8 @@ const DIM = 0.08;
 const UNSELECTED = 0.3;
 const HIT_EDGE_PX = 6;
 
-function cssVar(element: HTMLElement, name: string, fallback: string): string {
-  const value = getComputedStyle(element).getPropertyValue(name).trim();
+function cssVar(style: CSSStyleDeclaration, name: string, fallback: string): string {
+  const value = style.getPropertyValue(name).trim();
   return value || fallback;
 }
 
@@ -79,7 +78,10 @@ export class GraphCanvas {
   private readonly observer: ResizeObserver;
   private neighbours = new Map<string, Set<string>>();
   private signature = "";
-  private lastFocus: string | null = null;
+  private emphasised: { nodes: Set<string> | null; links: Set<string> | null } | null = null;
+  // True while the container has no size: the view was opened in a hidden
+  // tab or a collapsed pane, and the layout ran against a 1x1 box.
+  private degenerate = true;
   private readonly onMove = (event: MouseEvent): void => this.handleMove(event);
   private readonly onUp = (event: MouseEvent): void => this.handleUp(event);
 
@@ -125,12 +127,11 @@ export class GraphCanvas {
     this.links = [];
     for (const edge of graph.edges) {
       if (!this.byslug.has(edge.source) || !this.byslug.has(edge.target)) continue;
-      const live = edge.assertions.some((a) => a.status !== "dismissed");
-      if (!live) continue;
+      if (!isLiveEdge(edge)) continue;
       this.links.push(this.link(edge));
     }
     for (const item of graph.untyped) {
-      if (item.status === "dismissed") continue;
+      if (!isLive(item)) continue;
       if (!this.byslug.has(item.source) || !this.byslug.has(item.target)) continue;
       this.links.push({
         id: item.id,
@@ -144,6 +145,7 @@ export class GraphCanvas {
       });
     }
     this.neighbours = new Map();
+    this.emphasised = null;
     for (const link of this.links) {
       this.adjacent(link.sourceSlug).add(link.targetSlug);
       this.adjacent(link.targetSlug).add(link.sourceSlug);
@@ -188,23 +190,21 @@ export class GraphCanvas {
   }
 
   setFilters(filters: CanvasFilters): void {
+    const focusChanged = filters.focus !== this.filters.focus;
     this.filters = filters;
-    const focusChanged = filters.focus !== this.lastFocus;
-    this.lastFocus = filters.focus;
-    if (focusChanged && filters.focus && this.byslug.has(filters.focus)) {
-      const node = this.byslug.get(filters.focus)!;
+    this.emphasised = null;
+    const node = focusChanged && filters.focus ? this.byslug.get(filters.focus) : undefined;
+    if (node) {
       const { width, height } = this.size();
-      this.transform = {
-        k: Math.max(this.transform.k, 1.4),
-        x: width / 2 - (node.x ?? 0) * Math.max(this.transform.k, 1.4),
-        y: height / 2 - (node.y ?? 0) * Math.max(this.transform.k, 1.4),
-      };
+      const k = Math.max(this.transform.k, 1.4);
+      this.transform = { k, x: width / 2 - (node.x ?? 0) * k, y: height / 2 - (node.y ?? 0) * k };
     }
     this.schedule();
   }
 
   setSelection(selection: Selection | null): void {
     this.selection = selection;
+    this.emphasised = null;
     this.schedule();
   }
 
@@ -252,6 +252,13 @@ export class GraphCanvas {
     this.canvas.style.height = `${height}px`;
     this.ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     this.simulation?.force("center", forceCenter(width / 2, height / 2));
+    const wasDegenerate = this.degenerate;
+    this.degenerate = width <= 1 || height <= 1;
+    // Swapping the centre force moves nothing on its own: a cooled
+    // simulation never ticks again. A layout that ran while hidden must be
+    // re-heated when the pane first gets a real size, or it stays piled in
+    // the top-left corner until someone drags a node.
+    if (wasDegenerate && !this.degenerate) this.simulation?.alpha(1).restart();
     this.schedule();
   }
 
@@ -326,52 +333,42 @@ export class GraphCanvas {
   }
 
   private handleMove(event: MouseEvent): void {
-    {
-      if (this.dragging) {
-        const p = this.toGraph(event.clientX, event.clientY);
-        this.dragging.fx = p.x;
-        this.dragging.fy = p.y;
-        this.moved = true;
-        return;
-      }
-      if (this.panning) {
-        this.transform.x = this.panning.tx + (event.clientX - this.panning.x);
-        this.transform.y = this.panning.ty + (event.clientY - this.panning.y);
-        this.moved = true;
-        this.schedule();
-        return;
-      }
-      const hit = this.hit(event.clientX, event.clientY);
-      if (!sameSelection(hit, this.hovered)) {
-        this.hovered = hit;
-        this.canvas.style.cursor = hit ? "pointer" : "default";
-        this.callbacks.onHover(hit);
-        this.schedule();
-      }
+    if (this.dragging) {
+      const p = this.toGraph(event.clientX, event.clientY);
+      this.dragging.fx = p.x;
+      this.dragging.fy = p.y;
+      this.moved = true;
+      return;
+    }
+    if (this.panning) {
+      this.transform.x = this.panning.tx + (event.clientX - this.panning.x);
+      this.transform.y = this.panning.ty + (event.clientY - this.panning.y);
+      this.moved = true;
+      this.schedule();
+      return;
+    }
+    const hit = this.hit(event.clientX, event.clientY);
+    if (!sameSelection(hit, this.hovered)) {
+      this.hovered = hit;
+      this.canvas.style.cursor = hit ? "pointer" : "default";
+      this.schedule();
     }
   }
 
   private handleUp(event: MouseEvent): void {
-    {
-      if (this.dragging) {
-        this.dragging.fx = null;
-        this.dragging.fy = null;
-        this.simulation?.alphaTarget(0);
-        if (!this.moved) this.select({ kind: "entity", slug: this.dragging.slug });
-        this.dragging = null;
-        return;
-      }
-      if (this.panning) {
-        this.panning = null;
-        if (!this.moved) this.select(this.hit(event.clientX, event.clientY));
-      }
+    if (this.dragging) {
+      this.dragging.fx = null;
+      this.dragging.fy = null;
+      this.simulation?.alphaTarget(0);
+      if (!this.moved) this.callbacks.onSelect({ kind: "entity", slug: this.dragging.slug });
+      this.dragging = null;
+      return;
     }
-  }
-
-  private select(selection: Selection | null): void {
-    this.selection = selection;
-    this.callbacks.onSelect(selection);
-    this.schedule();
+    if (this.panning) {
+      this.panning = null;
+      // The view owns the selection and pushes it back via setSelection.
+      if (!this.moved) this.callbacks.onSelect(this.hit(event.clientX, event.clientY));
+    }
   }
 
   // ---- drawing ---------------------------------------------------------
@@ -382,7 +379,10 @@ export class GraphCanvas {
   }
 
   private emphasis(): { nodes: Set<string> | null; links: Set<string> | null } {
-    // Which slugs and link ids are "in": everything else is dimmed.
+    // Which slugs and link ids are "in": everything else is dimmed. Depends
+    // only on selection, focus and links, so it is kept until one changes
+    // rather than rebuilt on every frame of the simulation.
+    if (this.emphasised) return this.emphasised;
     const focusSet = this.filters.focus ? this.twoHop(this.filters.focus) : null;
     let selected: Set<string> | null = null;
     let selectedLinks: Set<string> | null = null;
@@ -402,7 +402,8 @@ export class GraphCanvas {
     }
     const nodes = focusSet && selected ? new Set([...focusSet].filter((s) => selected!.has(s))) : focusSet ?? selected;
     const links = selectedLinks ?? (focusSet ? new Set(this.links.filter((l) => focusSet.has(l.sourceSlug) && focusSet.has(l.targetSlug)).map((l) => l.id)) : null);
-    return { nodes, links };
+    this.emphasised = { nodes, links };
+    return this.emphasised;
   }
 
   private twoHop(slug: string): Set<string> {
@@ -417,9 +418,12 @@ export class GraphCanvas {
   private draw(): void {
     const { width, height } = this.size();
     const ctx = this.ctx;
-    const accent = cssVar(this.container, "--interactive-accent", "#7c6cf0");
-    const text = cssVar(this.container, "--text-normal", "#e0e0e0");
-    const muted = cssVar(this.container, "--text-muted", "#999");
+    // One style resolution per frame, not one per variable.
+    const style = getComputedStyle(this.container);
+    const accent = cssVar(style, "--interactive-accent", "#7c6cf0");
+    const text = cssVar(style, "--text-normal", "#e0e0e0");
+    const muted = cssVar(style, "--text-muted", "#999");
+    const font = cssVar(style, "--font-interface", "sans-serif");
     ctx.clearRect(0, 0, width, height);
     ctx.save();
     ctx.translate(this.transform.x, this.transform.y);
@@ -469,7 +473,7 @@ export class GraphCanvas {
     ctx.fillStyle = text;
     // A `var()` inside ctx.font is silently rejected and the default 10px
     // font kept; resolve the family the same way the colours are resolved.
-    ctx.font = `${11 / this.transform.k}px ${cssVar(this.container, "--font-interface", "sans-serif")}`;
+    ctx.font = `${11 / this.transform.k}px ${font}`;
     for (const node of this.nodes) {
       if (!this.visible(node)) continue;
       const emphasised = inNodes ? inNodes.has(node.slug) : false;

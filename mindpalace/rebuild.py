@@ -13,7 +13,13 @@ from mindpalace.embed import Embedder
 from mindpalace.frontmatter import FrontMatterError
 from mindpalace.graph.fold import FoldedEntity, GraphTables
 from mindpalace.ids import slugify
-from mindpalace.index.sync import _load_notes, fold_notes_with_quarantine, sync
+from mindpalace.index.sync import (
+    StatusSource,
+    _load_notes,
+    fold_notes_with_quarantine,
+    resolve_statuses,
+    sync,
+)
 from mindpalace.models import EntityPage, Note
 from mindpalace.vault.store import VaultStore
 
@@ -236,7 +242,7 @@ def rebuild(
     store: VaultStore,
     config: Config,
     embedder: Embedder,
-    statuses: dict[str, str],
+    statuses: StatusSource,
     scope: str = "all",
     *,
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
@@ -255,8 +261,11 @@ def rebuild(
     # `write_note`, `resolve_assertion`, `cluster`, and every other caller of
     # `rebuild` route through here (spec §10). See
     # `mindpalace.index.sync.fold_notes_with_quarantine`.
+    # Resolved here, after the first `sync` took its hashes, and passed on
+    # unresolved to the second: each `sync` must read the decision log no
+    # earlier than it hashes it (see `StatusSource`).
     notes, notes_by_id, tables, fold_issues = fold_notes_with_quarantine(
-        store, config, statuses, adoptions, merges
+        store, config, resolve_statuses(statuses), adoptions, merges
     )
     # Persist what quarantine found. When scope includes "cache", `sync`
     # (above) already wrote the identical set as part of its own full

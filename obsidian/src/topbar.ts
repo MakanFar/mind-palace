@@ -4,7 +4,6 @@ import type { GraphData } from "./graph";
 import { colourFor } from "./palette";
 
 export interface TopbarState {
-  query: string;
   hiddenTypes: Set<string>;
   showProposed: boolean;
   asOf: string | null;
@@ -15,7 +14,7 @@ let instances = 0;
 
 export class Topbar {
   private readonly listId = `mp-entities-${++instances}`;
-  private state: TopbarState = { query: "", hiddenTypes: new Set(), showProposed: true, asOf: null, focus: null };
+  private state: TopbarState = { hiddenTypes: new Set(), showProposed: true, asOf: null, focus: null };
   private readonly legend: HTMLElement;
   private readonly datalist: HTMLDataListElement;
   private slugs = new Set<string>();
@@ -31,14 +30,12 @@ export class Topbar {
     });
     this.datalist = container.createEl("datalist", { attr: { id: this.listId } });
     search.addEventListener("input", () => {
-      this.state.query = search.value;
       this.state.focus = this.slugs.has(search.value) ? search.value : null;
       this.emit();
     });
     search.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         search.value = "";
-        this.state.query = "";
         this.state.focus = null;
         this.emit();
       }
@@ -61,12 +58,14 @@ export class Topbar {
     });
   }
 
-  get current(): TopbarState {
-    return this.state;
-  }
-
   setGraph(graph: GraphData): void {
     this.slugs = new Set(graph.entities.map((e) => e.slug));
+    // A focus whose entity a merge or rename retired would otherwise dim the
+    // whole canvas around a node that no longer exists.
+    if (this.state.focus && !this.slugs.has(this.state.focus)) {
+      this.state.focus = null;
+      this.emit();
+    }
     this.datalist.empty();
     for (const slug of [...this.slugs].sort()) this.datalist.createEl("option", { attr: { value: slug } });
     const counts = new Map<string, number>();

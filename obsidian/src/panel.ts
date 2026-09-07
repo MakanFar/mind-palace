@@ -2,7 +2,7 @@
 
 import type { Selection } from "./canvas";
 import type { Action } from "./decisions";
-import type { GraphClaim, GraphData, GraphEdge, GraphEntity, GraphUntyped } from "./graph";
+import { type GraphClaim, type GraphData, type GraphEdge, type GraphEntity, type GraphUntyped, isLive, isLiveEdge } from "./graph";
 import { colourFor } from "./palette";
 
 export interface PanelActions {
@@ -30,6 +30,33 @@ export function holdsAt(from: string | null, to: string | null, asOf: string): b
   return atOrBefore(asOf, to);
 }
 
+type Resolved =
+  | { kind: "entity"; entity: GraphEntity }
+  | { kind: "edge"; edge: GraphEdge }
+  | { kind: "untyped"; item: GraphUntyped }
+  | null;
+
+/** The record a selection names in this graph, or null once a merge, an
+ *  adoption or a re-sync has retired it. */
+export function resolveSelection(selection: Selection, graph: GraphData): Resolved {
+  if (selection.kind === "entity") {
+    const entity = graph.entities.find((e) => e.slug === selection.slug);
+    return entity ? { kind: "entity", entity } : null;
+  }
+  if (selection.kind === "edge") {
+    const edge = graph.edges.find((e) => e.key === selection.key);
+    return edge ? { kind: "edge", edge } : null;
+  }
+  const item = graph.untyped.find((u) => u.id === selection.id);
+  return item ? { kind: "untyped", item } : null;
+}
+
+const GONE: Record<Selection["kind"], string> = {
+  entity: "That entity is not in the graph.",
+  edge: "That edge is no longer in the graph (a merge or a re-sync changed it).",
+  untyped: "That assertion is no longer untyped, or is no longer in the graph.",
+};
+
 export class Panel {
   constructor(
     private readonly container: HTMLElement,
@@ -39,55 +66,28 @@ export class Panel {
   }
 
   show(selection: Selection | null, graph: GraphData, asOf: string | null): void {
+    // graph.json is polled and the panel re-rendered on every change; a
+    // reason half-typed into a card must survive that, so carry the inputs'
+    // text across by assertion id.
+    const drafts = new Map<string, string>();
+    for (const input of this.container.querySelectorAll<HTMLInputElement>(".mp-reason[data-assertion]")) {
+      if (input.value) drafts.set(input.dataset.assertion!, input.value);
+    }
     this.container.empty();
     if (!selection) {
       this.container.createEl("p", { cls: "mp-muted", text: "Select a node or an edge." });
       this.renderVocabulary(graph);
       return;
     }
-    if (selection.kind === "entity") {
-      const entity = graph.entities.find((e) => e.slug === selection.slug);
-      if (entity) this.renderEntity(entity, graph, asOf);
-      else this.container.createEl("p", { cls: "mp-muted", text: `${selection.slug} is not in the graph.` });
-    } else if (selection.kind === "edge") {
-      const edge = graph.edges.find((e) => e.key === selection.key);
-      if (edge) this.renderEdge(edge, graph);
-      else this.gone("That edge is no longer in the graph (a merge or a re-sync changed it).");
-    } else {
-      const item = graph.untyped.find((u) => u.id === selection.id);
-      if (item) this.renderUntyped(item, graph);
-      else this.gone("That assertion is no longer untyped, or is no longer in the graph.");
+    const resolved = resolveSelection(selection, graph);
+    if (!resolved) this.container.createEl("p", { cls: "mp-muted", text: GONE[selection.kind] });
+    else if (resolved.kind === "entity") this.renderEntity(resolved.entity, graph, asOf);
+    else if (resolved.kind === "edge") this.renderEdge(resolved.edge, graph);
+    else this.renderUntyped(resolved.item, graph);
+    for (const input of this.container.querySelectorAll<HTMLInputElement>(".mp-reason[data-assertion]")) {
+      const draft = drafts.get(input.dataset.assertion!);
+      if (draft) input.value = draft;
     }
-  }
-
-  /** A fingerprint of everything the panel would render for a selection, so
-   *  a poll that changed nothing relevant does not wipe a half-typed reason. */
-  static snapshot(selection: Selection | null, graph: GraphData, asOf: string | null): string {
-    if (!selection) return JSON.stringify(["none", graph.vocabulary]);
-    if (selection.kind === "entity") {
-      const slug = selection.slug;
-      return JSON.stringify([
-        asOf,
-        graph.entities.find((e) => e.slug === slug) ?? null,
-        graph.claims.filter((c) => c.subject === slug),
-        graph.edges.filter((e) => e.source === slug || e.target === slug),
-        graph.untyped.filter((u) => u.source === slug || u.target === slug),
-      ]);
-    }
-    if (selection.kind === "edge") return JSON.stringify(graph.edges.find((e) => e.key === selection.key) ?? null);
-    return JSON.stringify(graph.untyped.find((u) => u.id === selection.id) ?? null);
-  }
-
-  /** Whether a selection still resolves in this graph. */
-  static resolves(selection: Selection | null, graph: GraphData): boolean {
-    if (!selection) return true;
-    if (selection.kind === "entity") return graph.entities.some((e) => e.slug === selection.slug);
-    if (selection.kind === "edge") return graph.edges.some((e) => e.key === selection.key);
-    return graph.untyped.some((u) => u.id === selection.id);
-  }
-
-  private gone(text: string): void {
-    this.container.createEl("p", { cls: "mp-muted", text });
   }
 
   // ---- entity ----------------------------------------------------------
@@ -129,11 +129,10 @@ export class Panel {
     const touching = graph.edges.filter((e) => e.source === slug || e.target === slug);
     const groups: Record<string, GraphEdge[]> = { confirmed: [], proposed: [] };
     for (const edge of touching) {
-      const live = edge.assertions.some((a) => a.status !== "dismissed");
-      if (!live) continue;
+      if (!isLiveEdge(edge)) continue;
       groups[edge.traversable ? "confirmed" : "proposed"].push(edge);
     }
-    const untyped = graph.untyped.filter((u) => (u.source === slug || u.target === slug) && u.status !== "dismissed");
+    const untyped = graph.untyped.filter((u) => (u.source === slug || u.target === slug) && isLive(u));
     for (const [label, edges] of Object.entries(groups)) {
       if (!edges.length) continue;
       this.section(`${label[0].toUpperCase()}${label.slice(1)} (${edges.length})`);
@@ -228,7 +227,10 @@ export class Panel {
 
   private decisionButtons(parent: HTMLElement, assertion: string): void {
     const row = parent.createDiv({ cls: "mp-actions" });
-    const reason = row.createEl("input", { cls: "mp-reason", attr: { placeholder: "reason (optional)" } });
+    const reason = row.createEl("input", {
+      cls: "mp-reason",
+      attr: { placeholder: "reason (optional)", "data-assertion": assertion },
+    });
     const confirm = row.createEl("button", { cls: "mp-confirm", text: "Confirm" });
     const dismiss = row.createEl("button", { cls: "mp-dismiss", text: "Dismiss" });
     const act = (action: Action) => async () => {

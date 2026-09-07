@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from mindpalace.atomic import atomic_write
+from mindpalace.cluster import Community
 from mindpalace.config import Config
 from mindpalace.graph.fold import GraphTables
 from mindpalace.models import Capture, CommunityReport, EntityPage, Note
@@ -18,10 +19,12 @@ from mindpalace.models import Capture, CommunityReport, EntityPage, Note
 VERSION = 1
 
 
-def _first_line(text: str) -> str:
+def first_line(text: str, limit: int = 200) -> str:
+    """The first non-blank line, stripped and capped: a title for prose that
+    has none. Shared with `sync`'s document titles and the vault index."""
     for line in text.splitlines():
         if line.strip():
-            return line.strip()[:200]
+            return line.strip()[:limit]
     return ""
 
 
@@ -33,7 +36,7 @@ def build_graph_export(
     notes_by_id: dict[str, Note],
     note_paths: dict[str, str],
     units: Iterable,
-    communities: list[dict],
+    communities: list[Community],
     vocabulary: list[tuple[str, str, int, str, str]],
     entity_pages: list[EntityPage],
     reports: list[CommunityReport],
@@ -42,19 +45,21 @@ def build_graph_export(
     pages = {page.slug: page for page in entity_pages}
     report_by_lineage = {r.lineage_id: r for r in reports}
 
-    entities = [
-        {
-            "slug": e.slug,
-            "type": e.type,
-            "rank": e.rank,
-            "merged_from": list(e.merged_from),
-            "description": _first_line(pages[e.slug].description) if e.slug in pages else "",
-            "stale": pages[e.slug].stale if e.slug in pages else True,
-            "note_ids": list(e.note_ids),
-            "text_unit_ids": list(e.text_unit_ids),
-        }
-        for e in tables.entities.values()
-    ]
+    entities = []
+    for e in tables.entities.values():
+        page = pages.get(e.slug)
+        entities.append(
+            {
+                "slug": e.slug,
+                "type": e.type,
+                "rank": e.rank,
+                "merged_from": list(e.merged_from),
+                "description": first_line(page.description) if page else "",
+                "stale": page.stale if page else True,
+                "note_ids": list(e.note_ids),
+                "text_unit_ids": list(e.text_unit_ids),
+            }
+        )
 
     def assertion_row(a) -> dict:
         return {
@@ -115,13 +120,13 @@ def build_graph_export(
     ]
     community_rows = []
     for c in communities:
-        report = report_by_lineage.get(c["lineage_id"])
+        report = report_by_lineage.get(c.lineage_id)
         community_rows.append(
             {
-                "lineage_id": c["lineage_id"],
-                "level": c["level"],
-                "parent": c["parent"],
-                "members": c["members"],
+                "lineage_id": c.lineage_id,
+                "level": c.level,
+                "parent": c.parent,
+                "members": sorted(c.members),
                 "title": report.title if report else None,
                 "stale": report.stale if report else None,
             }
@@ -139,7 +144,7 @@ def build_graph_export(
             for kind, proposed, count, example, _ids in vocabulary
         ],
         "captures": {
-            c.id: {"path": capture_paths.get(c.id, ""), "title": c.title or _first_line(c.text)}
+            c.id: {"path": capture_paths.get(c.id, ""), "title": c.title or first_line(c.text)}
             for c in captures
         },
         "notes": {note_id: {"path": note_paths.get(note_id, "")} for note_id in notes_by_id},

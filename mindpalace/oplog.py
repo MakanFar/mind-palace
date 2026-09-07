@@ -11,7 +11,9 @@ from mindpalace.ids import new_id, slugify
 from mindpalace.models import Decision
 
 
-def _now() -> str:
+def now_iso() -> str:
+    """UTC, second precision is not promised, `Z` suffix: the `ts` shape every
+    log line and the graph export carry."""
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
@@ -59,12 +61,12 @@ class OpLog:
     def begin(self, intent: dict) -> str:
         op_id = new_id("op_")
         _append_line(
-            self.path, {"kind": "op.begin", "op": op_id, "ts": _now(), "intent": intent}
+            self.path, {"kind": "op.begin", "op": op_id, "ts": now_iso(), "intent": intent}
         )
         return op_id
 
     def commit(self, op_id: str) -> None:
-        _append_line(self.path, {"kind": "op.commit", "op": op_id, "ts": _now()})
+        _append_line(self.path, {"kind": "op.commit", "op": op_id, "ts": now_iso()})
 
     def pending(self) -> list[dict]:
         begun: dict[str, dict] = {}
@@ -106,7 +108,7 @@ class DecisionLog:
             self.path,
             {
                 "op": op_id,
-                "ts": _now(),
+                "ts": now_iso(),
                 "assertion": assertion_id,
                 "action": action,
                 "via": via,
@@ -182,7 +184,7 @@ class VocabularyLog:
             self.path,
             {
                 "op": op_id,
-                "ts": _now(),
+                "ts": now_iso(),
                 "kind": kind,
                 "proposed": slugify(proposed),
                 "adopted": adopted,
@@ -236,7 +238,7 @@ class MergeLog:
             self.path,
             {
                 "op": op_id,
-                "ts": _now(),
+                "ts": now_iso(),
                 "duplicate": slugify(duplicate),
                 "canonical": slugify(canonical),
                 "action": action,

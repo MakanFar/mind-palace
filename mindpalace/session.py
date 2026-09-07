@@ -14,7 +14,7 @@ from pathlib import Path
 from mindpalace.config import Config, load_config, open_vault
 from mindpalace.embed import Embedder, get_embedder
 from mindpalace.index import db
-from mindpalace.index.sync import has_drift, sync
+from mindpalace.index.sync import export_graph, has_drift, sync
 from mindpalace.oplog import DecisionLog, MergeLog, OpLog, VocabularyLog
 from mindpalace.vault.paths import VaultPaths
 from mindpalace.vault.store import VaultStore
@@ -83,12 +83,6 @@ class Session:
             self.opened = True
             self._verify_cache_model()
             self.heal()
-            if not self.paths.graph_json.exists():
-                # Tier 3 like the db, but not covered by the model check or
-                # by drift: a deleted export would otherwise stay missing
-                # until the next write, and the Obsidian window promises
-                # that opening the server once is enough.
-                self.resync()
         except BaseException:
             # A failed open must leave nothing behind: the descriptor opened
             # above, and any connection made after it, both belong to a
@@ -261,12 +255,12 @@ class Session:
         The check is then repeated under the lock, because the wait is exactly
         the window in which the other session may have healed the same drift.
         """
-        if not self.oplog.pending() and not has_drift(self.conn, self.store):
+        if not self._needs_heal():
             return False
         with self.write_lock():
             pending = self.oplog.pending()
             drifted = has_drift(self.conn, self.store)
-            if not pending and not drifted:
+            if not pending and not drifted and self.paths.graph_json.exists():
                 return False
             if drifted:
                 # MINDPALACE.md is in the drift set, and its edge_types drive how
@@ -277,15 +271,36 @@ class Session:
                 self.oplog.commit(record["op"])
             return True
 
+    def _needs_heal(self) -> bool:
+        """The read half of `heal`. graph.json is Tier 3 like the db but is
+        covered by neither the model check nor drift: a deleted export would
+        otherwise stay missing until the next write, and the Obsidian window
+        promises that opening the server once is enough."""
+        return bool(
+            self.oplog.pending()
+            or has_drift(self.conn, self.store)
+            or not self.paths.graph_json.exists()
+        )
+
     def resync(self) -> None:
+        # `self.statuses` unresolved: `sync` reads it only after it has hashed
+        # decisions.jsonl (see `StatusSource` there).
         with self.write_lock():
             sync(
                 self.conn,
                 self.store,
                 self.config,
                 self.embedder,
-                self.statuses(),
+                self.statuses,
                 **self.overlays(),
+            )
+
+    def export_graph(self) -> None:
+        """Rewrite graph.json without a full `sync`; for a writer whose change
+        the cache already holds (docs/decisions/0003 §Part 1)."""
+        with self.write_lock():
+            export_graph(
+                self.conn, self.store, self.config, self.statuses, **self._fold_overlays()
             )
 
     def statuses(self) -> dict[str, str]:
@@ -295,7 +310,12 @@ class Session:
         """The folded vocabulary and merge logs, as keyword arguments for
         `fold` / `sync` / `rebuild` (docs/decisions/0001 §1, §5)."""
         return {
+            **self._fold_overlays(),
+            "kept": self.merges.kept(),
+        }
+
+    def _fold_overlays(self) -> dict:
+        return {
             "adoptions": self.vocabulary.adoptions(),
             "merges": self.merges.merges(),
-            "kept": self.merges.kept(),
         }

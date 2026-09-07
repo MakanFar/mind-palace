@@ -111,3 +111,24 @@ def test_a_decision_appended_during_sync_is_still_drift(tmp_path):
         save_capture(s, "one")  # the resync inside fires the hook mid-embed
         assert state["fired"]
         assert has_drift(s.conn, s.store)
+
+
+def test_a_decision_appended_after_the_statuses_were_read_is_still_drift(tmp_path):
+    """The other half of the window above: the decision map is read *after*
+    every source file is hashed, so a line landing between the two is either
+    folded or hashed as unfolded, never recorded as folded without being."""
+    from mindpalace.index.sync import has_drift, sync
+
+    with Session(tmp_path, init=True, embedder=StubEmbedder()) as s:
+        save_capture(s, "one")
+
+        def statuses_then_append():
+            # Simulates a read whose result is already stale by the time it
+            # returns: the plugin appended right after the file was read.
+            with s.paths.decisions_log.open("a") as f:
+                f.write('{"action":"confirm","assertion":"x_late","op":"obsidian_2","reason":null,"ts":"t","via":"obsidian"}\n')
+            return {}
+
+        with s.write_lock():
+            sync(s.conn, s.store, s.config, s.embedder, statuses_then_append, **s.overlays())
+        assert has_drift(s.conn, s.store)

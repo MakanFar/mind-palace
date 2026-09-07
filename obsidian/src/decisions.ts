@@ -66,11 +66,19 @@ export function applyOverlay(graph: GraphData, overlay: Overlay): GraphData {
     const confirmed = assertions.filter((a) => a.status === "confirmed").length;
     return { ...edge, assertions, traversable: confirmed > 0, weight: confirmed };
   });
+  // Same rule as the fold: a claim confirmed here retires the claim it
+  // supersedes, so the panel strikes the old one through at once rather
+  // than on the server's next sync.
+  const claims = graph.claims.map(restatus);
+  const ids = new Set(claims.map((c) => c.id));
+  const retired = new Set(
+    claims.filter((c) => c.status === "confirmed" && c.supersedes && ids.has(c.supersedes)).map((c) => c.supersedes),
+  );
   return {
     ...graph,
     edges,
     untyped: graph.untyped.map(restatus),
-    claims: graph.claims.map(restatus),
+    claims: claims.map((c) => (retired.has(c.id) ? { ...c, status: "superseded" as const } : c)),
   };
 }
 
