@@ -22,7 +22,6 @@ export class Topbar {
   constructor(
     container: HTMLElement,
     private readonly onChange: (state: TopbarState) => void,
-    onFit: () => void = () => undefined,
   ) {
     container.classList.add("mp-topbar");
     const search = container.createEl("input", {
@@ -50,9 +49,6 @@ export class Topbar {
       this.state.showProposed = box.checked;
       this.emit();
     });
-    const fit = container.createEl("button", { cls: "mp-pill", text: "fit" });
-    fit.setAttribute("aria-label", "Fit the graph to the view");
-    fit.addEventListener("click", () => onFit());
     const asOf = container.createEl("label", { cls: "mp-toggle" });
     asOf.createSpan({ text: "as of " });
     const date = asOf.createEl("input", { attr: { type: "date" } });
