@@ -1,0 +1,214 @@
+/* Mind Palace view. Layout and chrome only; colours come from Obsidian's
+   theme variables so light and dark both work. */
+
+/* `.workspace-leaf-content .view-content` sets padding and overflow with two
+   classes of specificity, so the reset needs the same weight. Rows use
+   minmax(0, 1fr): a bare 1fr has an `auto` minimum, which lets the panel's
+   content height dictate the row and left the graph a third of the tab tall. */
+.workspace-leaf-content .mp-root {
+  /* Pinned to the leaf's box rather than sized by `height: 100%`: that
+     percentage resolved as auto in practice, so the view grew and shrank
+     with the panel's content. `.workspace-leaf-content` is positioned, and
+     the view header above sits in flow, hence the top offset. */
+  position: absolute;
+  top: var(--header-height);
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: auto;
+  width: auto;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  padding: 0;
+  overflow: hidden;
+}
+
+.mp-topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-small);
+}
+
+.mp-search {
+  min-width: 180px;
+}
+
+.mp-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.mp-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--background-modifier-border);
+  background: transparent;
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+
+.mp-pill-off {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+
+.mp-dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.mp-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--text-muted);
+}
+
+.mp-notice {
+  padding: 8px 12px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.mp-body {
+  display: grid;
+  /* Hiding the notice must not move the body into its content-sized row. */
+  grid-row: 3;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+}
+
+.mp-canvas-host {
+  position: relative;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--background-primary);
+}
+
+/* Out of flow on purpose: the canvas is sized *from* its host, so it must
+   never contribute a height back to the host's row. */
+.mp-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+}
+
+.mp-panel {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-left: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-small);
+}
+
+.mp-panel h3 {
+  margin: 0;
+  font-size: var(--font-ui-medium);
+}
+
+.mp-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mp-section {
+  margin: 12px 0 4px;
+  font-size: var(--font-ui-smaller);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.mp-list {
+  margin: 0;
+  padding-left: 16px;
+}
+
+.mp-row {
+  cursor: pointer;
+}
+
+.mp-row:hover {
+  color: var(--interactive-accent);
+}
+
+.mp-muted {
+  color: var(--text-muted);
+}
+
+.mp-struck {
+  text-decoration: line-through;
+  opacity: 0.6;
+}
+
+.mp-link {
+  cursor: pointer;
+  color: var(--interactive-accent);
+}
+
+.mp-card {
+  margin: 6px 0;
+  padding: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+}
+
+.mp-card p {
+  margin: 0 0 4px;
+}
+
+.mp-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.mp-reason {
+  flex: 1;
+  min-width: 0;
+}
+
+.mp-confirm {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.mp-position {
+  margin: 0 0 6px;
+  font-size: var(--font-ui-smaller);
+}
+
+.mp-undo {
+  margin-left: 8px;
+}
+
+.mp-group {
+  margin: 8px 0 2px;
+  font-size: var(--font-ui-smaller);
+}
+
+.mp-all {
+  background: var(--background-secondary);
+}
+
+.mp-retire {
+  color: var(--text-error);
+}
+
+.mp-retire:disabled {
+  opacity: 0.5;
+}

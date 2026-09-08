@@ -11,7 +11,9 @@ from mindpalace.ids import new_id, slugify
 from mindpalace.models import Decision
 
 
-def _now() -> str:
+def now_iso() -> str:
+    """UTC, second precision is not promised, `Z` suffix: the `ts` shape every
+    log line and the graph export carry."""
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
@@ -59,12 +61,12 @@ class OpLog:
     def begin(self, intent: dict) -> str:
         op_id = new_id("op_")
         _append_line(
-            self.path, {"kind": "op.begin", "op": op_id, "ts": _now(), "intent": intent}
+            self.path, {"kind": "op.begin", "op": op_id, "ts": now_iso(), "intent": intent}
         )
         return op_id
 
     def commit(self, op_id: str) -> None:
-        _append_line(self.path, {"kind": "op.commit", "op": op_id, "ts": _now()})
+        _append_line(self.path, {"kind": "op.commit", "op": op_id, "ts": now_iso()})
 
     def pending(self) -> list[dict]:
         begun: dict[str, dict] = {}
@@ -76,7 +78,8 @@ class OpLog:
         return list(begun.values())
 
 
-VALID_ACTIONS = {"confirm", "dismiss"}
+# "reopen" puts an assertion back under review: the Obsidian window's undo.
+VALID_ACTIONS = {"confirm", "dismiss", "reopen"}
 
 
 class DecisionLog:
@@ -106,7 +109,7 @@ class DecisionLog:
             self.path,
             {
                 "op": op_id,
-                "ts": _now(),
+                "ts": now_iso(),
                 "assertion": assertion_id,
                 "action": action,
                 "via": via,
@@ -182,7 +185,7 @@ class VocabularyLog:
             self.path,
             {
                 "op": op_id,
-                "ts": _now(),
+                "ts": now_iso(),
                 "kind": kind,
                 "proposed": slugify(proposed),
                 "adopted": adopted,
@@ -236,7 +239,7 @@ class MergeLog:
             self.path,
             {
                 "op": op_id,
-                "ts": _now(),
+                "ts": now_iso(),
                 "duplicate": slugify(duplicate),
                 "canonical": slugify(canonical),
                 "action": action,
@@ -272,3 +275,53 @@ class MergeLog:
 
     def kept(self) -> set[tuple[str, str]]:
         return self._fold()[1]
+
+
+RETIREMENT_ACTIONS = {"retire", "restore"}
+
+
+class RetirementLog:
+    """Durable "this is not an entity" decisions (docs/decisions/0004 §Part 2).
+
+    `retire` drops the slug from every subsequent fold while nothing live
+    names it; `restore` reverses it. Last write wins per slug, the same
+    shape as `MergeLog`, and the Obsidian window appends lines of exactly
+    this shape.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def append(
+        self,
+        slug: str,
+        action: str,
+        via: str,
+        op_id: str,
+        reason: str | None = None,
+    ) -> None:
+        if action not in RETIREMENT_ACTIONS:
+            raise ValueError(
+                f"invalid retirement action {action!r} (expected one of "
+                f"{sorted(RETIREMENT_ACTIONS)})"
+            )
+        _append_line(
+            self.path,
+            {
+                "op": op_id,
+                "ts": now_iso(),
+                "slug": slugify(slug),
+                "action": action,
+                "via": via,
+                "reason": reason,
+            },
+        )
+
+    def retired(self) -> set[str]:
+        retired: set[str] = set()
+        for record in _read_lines(self.path):
+            if record["action"] == "retire":
+                retired.add(record["slug"])
+            else:
+                retired.discard(record["slug"])
+        return retired

@@ -32,6 +32,7 @@ TOOL_NAMES = (
     "resolve_assertion",
     "adopt_type",
     "merge_entities",
+    "retire_entity",
     "review_queue",
     "cluster",
     "write_community_report",
@@ -156,9 +157,9 @@ def build_server(session: Session) -> MCPServer:
     def _resolve_assertion(
         identifier: str, action: str, reason: str | None = None
     ) -> dict:
-        """Confirm or dismiss a proposed relationship or claim. Call this only
-        on the user's explicit instruction; the decision is logged with your
-        stated reason."""
+        """Confirm or dismiss a proposed relationship or claim, or reopen a
+        decided one so it is proposed again. Call this only on the user's
+        explicit instruction; the decision is logged with your stated reason."""
         return _run(session, tools.resolve_assertion, identifier, action, reason)
 
     @server.tool(name="adopt_type")
@@ -200,6 +201,14 @@ def build_server(session: Session) -> MCPServer:
         stops asking). Logged, never applied to note files. Call on the
         user's instruction."""
         return _run(session, tools.merge_entities, duplicate, canonical, action, reason)
+
+    @server.tool(name="retire_entity")
+    def _retire_entity(slug: str, action: str = "retire", reason: str | None = None) -> dict:
+        """Record that a slug is not an entity (action="retire", reversible
+        with "restore"). Refused while any proposed or confirmed relationship
+        or claim names it: decide or dismiss those first. Logged, never
+        applied to note files. Call on the user's instruction."""
+        return _run(session, tools.retire_entity, slug, action, reason)
 
     @server.tool(name="review_queue")
     def _review_queue(limit: int = 20) -> dict:

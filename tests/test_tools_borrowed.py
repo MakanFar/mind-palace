@@ -13,6 +13,7 @@ from mindpalace.tools import (
     merge_entities,
     propose_relationship,
     resolve_assertion,
+    retire_entity,
     review_queue,
     save_capture,
     write_note,
@@ -321,6 +322,61 @@ def test_a_keep_decision_silences_the_similarity_lint(session):
     result = merge_entities(session, "gpt-4", "gpt-4-turbo", action="keep")
     assert result["status"] == "kept"
     assert ("gpt-4", "gpt-4-turbo") in session.merges.kept()
+
+
+# ---- retirements (docs/decisions/0004) --------------------------------------
+
+
+def test_retire_entity_removes_an_isolated_entity_and_is_reversible(session):
+    note(session, entities=[{"name": "typo", "type": "concept", "description": "d"}])
+    assert graph_stats(session)["isolated"] == 1
+    result = retire_entity(session, "typo", reason="not a thing")
+    assert result == {"slug": "typo", "status": "retired", "reason": "not a thing"}
+    slugs = {r["slug"] for r in session.conn.execute("SELECT slug FROM entities")}
+    assert "typo" not in slugs
+    assert graph_stats(session)["retired"] == 1
+    assert graph_stats(session)["isolated"] == 0
+    retire_entity(session, "typo", action="restore")
+    slugs = {r["slug"] for r in session.conn.execute("SELECT slug FROM entities")}
+    assert "typo" in slugs
+    assert graph_stats(session)["retired"] == 0
+
+
+def test_retire_entity_refuses_while_anything_live_touches_it(session):
+    [x] = note(
+        session,
+        entities=[{"name": "a", "type": "concept", "description": "d"}],
+        relationship_assertions=[{"source": "a", "target": "b", "type": "relates-to", "description": "d"}],
+    )["relationship_assertions"]
+    with pytest.raises(ToolError, match="1 proposed relationship.*decide"):
+        retire_entity(session, "a")
+    resolve_assertion(session, x["id"], "confirm")
+    with pytest.raises(ToolError, match="1 confirmed relationship.*dismiss"):
+        retire_entity(session, "a")
+    resolve_assertion(session, x["id"], "dismiss")
+    # Declared, so still an entity; now isolated, so retirable.
+    assert retire_entity(session, "a")["status"] == "retired"
+    # Its undeclared endpoint left with the dismissal and is no entity at all.
+    with pytest.raises(ToolError, match="no entity"):
+        retire_entity(session, "b")
+
+
+def test_retire_entity_refuses_a_bad_action_and_an_unretired_restore(session):
+    note(session, entities=[{"name": "a", "type": "concept", "description": "d"}])
+    with pytest.raises(ToolError, match="action must be"):
+        retire_entity(session, "a", action="bogus")
+    with pytest.raises(ToolError, match="not retired"):
+        retire_entity(session, "a", action="restore")
+
+
+def test_a_live_claim_blocks_retirement_too(session):
+    note(
+        session,
+        entities=[{"name": "a", "type": "concept", "description": "d"}],
+        claim_assertions=[{"subject": "a", "text": "Holds."}],
+    )
+    with pytest.raises(ToolError, match="1 proposed claim"):
+        retire_entity(session, "a")
 
 
 # ---- 7. echo what landed ----------------------------------------------------

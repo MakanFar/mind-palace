@@ -69,6 +69,16 @@ def test_confirmation_clears_a_prior_dismissal_reason(tmp_path):
     assert decisions.dismissal_reasons() == {}
 
 
+def test_reopen_puts_an_assertion_back_under_review(tmp_path):
+    """The Obsidian window's undo appends a reopen; the fold must read it as
+    proposed again, and any dismissal reason must go with it."""
+    decisions = DecisionLog(tmp_path / "decisions.jsonl")
+    decisions.append("x_01", "dismiss", "obsidian", "op_1", "mis-click")
+    decisions.append("x_01", "reopen", "obsidian", "op_2")
+    assert decisions.status_map() == {"x_01": "reopen"}
+    assert decisions.dismissal_reasons() == {}
+
+
 def test_append_rejects_an_invalid_action(tmp_path):
     """The decision log is one shared file for the whole vault: a bad action
     line, once durably written, would block every future rebuild with no
@@ -204,3 +214,53 @@ def test_keep_only_undoes_a_merge_of_that_same_pair(tmp_path):
     log.append("a", "b", "keep", "t", "op_2")
     assert log.merges() == {"a": "c"}
     assert log.kept() == {("a", "b")}
+
+
+def test_decision_log_conformance_fixture_folds_the_same_as_the_plugin():
+    """tests/fixtures/decisions-conformance.jsonl is also read by the Obsidian
+    plugin's Vitest suite; both must fold it to the same map and tolerate the
+    torn final line the same way."""
+    from pathlib import Path
+
+    from mindpalace.oplog import DecisionLog
+
+    fixture = Path(__file__).parent / "fixtures" / "decisions-conformance.jsonl"
+    log = DecisionLog(fixture)
+    assert log.status_map() == {"x_1": "confirm", "k_2": "confirm", "x_3": "reopen"}
+    assert [d.via for d in log.entries()] == [
+        "resolve_assertion", "obsidian", "resolve_assertion", "resolve_assertion", "obsidian",
+    ]
+
+
+# ---- retirements (docs/decisions/0004 §Part 2) ------------------------------
+
+
+def test_retirement_log_folds_to_the_current_set_last_write_wins(tmp_path):
+    from mindpalace.oplog import RetirementLog
+
+    log = RetirementLog(tmp_path / "retirements.jsonl")
+    log.append("a", "retire", "retire_entity", "op_1", "not an entity")
+    log.append("B", "retire", "obsidian", "obsidian_X")
+    log.append("a", "restore", "retire_entity", "op_2")
+    assert log.retired() == {"b"}  # slugified on append, like merges
+
+
+def test_retirement_log_rejects_a_bad_action(tmp_path):
+    from mindpalace.oplog import RetirementLog
+
+    path = tmp_path / "retirements.jsonl"
+    with pytest.raises(ValueError, match="bogus"):
+        RetirementLog(path).append("a", "bogus", "v", "op")
+    assert not path.exists()
+
+
+def test_retirement_conformance_fixture_folds_the_same_as_the_plugin():
+    """tests/fixtures/retirements-conformance.jsonl is also read by the
+    Obsidian plugin's Vitest suite; both must fold it to the same set and
+    tolerate the torn final line the same way."""
+    from pathlib import Path
+
+    from mindpalace.oplog import RetirementLog
+
+    fixture = Path(__file__).parent / "fixtures" / "retirements-conformance.jsonl"
+    assert RetirementLog(fixture).retired() == {"b"}

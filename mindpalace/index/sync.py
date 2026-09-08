@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,8 +26,17 @@ from mindpalace.graph.duplicates import (
 )
 from mindpalace.graph.integrity import check_entity_types, check_signatures
 from mindpalace.ids import slugify, unit_id
+from mindpalace.index.graph_export import build_graph_export, first_line, write_graph_export
 from mindpalace.index import db, vectors
-from mindpalace.models import Capture, Note, capture_from_markdown, note_from_markdown
+from mindpalace.models import (
+    Capture,
+    CommunityReport,
+    EntityPage,
+    Note,
+    capture_from_markdown,
+    note_from_markdown,
+)
+from mindpalace.oplog import now_iso
 from mindpalace.vault.store import VaultStore
 
 DOC_KINDS = ("capture", "note", "entity", "report", "unparsed")
@@ -70,9 +79,31 @@ def _iter_source_files(store: VaultStore) -> Iterator[Path]:
         store.paths.mindpalace_md,
         store.paths.vocabulary_log,
         store.paths.merges_log,
+        store.paths.retirements_log,
     ):
         if dependency.exists():
             yield dependency
+
+
+def _source_hashes(store: VaultStore) -> Iterator[tuple[str, str]]:
+    """`(relative path, content hash)` for every file in `_iter_source_files`:
+    what `sync` records in `files` and what `has_drift` compares against it.
+    One definition, so the two can never disagree on path or encoding."""
+    for path in _iter_source_files(store):
+        yield _relative(store, path), content_hash(path.read_text(encoding="utf-8"))
+
+
+#: `sync` takes the fold's decision statuses either as the folded map or as
+#: a callable that reads it. The callable form exists for one reason: the
+#: Obsidian window appends to decisions.jsonl without the vault lock, and a
+#: line landing after the map was read but before the file was hashed would
+#: be recorded as folded without ever being folded (docs/decisions/0003
+#: §Part 2). Deferring the read until after the hash closes that window.
+StatusSource = Mapping[str, str] | Callable[[], Mapping[str, str]]
+
+
+def resolve_statuses(statuses: StatusSource) -> dict[str, str]:
+    return dict(statuses() if callable(statuses) else statuses)
 
 
 def _load_notes(
@@ -119,9 +150,11 @@ def _load_sources(
     list[tuple[str, str, str]],
     list[tuple[str, str]],
     dict[str, tuple[str, str]],
+    dict[str, str],
 ]:
     """Parse every Tier 1 source file, degrading rather than dropping on
-    failure. See `_load_notes` for the notes half of this."""
+    failure. See `_load_notes` for the notes half of this. The last item
+    maps capture id -> relative path, for the graph export."""
     captures: list[Capture] = []
     issues: list[tuple[str, str, str]] = []
     degraded: list[tuple[str, str]] = []
@@ -155,7 +188,7 @@ def _load_sources(
     issues.extend(note_issues)
     degraded.extend(note_degraded)
 
-    return captures, notes, issues, degraded, note_sources
+    return captures, notes, issues, degraded, note_sources, seen_ids
 
 
 def _load_entity_pages(
@@ -211,6 +244,7 @@ def _fold_with_quarantine(
     note_paths: dict[str, str],
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
     merges: Mapping[str, str] | None = None,
+    retired: Iterable[str] = (),
 ) -> tuple[GraphTables, set[str]]:
     """Fold, quarantining and retrying on a typed `FoldError` instead of
     letting it propagate out of `sync`.
@@ -250,6 +284,7 @@ def _fold_with_quarantine(
                     config,
                     adoptions=adoptions,
                     merges=merge_map,
+                    retired=retired,
                 ),
                 excluded,
             )
@@ -318,6 +353,7 @@ def fold_notes_with_quarantine(
     statuses: dict[str, str],
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
     merges: Mapping[str, str] | None = None,
+    retired: Iterable[str] = (),
 ) -> tuple[list[Note], dict[str, Note], GraphTables, list[tuple[str, str, str]]]:
     """Parse and fold every note currently on disk, quarantining anything
     `fold` rejects instead of raising.
@@ -342,8 +378,9 @@ def fold_notes_with_quarantine(
     notes, issues, _degraded, note_sources = _load_notes(store)
     note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
     tables, excluded = _fold_with_quarantine(
-        notes, statuses, config, issues, note_paths, adoptions, merges
+        notes, statuses, config, issues, note_paths, adoptions, merges, retired
     )
+    issues.extend(_revived_issues(tables))
     folded_notes = [note for note in notes if note.id not in excluded]
     notes_by_id = {note.id: note for note in folded_notes}
     return folded_notes, notes_by_id, tables, issues
@@ -384,13 +421,6 @@ def capture_units(capture: Capture) -> list[CaptureUnit]:
             CaptureUnit(unit_id(capture.id, ordinal), capture.id, ordinal, start, end, locator, text)
         )
     return units
-
-
-def _first_line(text: str) -> str:
-    for line in text.splitlines():
-        if line.strip():
-            return line.strip()[:120]
-    return ""
 
 
 def _ambiguous_alias_issues(
@@ -617,6 +647,45 @@ def _merged_page_issues(
     return issues, orphaned
 
 
+def _retired_page_issues(
+    store: VaultStore, tables: GraphTables, entity_pages: list, retired: set[str]
+) -> tuple[list[tuple[str, str, str]], set[str]]:
+    """An entity page for a retired slug (docs/decisions/0004): the file stays,
+    like a merged-away page, but it is not a live entity and must not be
+    indexed as one. A revived slug is back in the graph, so its page is not
+    reported here."""
+    issues: list[tuple[str, str, str]] = []
+    orphaned: set[str] = set()
+    for page in entity_pages:
+        if page.slug not in retired or page.slug in tables.entities:
+            continue
+        orphaned.add(page.slug)
+        issues.append(
+            (
+                _relative(store, store.paths.entity_path(page.slug)),
+                "retired_entity_page",
+                f"{page.slug!r} is retired; this page is no longer an entity. "
+                f"Delete this file, or restore the entity",
+            )
+        )
+    return issues, orphaned
+
+
+def _revived_issues(tables: GraphTables) -> list[tuple[str, str, str]]:
+    """A retired slug that folded anyway (docs/decisions/0004 §Part 1): a live
+    assertion or claim names it, and hiding a reviewable item would be silent
+    loss, so it is back in the graph and this says so."""
+    return [
+        (
+            ".mindpalace/retirements.jsonl",
+            "retired_entity_revived",
+            f"{slug!r} is retired but a live assertion or claim names it, so it "
+            f"is back in the graph; decide that item and retire again, or restore",
+        )
+        for slug in tables.revived
+    ]
+
+
 def _signature_issues(
     store: VaultStore, tables: GraphTables, config: Config, note_paths: dict[str, str]
 ) -> list[tuple[str, str, str]]:
@@ -644,7 +713,7 @@ def _render_index(
         "",
     ]
     for note in sorted(notes, key=lambda item: (item.created, item.id)):
-        lines.append(f"- `{note.id}` {note.created[:10]} — {_first_line(note.body)}")
+        lines.append(f"- `{note.id}` {note.created[:10]} — {first_line(note.body, 120)}")
     lines += ["", "## Entities", ""]
     for entity in sorted(
         tables.entities.values(), key=lambda item: (-item.rank, item.slug)
@@ -658,19 +727,32 @@ def sync(
     store: VaultStore,
     config: Config,
     embedder: Embedder,
-    statuses: dict[str, str],
+    statuses: StatusSource,
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
     merges: Mapping[str, str] | None = None,
     kept: Iterable[tuple[str, str]] = (),
+    retired: Iterable[str] = (),
 ) -> SyncReport:
-    """`adoptions`, `merges`, `kept` are the folded vocabulary and merge logs
-    (see `Session.overlays`). Defaulted so a caller that has none still syncs."""
-    captures, notes, issues, degraded, note_sources = _load_sources(store)
+    """`adoptions`, `merges`, `kept`, `retired` are the folded vocabulary,
+    merge and retirement logs (see `Session.overlays`). Defaulted so a
+    caller that has none still syncs.
+    `statuses` is the decision map or a callable that reads it; see
+    `StatusSource` for why a caller should pass the callable."""
+    # Hash every source file first: before the statuses are read, before the
+    # fold, and before the slow embed. The Obsidian window appends to
+    # decisions.jsonl without the vault lock; a line landing anywhere after
+    # this point must be hashed as *not yet* folded, or `has_drift` would
+    # never notice it (docs/decisions/0003 §Part 2).
+    source_hashes = list(_source_hashes(store))
+    statuses = resolve_statuses(statuses)
+    captures, notes, issues, degraded, note_sources, capture_paths = _load_sources(store)
 
     note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
+    retired = set(retired)
     tables, excluded_notes = _fold_with_quarantine(
-        notes, statuses, config, issues, note_paths, adoptions, merges
+        notes, statuses, config, issues, note_paths, adoptions, merges, retired
     )
+    issues.extend(_revived_issues(tables))
 
     # A note the graph rejected (unknown edge type, duplicate assertion id)
     # must still be findable so the user can go fix it -- spec §10 applies
@@ -685,14 +767,14 @@ def sync(
         units = capture_units(capture)
         all_units.extend(units)
         if len(units) == 1:
-            documents.append((capture.id, "capture", _first_line(capture.text), capture.text))
+            documents.append((capture.id, "capture", first_line(capture.text, 120), capture.text))
             continue
         # A long capture is searched by unit so a hit lands on a page or a
         # section, and its body is not indexed as well, so it never comes
         # back twice for one query.
         for unit in units:
             documents.append(
-                (unit.id, "unit", unit.locator or _first_line(capture.text), unit.text)
+                (unit.id, "unit", unit.locator or first_line(capture.text, 120), unit.text)
             )
     for note in folded_notes:
         # Assertion descriptions ride along in the note's searchable text rather
@@ -703,7 +785,7 @@ def sync(
         )
         claim_text = " ".join(c.text for c in note.claim_assertions)
         searchable = "\n".join(filter(None, [note.body, assertion_text, claim_text]))
-        documents.append((note.id, "note", _first_line(note.body), searchable))
+        documents.append((note.id, "note", first_line(note.body, 120), searchable))
     # Tier 2 gets the same degrade-and-record treatment as Tier 1 notes: a
     # page that fails to parse is skipped, recorded as a vault_issue, and
     # kept searchable via `degraded` rather than taking `sync` down (spec
@@ -714,6 +796,9 @@ def sync(
     degraded.extend(entity_degraded)
     merged_issues, orphaned = _merged_page_issues(store, tables, entity_pages)
     issues.extend(merged_issues)
+    retired_issues, retired_pages = _retired_page_issues(store, tables, entity_pages, retired)
+    issues.extend(retired_issues)
+    orphaned |= retired_pages
     for page in entity_pages:
         if page.slug in orphaned:
             continue
@@ -774,11 +859,7 @@ def sync(
         vectors.clear(conn)
         db.write_meta(conn, embedder.model_id, embedder.dim)
 
-        for path in _iter_source_files(store):
-            conn.execute(
-                "INSERT INTO files (path, hash) VALUES (?, ?)",
-                (_relative(store, path), content_hash(path.read_text(encoding="utf-8"))),
-            )
+        conn.executemany("INSERT INTO files (path, hash) VALUES (?, ?)", source_hashes)
 
         for entity in tables.entities.values():
             conn.execute(
@@ -883,6 +964,11 @@ def sync(
 
     atomic_write(store.paths.index_md, _render_index(captures, folded_notes, tables))
 
+    _write_graph_json(
+        conn, store, config, tables, captures, capture_paths, folded_notes, note_paths,
+        all_units, proposals, entity_pages, reports,
+    )
+
     return SyncReport(
         notes=len(folded_notes),
         captures=len(captures),
@@ -892,15 +978,79 @@ def sync(
     )
 
 
+def _write_graph_json(
+    conn: sqlite3.Connection,
+    store: VaultStore,
+    config: Config,
+    tables: GraphTables,
+    captures: list[Capture],
+    capture_paths: dict[str, str],
+    folded_notes: list[Note],
+    note_paths: dict[str, str],
+    all_units: list[CaptureUnit],
+    proposals: list[tuple[str, str, int, str, str]],
+    entity_pages: list[EntityPage],
+    reports: list[CommunityReport],
+) -> None:
+    """The window's data (docs/decisions/0003). Communities are read back
+    because `cluster` owns that table; everything else is in hand."""
+    write_graph_export(
+        store.paths.graph_json,
+        build_graph_export(
+            tables,
+            config,
+            captures,
+            capture_paths,
+            {note.id: note for note in folded_notes},
+            note_paths,
+            all_units,
+            db.read_communities(conn),
+            proposals,
+            entity_pages,
+            reports,
+            now_iso(),
+        ),
+    )
+
+
+def export_graph(
+    conn: sqlite3.Connection,
+    store: VaultStore,
+    config: Config,
+    statuses: StatusSource,
+    adoptions: Mapping[str, Mapping[str, str]] | None = None,
+    merges: Mapping[str, str] | None = None,
+    retired: Iterable[str] = (),
+) -> None:
+    """Rewrite graph.json from the sources and the tables as they stand,
+    without touching the cache or the embedder.
+
+    For a writer that changed something the window shows but the cache does
+    not derive from the sources -- `cluster` owns the communities table --
+    so it can refresh the export at the cost of a parse and a fold rather
+    than a full `sync` (re-embedding every document to copy one list)."""
+    captures, notes, issues, _degraded, note_sources, capture_paths = _load_sources(store)
+    note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
+    tables, excluded_notes = _fold_with_quarantine(
+        notes, resolve_statuses(statuses), config, issues, note_paths, adoptions, merges, retired
+    )
+    folded_notes = [note for note in notes if note.id not in excluded_notes]
+    all_units = [unit for capture in captures for unit in capture_units(capture)]
+    entity_pages, _issues, _degraded = _load_entity_pages(store)
+    reports, _issues, _degraded = _load_reports(store)
+    _write_graph_json(
+        conn, store, config, tables, captures, capture_paths, folded_notes, note_paths,
+        all_units, _vocabulary_proposals(folded_notes, config, adoptions), entity_pages, reports,
+    )
+
+
 def has_drift(conn: sqlite3.Connection, store: VaultStore) -> bool:
     recorded = {
         row["path"]: row["hash"] for row in conn.execute("SELECT path, hash FROM files")
     }
     seen: set[str] = set()
-    for path in _iter_source_files(store):
-        relative = _relative(store, path)
+    for relative, current in _source_hashes(store):
         seen.add(relative)
-        current = content_hash(path.read_text(encoding="utf-8"))
         if recorded.get(relative) != current:
             return True
     return seen != recorded.keys()

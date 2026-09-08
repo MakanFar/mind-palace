@@ -1,0 +1,4 @@
+{"action": "retire", "op": "op_1", "reason": "typo", "slug": "a", "ts": "2026-09-07T00:00:00Z", "via": "retire_entity"}
+{"action":"retire","op":"obsidian_ABC","reason":null,"slug":"b","ts":"2026-09-07T00:01:00Z","via":"obsidian"}
+{"action": "restore", "op": "op_2", "reason": null, "slug": "a", "ts": "2026-09-07T00:02:00Z", "via": "retire_entity"}
+{"action": "retire", "op": "op_3", "slug": "torn", "ts": "2026-09-07T00:0

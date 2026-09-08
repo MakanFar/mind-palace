@@ -6,6 +6,8 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
+from mindpalace.cluster import Community
+
 TABLES = frozenset(
     {
         "cache_meta",
@@ -259,3 +261,17 @@ def write_meta(conn: sqlite3.Connection, model_id: str, dim: int) -> None:
         "dim = excluded.dim",
         (model_id, dim),
     )
+
+
+def read_communities(conn: sqlite3.Connection) -> list[Community]:
+    """Every stored community. `cluster` owns this table; `members` is the
+    comma-joined member slugs, and this is the one place that knows it."""
+    return [
+        Community(
+            lineage_id=row["lineage_id"],
+            level=row["level"],
+            members=frozenset(row["members"].split(",")) if row["members"] else frozenset(),
+            parent=row["parent"],
+        )
+        for row in conn.execute("SELECT lineage_id, level, parent, members FROM communities")
+    ]
