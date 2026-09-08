@@ -35,6 +35,7 @@ _FOLD_ISSUE_KINDS = (
     "duplicate_assertion_id",
     "unknown_decision_action",
     "merge_cycle",
+    "retired_entity_revived",
 )
 
 
@@ -248,12 +249,13 @@ def rebuild(
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
     merges: Mapping[str, str] | None = None,
     kept: Iterable[tuple[str, str]] = (),
+    retired: Iterable[str] = (),
 ) -> RebuildReport:
     synced = 0
     if scope in {"cache", "all"}:
         synced = sync(
             conn, store, config, embedder, statuses,
-            adoptions=adoptions, merges=merges, kept=kept,
+            adoptions=adoptions, merges=merges, kept=kept, retired=retired,
         ).notes
 
     # Quarantine-aware, not a bare `fold()` call: a note with a typo'd edge
@@ -265,7 +267,7 @@ def rebuild(
     # unresolved to the second: each `sync` must read the decision log no
     # earlier than it hashes it (see `StatusSource`).
     notes, notes_by_id, tables, fold_issues = fold_notes_with_quarantine(
-        store, config, resolve_statuses(statuses), adoptions, merges
+        store, config, resolve_statuses(statuses), adoptions, merges, retired
     )
     # Persist what quarantine found. When scope includes "cache", `sync`
     # (above) already wrote the identical set as part of its own full
@@ -367,7 +369,7 @@ def rebuild(
     if written or reports_marked:
         sync(
             conn, store, config, embedder, statuses,
-            adoptions=adoptions, merges=merges, kept=kept,
+            adoptions=adoptions, merges=merges, kept=kept, retired=retired,
         )
 
     return RebuildReport(

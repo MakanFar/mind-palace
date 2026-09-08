@@ -54,6 +54,7 @@ def build_graph_export(
                 "type": e.type,
                 "rank": e.rank,
                 "merged_from": list(e.merged_from),
+                "declared": e.declared,
                 "description": first_line(page.description) if page else "",
                 "stale": page.stale if page else True,
                 "note_ids": list(e.note_ids),

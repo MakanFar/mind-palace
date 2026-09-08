@@ -42,7 +42,7 @@ def call(session, name: str, arguments: dict | None = None) -> dict:
 
 def test_all_fifteen_tools_are_registered(session):
     assert registered_names(session) == set(TOOL_NAMES)
-    assert len(TOOL_NAMES) == 18
+    assert len(TOOL_NAMES) == 19
 
 
 def test_every_tool_has_a_description(session):

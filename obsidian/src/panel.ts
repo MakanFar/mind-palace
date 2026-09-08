@@ -2,13 +2,29 @@
 
 import type { Selection } from "./canvas";
 import type { Action } from "./decisions";
-import { type GraphClaim, type GraphData, type GraphEdge, type GraphEntity, type GraphUntyped, isLive, isLiveEdge } from "./graph";
+import { type GraphClaim, type GraphData, type GraphEdge, type GraphEntity, type GraphUntyped, isLive, isLiveEdge, isolatedEntities } from "./graph";
+import { retireBlockers } from "./retirements";
 import { colourFor } from "./palette";
+import type { QueueItem } from "./review";
+
+/** The review queue and where the selection sits in it (-1: not in it). */
+export interface ReviewContext {
+  queue: QueueItem[];
+  index: number;
+  /** Review mode: the queue replaces the empty state. */
+  listing: boolean;
+  /** The queue is ordered by note, so the list shows note headings. */
+  grouped: boolean;
+}
+
+const KEYS = "c confirm · d dismiss · n next · p previous · r reason";
 
 export interface PanelActions {
   openFile(path: string): void;
   select(selection: Selection): void;
-  decide(assertion: string, action: Action, reason: string | null): Promise<void>;
+  /** One reason, one append, for every assertion given. */
+  decide(assertions: string[], action: Action, reason: string | null): Promise<void>;
+  retire(slug: string, reason: string | null): Promise<void>;
 }
 
 export function describeValidity(from: string | null, to: string | null): string {
@@ -65,7 +81,19 @@ export class Panel {
     container.classList.add("mp-panel");
   }
 
-  show(selection: Selection | null, graph: GraphData, asOf: string | null): void {
+  /** The reason typed for an assertion, for a decision made from the keyboard. */
+  reasonFor(assertion: string): string | null {
+    const input = this.container.querySelector<HTMLInputElement>(`.mp-reason[data-assertion="${assertion}"]`);
+    return input?.value.trim() || null;
+  }
+
+  focusReason(): boolean {
+    const input = this.container.querySelector<HTMLInputElement>(".mp-reason");
+    input?.focus();
+    return input !== null;
+  }
+
+  show(selection: Selection | null, graph: GraphData, asOf: string | null, review: ReviewContext | null): void {
     // graph.json is polled and the panel re-rendered on every change; a
     // reason half-typed into a card must survive that, so carry the inputs'
     // text across by assertion id.
@@ -75,9 +103,17 @@ export class Panel {
     }
     this.container.empty();
     if (!selection) {
-      this.container.createEl("p", { cls: "mp-muted", text: "Select a node or an edge." });
+      if (review?.listing) this.renderQueue(review.queue, review.grouped);
+      else this.container.createEl("p", { cls: "mp-muted", text: "Select a node or an edge." });
+      this.renderIsolated(graph);
       this.renderVocabulary(graph);
       return;
+    }
+    if (review && review.index >= 0) {
+      this.container.createEl("p", {
+        cls: "mp-muted mp-position",
+        text: `${review.index + 1} of ${review.queue.length} to review · ${KEYS}`,
+      });
     }
     const resolved = resolveSelection(selection, graph);
     if (!resolved) this.container.createEl("p", { cls: "mp-muted", text: GONE[selection.kind] });
@@ -103,6 +139,7 @@ export class Panel {
     if (entity.description) this.container.createEl("p", { text: entity.description });
     const open = this.container.createEl("a", { cls: "mp-link", text: "Open page" });
     open.addEventListener("click", () => this.actions.openFile(`entities/${entity.slug}.md`));
+    this.retireRow(entity.slug, graph);
 
     this.renderClaims(graph.claims.filter((c) => c.subject === entity.slug), asOf);
     this.renderEdgeList(entity.slug, graph);
@@ -179,6 +216,13 @@ export class Panel {
       text: `${edge.type} · ${edge.traversable ? "confirmed" : "proposed"} · weight ${edge.weight}`,
     });
     this.section(`Assertions (${edge.assertions.length})`);
+    const pending = edge.assertions.filter((a) => a.status === "proposed").map((a) => a.id);
+    // With one pending card the card's own buttons are the same thing.
+    if (pending.length > 1) {
+      const all = this.container.createDiv({ cls: "mp-card mp-all" });
+      all.createEl("p", { cls: "mp-muted", text: `${pending.length} proposed on this edge` });
+      this.decisionButtons(all, pending, `all ${pending.length}`);
+    }
     for (const assertion of edge.assertions) {
       const card = this.container.createDiv({ cls: "mp-card" });
       card.createEl("p", { text: assertion.description || "(no rationale)" });
@@ -203,6 +247,82 @@ export class Panel {
     });
   }
 
+  private renderQueue(queue: QueueItem[], grouped: boolean): void {
+    if (!queue.length) {
+      this.container.createEl("p", { cls: "mp-muted", text: "Nothing left to review." });
+      return;
+    }
+    this.section(`Review queue (${queue.length})`);
+    this.container.createEl("p", { cls: "mp-muted", text: KEYS });
+    let list: HTMLElement | null = null;
+    let group: string | null = null;
+    for (const item of queue) {
+      // A heading per note when the queue is grouped by note: consecutive
+      // items from one note share it, so this needs no knowledge of the order.
+      const heading = item.notePath ?? item.note;
+      if (grouped && heading !== group) {
+        group = heading;
+        this.container.createEl("p", { cls: "mp-muted mp-group", text: heading });
+        list = null;
+      }
+      list ??= this.container.createEl("ul", { cls: "mp-list" });
+      const row = list.createEl("li", { cls: "mp-row" });
+      row.createSpan({ text: item.label });
+      if (item.pending.length > 1) row.createSpan({ cls: "mp-muted", text: ` ×${item.pending.length}` });
+      row.addEventListener("click", () => this.actions.select(item.selection));
+    }
+  }
+
+  /** Entities with nothing live attached (docs/decisions/0004): the ones
+   *  retire would accept, listed so they can be walked one by one. */
+  private renderIsolated(graph: GraphData): void {
+    const isolated = isolatedEntities(graph);
+    if (!isolated.length) return;
+    this.section(`Isolated (${isolated.length})`);
+    this.container.createEl("p", { cls: "mp-muted", text: "Nothing live names these. Select one to retire it (x)." });
+    const list = this.container.createEl("ul", { cls: "mp-list" });
+    for (const entity of isolated) {
+      const row = list.createEl("li", { cls: "mp-row" });
+      const dot = row.createSpan({ cls: "mp-dot" });
+      dot.style.background = colourFor(entity.type);
+      row.createSpan({ text: ` ${entity.slug}` });
+      row.addEventListener("click", () => this.actions.select({ kind: "entity", slug: entity.slug }));
+    }
+  }
+
+  private retireRow(slug: string, graph: GraphData): void {
+    const blockers = retireBlockers(slug, graph);
+    const row = this.container.createDiv({ cls: "mp-actions" });
+    const reason = row.createEl("input", {
+      cls: "mp-reason",
+      attr: { placeholder: "reason (optional)", "data-retire": slug },
+    });
+    reason.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") reason.blur();
+    });
+    const retire = row.createEl("button", { cls: "mp-retire", text: "Retire" });
+    if (blockers) {
+      retire.disabled = true;
+      retire.title = blockers;
+      this.container.createEl("p", { cls: "mp-muted", text: `Cannot retire: ${blockers}.` });
+      return;
+    }
+    retire.addEventListener("click", async () => {
+      retire.disabled = true;
+      try {
+        await this.actions.retire(slug, reason.value.trim() || null);
+      } finally {
+        retire.disabled = false;
+      }
+    });
+  }
+
+  /** The reason typed for retiring an entity, for the keyboard. */
+  retireReasonFor(slug: string): string | null {
+    const input = this.container.querySelector<HTMLInputElement>(`.mp-reason[data-retire="${slug}"]`);
+    return input?.value.trim() || null;
+  }
+
   private renderVocabulary(graph: GraphData): void {
     if (!graph.vocabulary.length) return;
     this.section(`Vocabulary proposals (${graph.vocabulary.length})`);
@@ -225,18 +345,26 @@ export class Panel {
     link.addEventListener("click", () => this.actions.openFile(path));
   }
 
-  private decisionButtons(parent: HTMLElement, assertion: string): void {
+  private decisionButtons(parent: HTMLElement, assertions: string | string[], suffix = ""): void {
+    const ids = typeof assertions === "string" ? [assertions] : assertions;
     const row = parent.createDiv({ cls: "mp-actions" });
     const reason = row.createEl("input", {
       cls: "mp-reason",
-      attr: { placeholder: "reason (optional)", "data-assertion": assertion },
+      // A batch row's draft survives re-renders under its joined ids.
+      attr: { placeholder: "reason (optional)", "data-assertion": ids.join(" ") },
     });
-    const confirm = row.createEl("button", { cls: "mp-confirm", text: "Confirm" });
-    const dismiss = row.createEl("button", { cls: "mp-dismiss", text: "Dismiss" });
+    // Escape hands the keys back to the view: while the field has focus,
+    // c and d type letters rather than decide.
+    reason.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") reason.blur();
+    });
+    const label = (verb: string) => (suffix ? `${verb} ${suffix}` : verb);
+    const confirm = row.createEl("button", { cls: "mp-confirm", text: label("Confirm") });
+    const dismiss = row.createEl("button", { cls: "mp-dismiss", text: label("Dismiss") });
     const act = (action: Action) => async () => {
       confirm.disabled = dismiss.disabled = true;
       try {
-        await this.actions.decide(assertion, action, reason.value.trim() || null);
+        await this.actions.decide(ids, action, reason.value.trim() || null);
       } finally {
         // A successful decide re-renders the panel and replaces these
         // buttons; a failed one must hand them back.

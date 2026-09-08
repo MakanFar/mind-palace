@@ -15,7 +15,7 @@ from mindpalace.config import Config, load_config, open_vault
 from mindpalace.embed import Embedder, get_embedder
 from mindpalace.index import db
 from mindpalace.index.sync import export_graph, has_drift, sync
-from mindpalace.oplog import DecisionLog, MergeLog, OpLog, VocabularyLog
+from mindpalace.oplog import DecisionLog, MergeLog, OpLog, RetirementLog, VocabularyLog
 from mindpalace.vault.paths import VaultPaths
 from mindpalace.vault.store import VaultStore
 
@@ -79,6 +79,7 @@ class Session:
             self.decisions = DecisionLog(self.paths.decisions_log)
             self.vocabulary = VocabularyLog(self.paths.vocabulary_log)
             self.merges = MergeLog(self.paths.merges_log)
+            self.retirements = RetirementLog(self.paths.retirements_log)
             self.embedder = self._explicit_embedder or get_embedder(self.config.embedder)
             self.opened = True
             self._verify_cache_model()
@@ -318,4 +319,5 @@ class Session:
         return {
             "adoptions": self.vocabulary.adoptions(),
             "merges": self.merges.merges(),
+            "retired": self.retirements.retired(),
         }

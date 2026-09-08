@@ -33,7 +33,7 @@ from mindpalace.models import (
     is_valid_validity,
     validity_precision,
 )
-from mindpalace.oplog import MERGE_ACTIONS, VOCABULARY_ACTIONS, VOCABULARY_KINDS
+from mindpalace.oplog import MERGE_ACTIONS, RETIREMENT_ACTIONS, VOCABULARY_ACTIONS, VOCABULARY_KINDS
 from mindpalace.index import db
 from mindpalace.index.sync import fold_notes_with_quarantine
 from mindpalace.rebuild import (
@@ -793,6 +793,7 @@ def _tables(session: Session):
         session.statuses(),
         overlays["adoptions"],
         overlays["merges"],
+        overlays["retired"],
     )
     return notes, notes_by_id, tables
 
@@ -1050,6 +1051,20 @@ def graph_stats(session: Session) -> dict:
     return {
         "entities": entities,
         "orphans": count("SELECT COUNT(*) FROM entities WHERE rank = 0"),
+        # Nothing live names it: what `retire_entity` would accept
+        # (docs/decisions/0004). Distinct from rank 0, which only counts
+        # confirmed edges and so is every entity in a vault under review.
+        "isolated": count(
+            """
+            SELECT COUNT(*) FROM entities e
+            WHERE NOT EXISTS (
+                SELECT 1 FROM assertions a
+                WHERE (a.source = e.slug OR a.target = e.slug) AND a.status != 'dismissed'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM claims c WHERE c.subject = e.slug AND c.status != 'dismissed'
+            )
+            """
+        ),
         "assertions": count("SELECT COUNT(*) FROM assertions"),
         "aggregates": count("SELECT COUNT(*) FROM aggregates"),
         "traversable_aggregates": count(
@@ -1071,6 +1086,7 @@ def graph_stats(session: Session) -> dict:
             },
         },
         "merges": len(session.merges.merges()),
+        "retired": len(session.retirements.retired()),
         "communities": communities,
         "stale_entity_pages": stale_pages,
         "stale_reports": stale_reports,
@@ -1090,7 +1106,7 @@ def graph_stats(session: Session) -> dict:
     }
 
 
-VALID_ACTIONS = {"confirm": "confirmed", "dismiss": "dismissed"}
+VALID_ACTIONS = {"confirm": "confirmed", "dismiss": "dismissed", "reopen": "proposed"}
 
 
 def propose_relationship(
@@ -1258,11 +1274,67 @@ def merge_entities(
     return {"duplicate": dup, "canonical": canon, "status": status, "reason": reason}
 
 
+def _live_items(session: Session, slug: str) -> list[tuple[str, str, int]]:
+    """(status, kind, count) for every non-dismissed assertion or claim that
+    names `slug`: what stands between it and retirement."""
+    rows = session.conn.execute(
+        """
+        SELECT status, 'relationship' AS kind, COUNT(*) AS n FROM assertions
+        WHERE (source = ? OR target = ?) AND status != 'dismissed' GROUP BY status
+        UNION ALL
+        SELECT status, 'claim' AS kind, COUNT(*) AS n FROM claims
+        WHERE subject = ? AND status != 'dismissed' GROUP BY status
+        """,
+        (slug, slug, slug),
+    ).fetchall()
+    return [(r["status"], r["kind"], r["n"]) for r in rows if r["n"]]
+
+
+def retire_entity(
+    session: Session, slug: str, action: str = "retire", reason: str | None = None
+) -> dict:
+    """Record that a slug is not an entity in `retirements.jsonl`
+    (docs/decisions/0004 §Part 2), or restore one.
+
+    `retire` is refused while anything live names the slug: a proposed item
+    must be decided and a confirmed one dismissed first, so retiring never
+    drops an assertion and the review queue stays the one place assertions
+    are decided. The note files are untouched, so the decision is exactly as
+    reversible as a merge.
+    """
+    _require(
+        action in RETIREMENT_ACTIONS,
+        f"action must be one of {sorted(RETIREMENT_ACTIONS)}, got {action!r}",
+    )
+    target = _require_slug(slug, "slug")
+    retired = session.retirements.retired()
+    if action == "retire":
+        known = {row["slug"] for row in session.conn.execute("SELECT slug FROM entities")}
+        _require(target in known, f"no entity {target!r} in the graph")
+        blockers = _live_items(session, target)
+        if blockers:
+            parts = []
+            for status, kind, count in blockers:
+                verb = "dismiss" if status == "confirmed" else "decide"
+                noun = kind if count == 1 else f"{kind}s"
+                parts.append(f"{count} {status} {noun}: {verb} {'it' if count == 1 else 'them'} first")
+            raise ToolError(f"{target!r} still has {'; '.join(parts)}")
+    else:
+        _require(target in retired, f"{target!r} is not retired")
+
+    with session.operation({"tool": "retire_entity", "slug": target, "action": action}) as op_id:
+        session.retirements.append(target, action, "retire_entity", op_id, reason)
+        _rebuild(session)
+
+    status = {"retire": "retired", "restore": "restored"}[action]
+    return {"slug": target, "status": status, "reason": reason}
+
+
 def resolve_assertion(
     session: Session, identifier: str, action: str, reason: str | None = None
 ) -> dict:
     if action not in VALID_ACTIONS:
-        raise ToolError(f"action must be 'confirm' or 'dismiss', got {action!r}")
+        raise ToolError(f"action must be 'confirm', 'dismiss' or 'reopen', got {action!r}")
 
     exists = session.conn.execute(
         "SELECT 1 FROM assertions WHERE id = ? UNION SELECT 1 FROM claims WHERE id = ?",

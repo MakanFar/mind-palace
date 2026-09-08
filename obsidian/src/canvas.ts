@@ -17,7 +17,7 @@ import {
   type SimulationNodeDatum,
 } from "d3-force";
 
-import { type GraphData, type GraphEdge, isLive, isLiveEdge } from "./graph";
+import { type GraphData, type GraphEdge, hasPending, isLive, isLiveEdge } from "./graph";
 import { EDGE_STYLE, colourFor, radiusFor, type EdgeKind } from "./palette";
 
 export type Selection =
@@ -29,10 +29,23 @@ export interface CanvasCallbacks {
   onSelect(selection: Selection | null): void;
 }
 
+/**
+ * Which links the canvas draws. "proposed" is the review mode: only links
+ * with a proposal still to decide, and only the nodes they touch, so the
+ * picture is the review queue and empties as decisions are made.
+ */
+export type EdgeMode = "all" | "confirmed" | "proposed";
+
 export interface CanvasFilters {
   hiddenTypes: Set<string>;
-  showProposed: boolean;
+  edgeMode: EdgeMode;
   focus: string | null;
+}
+
+export function linkShown(mode: EdgeMode, link: { kind: EdgeKind; pending: boolean }): boolean {
+  if (mode === "confirmed") return link.kind === "confirmed";
+  if (mode === "proposed") return link.pending;
+  return true;
 }
 
 interface Node extends SimulationNodeDatum {
@@ -45,6 +58,9 @@ interface Node extends SimulationNodeDatum {
 interface Link extends SimulationLinkDatum<Node> {
   id: string;
   kind: EdgeKind;
+  // Still carries a proposed assertion: a traversable edge can, when one
+  // member is confirmed and another is not.
+  pending: boolean;
   directed: boolean;
   selection: Selection;
   sourceSlug: string;
@@ -67,7 +83,7 @@ export class GraphCanvas {
   private nodes: Node[] = [];
   private links: Link[] = [];
   private byslug = new Map<string, Node>();
-  private filters: CanvasFilters = { hiddenTypes: new Set(), showProposed: true, focus: null };
+  private filters: CanvasFilters = { hiddenTypes: new Set(), edgeMode: "all", focus: null };
   private selection: Selection | null = null;
   private hovered: Selection | null = null;
   private transform = { x: 0, y: 0, k: 1 };
@@ -79,6 +95,9 @@ export class GraphCanvas {
   private neighbours = new Map<string, Set<string>>();
   private signature = "";
   private emphasised: { nodes: Set<string> | null; links: Set<string> | null } | null = null;
+  // In review mode a node is drawn only while it touches a shown link;
+  // rebuilt when the links or the filters change, not per frame.
+  private reviewable: Set<string> | null = null;
   // True while the container has no size: the view was opened in a hidden
   // tab or a collapsed pane, and the layout ran against a 1x1 box.
   private degenerate = true;
@@ -139,6 +158,7 @@ export class GraphCanvas {
       this.links.push({
         id: item.id,
         kind: "untyped",
+        pending: item.status === "proposed",
         directed: false,
         selection: { kind: "untyped", id: item.id },
         sourceSlug: item.source,
@@ -149,6 +169,7 @@ export class GraphCanvas {
     }
     this.neighbours = new Map();
     this.emphasised = null;
+    this.reviewable = null;
     for (const link of this.links) {
       this.adjacent(link.sourceSlug).add(link.targetSlug);
       this.adjacent(link.targetSlug).add(link.sourceSlug);
@@ -174,6 +195,7 @@ export class GraphCanvas {
     return {
       id: edge.key,
       kind: edge.traversable ? "confirmed" : "proposed",
+      pending: hasPending(edge),
       directed: edge.directed,
       selection: { kind: "edge", key: edge.key },
       sourceSlug: edge.source,
@@ -196,6 +218,7 @@ export class GraphCanvas {
     const focusChanged = filters.focus !== this.filters.focus;
     this.filters = filters;
     this.emphasised = null;
+    this.reviewable = null;
     const node = focusChanged && filters.focus ? this.byslug.get(filters.focus) : undefined;
     if (node) {
       const { width, height } = this.size();
@@ -209,6 +232,34 @@ export class GraphCanvas {
     this.selection = selection;
     this.emphasised = null;
     this.schedule();
+  }
+
+  /** Pan (never zoom) so the item is on screen; a no-op while it already is.
+   *  Stepping the review queue must not leave the reader looking at empty
+   *  space, but must not jitter the viewport for an item already in view. */
+  reveal(selection: Selection): void {
+    const points = this.pointsOf(selection);
+    if (!points.length) return;
+    const cx = points.reduce((sum, n) => sum + (n.x ?? 0), 0) / points.length;
+    const cy = points.reduce((sum, n) => sum + (n.y ?? 0), 0) / points.length;
+    const { width, height } = this.size();
+    const { k } = this.transform;
+    const sx = cx * k + this.transform.x;
+    const sy = cy * k + this.transform.y;
+    const margin = 40;
+    if (sx >= margin && sx <= width - margin && sy >= margin && sy <= height - margin) return;
+    this.transform = { k, x: width / 2 - cx * k, y: height / 2 - cy * k };
+    this.schedule();
+  }
+
+  private pointsOf(selection: Selection): Node[] {
+    if (selection.kind === "entity") {
+      const node = this.byslug.get(selection.slug);
+      return node ? [node] : [];
+    }
+    const id = selection.kind === "edge" ? selection.key : selection.id;
+    const link = this.links.find((l) => l.id === id);
+    return link ? [link.source as Node, link.target as Node] : [];
   }
 
   destroy(): void {
@@ -293,12 +344,28 @@ export class GraphCanvas {
     return null;
   }
 
-  private visible(node: Node): boolean {
+  private typeShown(node: Node): boolean {
     return !this.filters.hiddenTypes.has(node.type);
   }
 
+  private visible(node: Node): boolean {
+    if (!this.typeShown(node)) return false;
+    if (this.filters.edgeMode !== "proposed") return true;
+    if (!this.reviewable) {
+      this.reviewable = new Set();
+      for (const link of this.links) {
+        if (!linkShown("proposed", link)) continue;
+        const a = link.source as Node;
+        const b = link.target as Node;
+        if (!this.typeShown(a) || !this.typeShown(b)) continue;
+        this.reviewable.add(a.slug).add(b.slug);
+      }
+    }
+    return this.reviewable.has(node.slug);
+  }
+
   private linkVisible(link: Link): boolean {
-    if (link.kind !== "confirmed" && !this.filters.showProposed) return false;
+    if (!linkShown(this.filters.edgeMode, link)) return false;
     return this.visible(link.source as Node) && this.visible(link.target as Node);
   }
 
@@ -444,7 +511,10 @@ export class GraphCanvas {
       const style = EDGE_STYLE[link.kind];
       const emphasised = inLinks ? inLinks.has(link.id) : true;
       const dim = this.filters.focus && !emphasised ? DIM : !emphasised ? UNSELECTED : 1;
-      ctx.globalAlpha = style.alpha * dim;
+      // Proposals are drawn faint against confirmed edges; in review mode
+      // they are the subject, so the dash stays and the fade goes.
+      const alpha = this.filters.edgeMode === "proposed" ? 1 : style.alpha;
+      ctx.globalAlpha = alpha * dim;
       ctx.strokeStyle = inLinks?.has(link.id) && this.selection ? accent : muted;
       ctx.lineWidth = (link.id === hoveredId ? 2.5 : 1.2) / this.transform.k;
       ctx.setLineDash(style.dash.map((d) => d / this.transform.k));
@@ -480,8 +550,12 @@ export class GraphCanvas {
     for (const node of this.nodes) {
       if (!this.visible(node)) continue;
       const emphasised = inNodes ? inNodes.has(node.slug) : false;
+      // Reviewing a proposal needs both names; review mode shows few nodes.
       const show =
-        node.slug === hoveredSlug || emphasised || (this.transform.k > 1.2 && node.rank >= 3);
+        node.slug === hoveredSlug ||
+        emphasised ||
+        this.filters.edgeMode === "proposed" ||
+        (this.transform.k > 1.2 && node.rank >= 3);
       if (!show) continue;
       ctx.globalAlpha = this.filters.focus && !emphasised && node.slug !== hoveredSlug ? DIM : 1;
       ctx.fillText(node.slug, (node.x ?? 0) + node.radius + 3 / this.transform.k, (node.y ?? 0) + 4 / this.transform.k);

@@ -86,7 +86,8 @@ One view, one command, one ribbon icon, one settings tab.
 - **View.** An `ItemView` registered under `mind-palace-graph`, opened by the command
   "Open Mind Palace" or the ribbon icon. Left: the canvas. Right: the panel. Top: a bar
   with a search box, entity-type toggles (a legend sorted by count, the way Utopia
-  orders its legend), a "proposed" toggle, and an "as of" date field.
+  orders its legend), an edge mode (all, confirmed only, proposed only), and an "as of"
+  date field.
 - **Reading.** `graph.json` and `decisions.jsonl` are read through the vault adapter,
   because Obsidian's file index does not see dot-folders. The plugin polls both every
   two seconds while the view is open and re-renders when either's modification time
@@ -98,7 +99,9 @@ One view, one command, one ribbon icon, one settings tab.
   next Python sync.
 - **Writing.** Confirm and Dismiss append one JSON line to `decisions.jsonl` in exactly
   the shape `DecisionLog.append` writes: `op`, `ts`, `assertion`, `action`, `via`,
-  `reason`. `op` is `"obsidian_" + a random id`, `via` is `"obsidian"`. The Python side
+  `reason`. Undo appends a third action, `reopen`, which both folds read as "proposed"
+  again; it exists because the log had no way back to under-review, and "the opposite
+  action" is not an undo. `op` is `"obsidian_" + a random id`, `via` is `"obsidian"`. The Python side
   reads the file on its next open, sees the drift, and re-folds. The write uses the
   adapter's append so a concurrent Python write cannot be clobbered; the flock is not
   taken, since Obsidian cannot take it, and a single appended line is the smallest safe
@@ -116,6 +119,29 @@ One view, one command, one ribbon icon, one settings tab.
   dotted at a quarter, dismissed not drawn. Directed types get an arrowhead. Selecting
   an edge or node draws it and its neighbours in a warm highlight and dims the rest,
   the way Utopia keeps a selection legible without erasing where it came from.
+- **Review mode.** The edge mode "proposed only" draws just the links that still carry a
+  proposal to decide (an edge with any proposed member, or a proposed untyped assertion),
+  and only the nodes they touch, every one labelled and the dashes at full strength since
+  there is nothing confirmed to contrast with. The option shows the count. Clicking an
+  edge opens its Confirm and Dismiss cards in the panel, and an edge leaves the picture
+  once its last proposal is decided, so the view is the review queue and empties as the
+  reader works through it. "Confirmed only" hides everything not traversable.
+- **The review loop.** In review mode with nothing selected, the panel lists the queue;
+  a row selects its edge and pans it into view if it is off screen. With an edge selected
+  the panel says `3 of 47 to review`. Keys, while the view is focused and no field has
+  focus: `c` confirms and `d` dismisses the first pending card (with whatever reason was
+  typed into it), `n` and `p` step the queue with wrap-around, `r` focuses the reason
+  field and Escape hands the keys back. After a decision in review mode the view moves to
+  the next surviving item once the edge has nothing left to decide; in other modes the
+  selection stays put. Every decision shows a notice with an Undo button for eight
+  seconds; undo appends `reopen` and reselects the item.
+- **Queue order.** An "order" control beside the edge mode, shown in review mode only:
+  graph order, by note (a note's extractions together, under a heading with the note's
+  path, so they are judged with that note in mind), or by strength (strongest pending
+  assertion first, untyped last). Stepping and auto-advance follow the same order.
+- **All on this edge.** An edge with more than one pending assertion gets a row above its
+  cards that confirms or dismisses all of them with one reason; the lines go in one
+  append, and one Undo reopens them all.
 - **Focus.** Typing in the search box and choosing an entity centres it and shows its
   two-hop neighbourhood; escape returns to the overview.
 - **As of.** A date in the top bar dims every claim in the panel whose validity does not

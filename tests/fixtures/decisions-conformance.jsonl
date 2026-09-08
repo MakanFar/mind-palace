@@ -1,4 +1,6 @@
 {"action": "dismiss", "assertion": "x_1", "op": "op_1", "reason": null, "ts": "2026-09-06T00:00:00Z", "via": "resolve_assertion"}
 {"action":"confirm","assertion":"x_1","op":"obsidian_ABC","reason":"looks right","ts":"2026-09-06T00:01:00Z","via":"obsidian"}
 {"action": "confirm", "assertion": "k_2", "op": "op_3", "reason": null, "ts": "2026-09-06T00:02:00Z", "via": "resolve_assertion"}
+{"action": "confirm", "assertion": "x_3", "op": "op_5", "reason": null, "ts": "2026-09-06T00:03:00Z", "via": "resolve_assertion"}
+{"action":"reopen","assertion":"x_3","op":"obsidian_DEF","reason":null,"ts":"2026-09-06T00:04:00Z","via":"obsidian"}
 {"action": "confirm", "assertion": "k_torn", "op": "op_4", "ts": "2026-09-06T00:0

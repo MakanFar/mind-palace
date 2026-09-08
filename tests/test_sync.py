@@ -952,3 +952,41 @@ def test_a_unit_straddling_a_page_boundary_keeps_the_page_it_starts_on(conn, vau
     sync(conn, store, config, StubEmbedder(), {})
     locators = {r["ordinal"]: r["locator"] for r in conn.execute("SELECT ordinal, locator FROM text_units WHERE capture_id = 'c_s'")}
     assert locators == {0: "Page 1", 1: "Page 1"}
+
+
+# ---- retirements (docs/decisions/0004) --------------------------------------
+
+
+def test_sync_drops_retired_entities_and_tracks_the_log_for_drift(conn, vault, config):
+    paths, store = vault
+    add_note(store, "n_40", "typo")
+    sync(conn, store, config, StubEmbedder(), {}, retired={"typo"})
+    assert {r["slug"] for r in conn.execute("SELECT slug FROM entities")} == set()
+    assert not has_drift(conn, store)
+    paths.retirements_log.parent.mkdir(exist_ok=True)
+    paths.retirements_log.write_text('{"x": 1}\n')
+    assert has_drift(conn, store)
+
+
+def test_a_live_assertion_revives_a_retired_entity_as_an_issue(conn, vault, config):
+    _, store = vault
+    add_note(
+        store, "n_41", "alpha",
+        relationships=(RelationshipAssertion("x_41", "alpha", "beta", "contradicts", 5, "because."),),
+    )
+    report = sync(conn, store, config, StubEmbedder(), {}, retired={"beta"})
+    assert {r["slug"] for r in conn.execute("SELECT slug FROM entities")} == {"alpha", "beta"}
+    [issue] = [i for i in report.issues if i[1] == "retired_entity_revived"]
+    assert issue[0] == ".mindpalace/retirements.jsonl"
+    assert "'beta'" in issue[2]
+
+
+def test_a_retired_entity_page_is_reported_and_not_indexed(conn, vault, config):
+    _, store = vault
+    add_note(store, "n_42", "typo")
+    store.write_entity_page(EntityPage(slug="typo", type="concept", description="Prose."))
+    report = sync(conn, store, config, StubEmbedder(), {}, retired={"typo"})
+    kinds = {issue[1] for issue in report.issues}
+    assert "retired_entity_page" in kinds
+    docs = {r["doc_id"] for r in conn.execute("SELECT doc_id FROM docs")}
+    assert "e_typo" not in docs

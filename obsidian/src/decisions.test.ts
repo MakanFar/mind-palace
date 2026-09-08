@@ -74,6 +74,22 @@ describe("applyOverlay", () => {
   });
 });
 
+describe("reopen", () => {
+  it("folds and puts the assertion back to proposed, retracting traversability", () => {
+    const overlay = foldDecisions(
+      decisionLine("x_1", "confirm", null, new Date(), "a") + decisionLine("x_1", "reopen", null, new Date(), "b"),
+    );
+    expect(overlay.get("x_1")).toBe("reopen");
+    const g: GraphData = {
+      ...emptyGraph(),
+      edges: [{ ...graph.edges[0], traversable: true, weight: 1, assertions: [{ ...graph.edges[0].assertions[0], status: "confirmed" }] }],
+    };
+    const out = applyOverlay(g, overlay);
+    expect(out.edges[0].assertions[0].status).toBe("proposed");
+    expect(out.edges[0].traversable).toBe(false);
+  });
+});
+
 describe("decisionLine", () => {
   it("matches the Python DecisionLog shape with sorted keys", () => {
     const line = decisionLine("x_1", "confirm", null, new Date(Date.UTC(2026, 8, 6, 10, 0, 0)), "abc");
@@ -145,7 +161,7 @@ describe("conformance with the Python DecisionLog", () => {
 
   it("folds the shared fixture to the same map, torn final line included", () => {
     const overlay = foldDecisions(fixture);
-    expect([...overlay.entries()]).toEqual([["x_1", "confirm"], ["k_2", "confirm"]]);
+    expect([...overlay.entries()]).toEqual([["x_1", "confirm"], ["k_2", "confirm"], ["x_3", "reopen"]]);
   });
 
   it("treats a torn line before a trailing newline as final, like splitlines()", () => {

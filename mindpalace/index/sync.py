@@ -79,6 +79,7 @@ def _iter_source_files(store: VaultStore) -> Iterator[Path]:
         store.paths.mindpalace_md,
         store.paths.vocabulary_log,
         store.paths.merges_log,
+        store.paths.retirements_log,
     ):
         if dependency.exists():
             yield dependency
@@ -243,6 +244,7 @@ def _fold_with_quarantine(
     note_paths: dict[str, str],
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
     merges: Mapping[str, str] | None = None,
+    retired: Iterable[str] = (),
 ) -> tuple[GraphTables, set[str]]:
     """Fold, quarantining and retrying on a typed `FoldError` instead of
     letting it propagate out of `sync`.
@@ -282,6 +284,7 @@ def _fold_with_quarantine(
                     config,
                     adoptions=adoptions,
                     merges=merge_map,
+                    retired=retired,
                 ),
                 excluded,
             )
@@ -350,6 +353,7 @@ def fold_notes_with_quarantine(
     statuses: dict[str, str],
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
     merges: Mapping[str, str] | None = None,
+    retired: Iterable[str] = (),
 ) -> tuple[list[Note], dict[str, Note], GraphTables, list[tuple[str, str, str]]]:
     """Parse and fold every note currently on disk, quarantining anything
     `fold` rejects instead of raising.
@@ -374,8 +378,9 @@ def fold_notes_with_quarantine(
     notes, issues, _degraded, note_sources = _load_notes(store)
     note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
     tables, excluded = _fold_with_quarantine(
-        notes, statuses, config, issues, note_paths, adoptions, merges
+        notes, statuses, config, issues, note_paths, adoptions, merges, retired
     )
+    issues.extend(_revived_issues(tables))
     folded_notes = [note for note in notes if note.id not in excluded]
     notes_by_id = {note.id: note for note in folded_notes}
     return folded_notes, notes_by_id, tables, issues
@@ -642,6 +647,45 @@ def _merged_page_issues(
     return issues, orphaned
 
 
+def _retired_page_issues(
+    store: VaultStore, tables: GraphTables, entity_pages: list, retired: set[str]
+) -> tuple[list[tuple[str, str, str]], set[str]]:
+    """An entity page for a retired slug (docs/decisions/0004): the file stays,
+    like a merged-away page, but it is not a live entity and must not be
+    indexed as one. A revived slug is back in the graph, so its page is not
+    reported here."""
+    issues: list[tuple[str, str, str]] = []
+    orphaned: set[str] = set()
+    for page in entity_pages:
+        if page.slug not in retired or page.slug in tables.entities:
+            continue
+        orphaned.add(page.slug)
+        issues.append(
+            (
+                _relative(store, store.paths.entity_path(page.slug)),
+                "retired_entity_page",
+                f"{page.slug!r} is retired; this page is no longer an entity. "
+                f"Delete this file, or restore the entity",
+            )
+        )
+    return issues, orphaned
+
+
+def _revived_issues(tables: GraphTables) -> list[tuple[str, str, str]]:
+    """A retired slug that folded anyway (docs/decisions/0004 §Part 1): a live
+    assertion or claim names it, and hiding a reviewable item would be silent
+    loss, so it is back in the graph and this says so."""
+    return [
+        (
+            ".mindpalace/retirements.jsonl",
+            "retired_entity_revived",
+            f"{slug!r} is retired but a live assertion or claim names it, so it "
+            f"is back in the graph; decide that item and retire again, or restore",
+        )
+        for slug in tables.revived
+    ]
+
+
 def _signature_issues(
     store: VaultStore, tables: GraphTables, config: Config, note_paths: dict[str, str]
 ) -> list[tuple[str, str, str]]:
@@ -687,9 +731,11 @@ def sync(
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
     merges: Mapping[str, str] | None = None,
     kept: Iterable[tuple[str, str]] = (),
+    retired: Iterable[str] = (),
 ) -> SyncReport:
-    """`adoptions`, `merges`, `kept` are the folded vocabulary and merge logs
-    (see `Session.overlays`). Defaulted so a caller that has none still syncs.
+    """`adoptions`, `merges`, `kept`, `retired` are the folded vocabulary,
+    merge and retirement logs (see `Session.overlays`). Defaulted so a
+    caller that has none still syncs.
     `statuses` is the decision map or a callable that reads it; see
     `StatusSource` for why a caller should pass the callable."""
     # Hash every source file first: before the statuses are read, before the
@@ -702,9 +748,11 @@ def sync(
     captures, notes, issues, degraded, note_sources, capture_paths = _load_sources(store)
 
     note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
+    retired = set(retired)
     tables, excluded_notes = _fold_with_quarantine(
-        notes, statuses, config, issues, note_paths, adoptions, merges
+        notes, statuses, config, issues, note_paths, adoptions, merges, retired
     )
+    issues.extend(_revived_issues(tables))
 
     # A note the graph rejected (unknown edge type, duplicate assertion id)
     # must still be findable so the user can go fix it -- spec §10 applies
@@ -748,6 +796,9 @@ def sync(
     degraded.extend(entity_degraded)
     merged_issues, orphaned = _merged_page_issues(store, tables, entity_pages)
     issues.extend(merged_issues)
+    retired_issues, retired_pages = _retired_page_issues(store, tables, entity_pages, retired)
+    issues.extend(retired_issues)
+    orphaned |= retired_pages
     for page in entity_pages:
         if page.slug in orphaned:
             continue
@@ -969,6 +1020,7 @@ def export_graph(
     statuses: StatusSource,
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
     merges: Mapping[str, str] | None = None,
+    retired: Iterable[str] = (),
 ) -> None:
     """Rewrite graph.json from the sources and the tables as they stand,
     without touching the cache or the embedder.
@@ -980,7 +1032,7 @@ def export_graph(
     captures, notes, issues, _degraded, note_sources, capture_paths = _load_sources(store)
     note_paths = {note_id: path for note_id, (path, _raw) in note_sources.items()}
     tables, excluded_notes = _fold_with_quarantine(
-        notes, resolve_statuses(statuses), config, issues, note_paths, adoptions, merges
+        notes, resolve_statuses(statuses), config, issues, note_paths, adoptions, merges, retired
     )
     folded_notes = [note for note in notes if note.id not in excluded_notes]
     all_units = [unit for capture in captures for unit in capture_units(capture)]

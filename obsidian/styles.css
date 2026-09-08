@@ -186,3 +186,29 @@
   background: var(--interactive-accent);
   color: var(--text-on-accent);
 }
+
+.mp-position {
+  margin: 0 0 6px;
+  font-size: var(--font-ui-smaller);
+}
+
+.mp-undo {
+  margin-left: 8px;
+}
+
+.mp-group {
+  margin: 8px 0 2px;
+  font-size: var(--font-ui-smaller);
+}
+
+.mp-all {
+  background: var(--background-secondary);
+}
+
+.mp-retire {
+  color: var(--text-error);
+}
+
+.mp-retire:disabled {
+  opacity: 0.5;
+}

@@ -9,10 +9,11 @@
 
 import type { GraphData } from "./graph";
 
-export type Action = "confirm" | "dismiss";
+export type Action = "confirm" | "dismiss" | "reopen";
 export type Overlay = Map<string, Action>;
 
-const STATUS = { confirm: "confirmed", dismiss: "dismissed" } as const;
+// "reopen" is the undo: the assertion goes back under review.
+const STATUS = { confirm: "confirmed", dismiss: "dismissed", reopen: "proposed" } as const;
 
 const REQUIRED_KEYS = ["op", "ts", "assertion", "action", "via"] as const;
 
@@ -39,14 +40,15 @@ export function foldDecisions(text: string): Overlay {
     if (missing.length) {
       throw new Error(`decisions.jsonl: line ${index + 1} is missing ${missing.join(", ")}`);
     }
-    if (
-      typeof record.assertion === "string" &&
-      (record.action === "confirm" || record.action === "dismiss")
-    ) {
+    if (typeof record.assertion === "string" && isAction(record.action)) {
       overlay.set(record.assertion, record.action);
     }
   });
   return overlay;
+}
+
+function isAction(value: unknown): value is Action {
+  return value === "confirm" || value === "dismiss" || value === "reopen";
 }
 
 export function applyOverlay(graph: GraphData, overlay: Overlay): GraphData {

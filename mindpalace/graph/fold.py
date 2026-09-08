@@ -15,7 +15,7 @@ from mindpalace.config import Config
 from mindpalace.ids import aggregate_key, slugify
 from mindpalace.models import Note
 
-ACTION_TO_STATUS = {"confirm": "confirmed", "dismiss": "dismissed"}
+ACTION_TO_STATUS = {"confirm": "confirmed", "dismiss": "dismissed", "reopen": "proposed"}
 UNKNOWN_TYPE = "unknown"
 #: A claim a *confirmed* later claim names in `supersedes`
 #: (docs/decisions/0001 §4). Never a decision-log action: it is derived.
@@ -114,6 +114,9 @@ class FoldedEntity:
     # Every unit that mentions this entity: its own instances plus the
     # assertions and claims it is an endpoint of (docs/decisions/0002).
     text_unit_ids: tuple[str, ...] = ()
+    # An entity instance in some note named it, as opposed to an endpoint
+    # only an assertion or claim implied (docs/decisions/0004 §Part 1).
+    declared: bool = False
 
 
 @dataclass(frozen=True)
@@ -164,6 +167,9 @@ class GraphTables:
     aggregates: dict[str, Aggregate] = field(default_factory=dict)
     assertions: dict[str, FoldedAssertion] = field(default_factory=dict)
     claims: dict[str, FoldedClaim] = field(default_factory=dict)
+    # Retired slugs that folded anyway because something live names them
+    # (docs/decisions/0004 §Part 1); `sync` reports each one.
+    revived: tuple[str, ...] = ()
 
 
 def _status(item_id: str, statuses: dict[str, str]) -> str:
@@ -215,18 +221,26 @@ def fold(
     *,
     adoptions: Mapping[str, Mapping[str, str]] | None = None,
     merges: Mapping[str, str] | None = None,
+    retired: Iterable[str] = (),
 ) -> GraphTables:
     """`adoptions` is `VocabularyLog.adoptions()`; `merges` is
-    `MergeLog.merges()`. Both default to empty so callers that predate them
-    (and every test that folds a bare note list) keep working."""
+    `MergeLog.merges()`; `retired` is `RetirementLog.retired()`. All default
+    to empty so callers that predate them (and every test that folds a bare
+    note list) keep working."""
     ordered = sorted(notes, key=lambda note: (note.created, note.id))
     canonical_of = resolve_merges(merges)
+    retired_set = {canonical_of.get(slug, slug) for slug in retired}
 
     def canon(slug: str) -> str:
         return canonical_of.get(slug, slug)
 
     entity_types: dict[str, str] = {}
     entity_notes: dict[str, list[str]] = {}
+    # Which slugs earn a node (docs/decisions/0004 §Part 1): declared by an
+    # entity instance, or live as the endpoint or subject of an assertion or
+    # claim that is not dismissed. A dismissed relationship implies nothing.
+    declared_slugs: set[str] = set()
+    live: set[str] = set()
     entity_units: dict[str, set[str]] = {}
     merged_from: dict[str, set[str]] = {}
     assertions: dict[str, FoldedAssertion] = {}
@@ -258,6 +272,7 @@ def fold(
                 if declared is not None and declared not in config.entity_types:
                     declared = None
             touch(slugify(instance.name), note.id, declared, instance.text_unit_ids)
+            declared_slugs.add(canon(slugify(instance.name)))
 
         for raw in note.relationship_assertions:
             if raw.type is not None and raw.type not in config.edge_types:
@@ -272,6 +287,8 @@ def fold(
             source, target = canon(slugify(raw.source)), canon(slugify(raw.target))
             touch(slugify(raw.source), note.id, None, raw.text_unit_ids)
             touch(slugify(raw.target), note.id, None, raw.text_unit_ids)
+            if _status(raw.id, statuses) != "dismissed":
+                live.update((source, target))
 
             # An adoption may name a type that has since left the config.
             # That is not the note's fault: the proposal simply stands.
@@ -320,6 +337,8 @@ def fold(
                 )
             subject = canon(slugify(raw_claim.subject))
             touch(slugify(raw_claim.subject), note.id, None, raw_claim.text_unit_ids)
+            if _status(raw_claim.id, statuses) != "dismissed":
+                live.add(subject)
             claims[raw_claim.id] = FoldedClaim(
                 id=raw_claim.id,
                 note_id=note.id,
@@ -361,6 +380,13 @@ def fold(
             degree[left] = degree.get(left, 0) + 1
             degree[right] = degree.get(right, 0) + 1
 
+    # A live item outranks a retirement: hiding a reviewable proposal would
+    # be silent loss. A bare declaration does not; that is what retire is for.
+    def folds(slug: str) -> bool:
+        if slug in live:
+            return True
+        return slug in declared_slugs and slug not in retired_set
+
     entities = {
         slug: FoldedEntity(
             slug=slug,
@@ -369,13 +395,17 @@ def fold(
             note_ids=tuple(entity_notes[slug]),
             merged_from=tuple(sorted(merged_from.get(slug, ()))),
             text_unit_ids=tuple(sorted(entity_units.get(slug, ()))),
+            declared=slug in declared_slugs,
         )
         for slug in sorted(entity_types)
+        if folds(slug)
     }
+    revived = tuple(sorted(slug for slug in retired_set if slug in live and slug in entity_types))
 
     return GraphTables(
         entities=entities,
         aggregates=aggregates,
         assertions=assertions,
         claims=claims,
+        revived=revived,
     )

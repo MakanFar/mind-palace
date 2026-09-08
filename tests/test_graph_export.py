@@ -132,3 +132,18 @@ def test_a_decision_appended_after_the_statuses_were_read_is_still_drift(tmp_pat
         with s.write_lock():
             sync(s.conn, s.store, s.config, s.embedder, statuses_then_append, **s.overlays())
         assert has_drift(s.conn, s.store)
+
+
+def test_graph_json_says_whether_an_entity_was_declared(session):
+    capture = save_capture(session, "Kaplan 2020 supports scaling laws.")
+    write_note(
+        session, capture["id"], "Body.",
+        entities=[{"name": "kaplan-2020", "type": "paper", "description": "the paper"}],
+        relationship_assertions=[
+            {"source": "kaplan-2020", "target": "scaling-laws", "type": "supports", "description": "m"},
+        ],
+    )
+    payload = json.loads(session.paths.graph_json.read_text())
+    slugs = {e["slug"]: e for e in payload["entities"]}
+    assert slugs["kaplan-2020"]["declared"] is True
+    assert slugs["scaling-laws"]["declared"] is False

@@ -1,21 +1,42 @@
-/** Search, type legend, proposed toggle, as-of (docs/decisions/0003 §Part 3). */
+/** Search, type legend, edge mode, as-of (docs/decisions/0003 §Part 3). */
 
+import type { EdgeMode } from "./canvas";
 import type { GraphData } from "./graph";
 import { colourFor } from "./palette";
+import { type QueueOrder, reviewQueue } from "./review";
 
 export interface TopbarState {
   hiddenTypes: Set<string>;
-  showProposed: boolean;
+  edgeMode: EdgeMode;
+  queueOrder: QueueOrder;
   asOf: string | null;
   focus: string | null;
+}
+
+const QUEUE_ORDERS: Record<QueueOrder, string> = {
+  graph: "graph order",
+  note: "by note",
+  strength: "by strength",
+};
+
+const EDGE_MODES: Record<EdgeMode, string> = {
+  all: "all edges",
+  confirmed: "confirmed only",
+  proposed: "proposed only",
+};
+
+/** How many links review mode would draw: the size of the review queue. */
+export function pendingCount(graph: GraphData): number {
+  return reviewQueue(graph).length;
 }
 
 let instances = 0;
 
 export class Topbar {
   private readonly listId = `mp-entities-${++instances}`;
-  private state: TopbarState = { hiddenTypes: new Set(), showProposed: true, asOf: null, focus: null };
+  private state: TopbarState = { hiddenTypes: new Set(), edgeMode: "all", queueOrder: "graph", asOf: null, focus: null };
   private readonly legend: HTMLElement;
+  private readonly proposedOption: HTMLOptionElement;
   private readonly datalist: HTMLDataListElement;
   private slugs = new Set<string>();
 
@@ -41,12 +62,29 @@ export class Topbar {
       }
     });
     this.legend = container.createDiv({ cls: "mp-legend" });
-    const proposed = container.createEl("label", { cls: "mp-toggle" });
-    const box = proposed.createEl("input", { attr: { type: "checkbox" } });
-    box.checked = true;
-    proposed.createSpan({ text: " proposed" });
-    box.addEventListener("change", () => {
-      this.state.showProposed = box.checked;
+    const edges = container.createEl("label", { cls: "mp-toggle" });
+    edges.createSpan({ text: "edges " });
+    const mode = edges.createEl("select", { cls: "dropdown" });
+    const options = new Map<EdgeMode, HTMLOptionElement>();
+    for (const [value, text] of Object.entries(EDGE_MODES) as [EdgeMode, string][]) {
+      options.set(value, mode.createEl("option", { text, attr: { value } }));
+    }
+    this.proposedOption = options.get("proposed")!;
+    // The queue order only means something while the queue is on screen.
+    const order = container.createEl("label", { cls: "mp-toggle" });
+    order.createSpan({ text: "order " });
+    const orderSelect = order.createEl("select", { cls: "dropdown" });
+    for (const [value, text] of Object.entries(QUEUE_ORDERS) as [QueueOrder, string][]) {
+      orderSelect.createEl("option", { text, attr: { value } });
+    }
+    order.hide();
+    orderSelect.addEventListener("change", () => {
+      this.state.queueOrder = orderSelect.value as QueueOrder;
+      this.emit();
+    });
+    mode.addEventListener("change", () => {
+      this.state.edgeMode = mode.value as EdgeMode;
+      order.toggle(this.state.edgeMode === "proposed");
       this.emit();
     });
     const asOf = container.createEl("label", { cls: "mp-toggle" });
@@ -60,6 +98,9 @@ export class Topbar {
 
   setGraph(graph: GraphData): void {
     this.slugs = new Set(graph.entities.map((e) => e.slug));
+    // The queue length sits on the option so it is readable before and
+    // after switching into review mode.
+    this.proposedOption.text = `${EDGE_MODES.proposed} (${pendingCount(graph)})`;
     // A focus whose entity a merge or rename retired would otherwise dim the
     // whole canvas around a node that no longer exists.
     if (this.state.focus && !this.slugs.has(this.state.focus)) {

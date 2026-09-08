@@ -54,6 +54,15 @@ class MindPalaceSettingTab extends PluginSettingTab {
         }),
       );
     new Setting(containerEl)
+      .setName("Retirements file")
+      .setDesc("Vault-relative path of retirements.jsonl; retiring an entity appends here.")
+      .addText((text) =>
+        text.setValue(this.plugin.settings.retirementsPath).onChange(async (value) => {
+          this.plugin.settings.retirementsPath = value.trim() || DEFAULT_SETTINGS.retirementsPath;
+          await this.plugin.saveSettings();
+        }),
+      );
+    new Setting(containerEl)
       .setName("Decisions file")
       .setDesc("Vault-relative path of decisions.jsonl; confirm and dismiss append here.")
       .addText((text) =>

@@ -7,6 +7,9 @@ export interface GraphEntity {
   type: string;
   rank: number;
   merged_from: string[];
+  /** Named by an entity instance in some note, not just implied by an
+   *  assertion (docs/decisions/0004). Absent in an older export: declared. */
+  declared?: boolean;
   description: string;
   stale: boolean;
   note_ids: string[];
@@ -100,6 +103,11 @@ export function isLiveEdge(edge: GraphEdge): boolean {
   return edge.assertions.some(isLive);
 }
 
+/** An edge still has something to review while any member is proposed. */
+export function hasPending(edge: GraphEdge): boolean {
+  return edge.assertions.some((a) => a.status === "proposed");
+}
+
 export function parseGraph(text: string): GraphData {
   const data = JSON.parse(text) as Partial<GraphData>;
   if (data.version !== GRAPH_VERSION) {
@@ -122,4 +130,26 @@ export function emptyGraph(): GraphData {
     notes: {},
     units: {},
   };
+}
+
+/** Slugs named by an assertion or claim that is not dismissed: the ones
+ *  that keep an entity in the graph (docs/decisions/0004 §Part 1). */
+export function liveSlugs(graph: GraphData): Set<string> {
+  const live = new Set<string>();
+  for (const edge of graph.edges) {
+    if (edge.assertions.some(isLive)) live.add(edge.source).add(edge.target);
+  }
+  for (const item of graph.untyped) {
+    if (isLive(item)) live.add(item.source).add(item.target);
+  }
+  for (const claim of graph.claims) {
+    if (isLive(claim)) live.add(claim.subject);
+  }
+  return live;
+}
+
+/** Entities with nothing live attached: what retire would accept. */
+export function isolatedEntities(graph: GraphData): GraphEntity[] {
+  const live = liveSlugs(graph);
+  return graph.entities.filter((e) => !live.has(e.slug));
 }

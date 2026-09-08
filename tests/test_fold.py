@@ -291,6 +291,16 @@ def test_unknown_edge_type_error_carries_structured_attributes(config):
     assert excinfo.value.assertion_id == "x_1"
 
 
+def test_a_reopened_assertion_folds_as_proposed_again(config):
+    note = make_note(
+        "n_01", "2026-08-01T00:00:00Z", relationships=[rel("x_1", "a", "b")]
+    )
+    tables = fold([note], {"x_1": "reopen"}, config)
+    assert tables.assertions["x_1"].status == "proposed"
+    [aggregate] = tables.aggregates.values()
+    assert aggregate.traversable is False
+
+
 def test_unrecognized_decision_action_is_rejected(config):
     note = make_note(
         "n_01", "2026-08-01T00:00:00Z", relationships=[rel("x_1", "a", "b")]
@@ -484,3 +494,69 @@ def test_fold_carries_unit_provenance_onto_entities_and_items(config):
     assert tables.claims["k_1"].text_unit_ids == ("u_1_0002",)
     assert tables.entities["a"].text_unit_ids == ("u_1_0000", "u_1_0001")
     assert tables.entities["b"].text_unit_ids == ("u_1_0001", "u_1_0002")
+
+
+# ---- retiring an entity (docs/decisions/0004) ------------------------------
+
+
+def test_a_dismissed_only_endpoint_is_not_an_entity(config):
+    """A wrong relationship, once dismissed, must not leave its endpoints
+    behind; reopen brings them back because the fold reruns from statuses."""
+    note = make_note("n_01", "2026-08-01T00:00:00Z", relationships=[rel("x_1", "a", "b")])
+    tables = fold([note], {"x_1": "dismiss"}, config)
+    assert set(tables.entities) == set()
+    assert "x_1" in tables.assertions
+    assert set(fold([note], {"x_1": "reopen"}, config).entities) == {"a", "b"}
+
+
+def test_a_dismissed_only_claim_subject_is_not_an_entity(config):
+    note = make_note(
+        "n_01", "2026-08-01T00:00:00Z",
+        claims=[ClaimAssertion(id="k_1", subject="a", text="t")],
+    )
+    assert set(fold([note], {"k_1": "dismiss"}, config).entities) == set()
+    assert set(fold([note], {}, config).entities) == {"a"}
+
+
+def test_a_declared_entity_survives_its_only_assertion_being_dismissed(config):
+    note = make_note(
+        "n_01", "2026-08-01T00:00:00Z",
+        entities=[EntityInstance("a", "concept", "…")],
+        relationships=[rel("x_1", "a", "b")],
+    )
+    tables = fold([note], {"x_1": "dismiss"}, config)
+    assert set(tables.entities) == {"a"}
+    assert tables.entities["a"].declared is True
+
+
+def test_an_endpoint_only_entity_is_not_declared(config):
+    note = make_note("n_01", "2026-08-01T00:00:00Z", relationships=[rel("x_1", "a", "b")])
+    tables = fold([note], {}, config)
+    assert tables.entities["a"].declared is False
+
+
+def test_a_retired_entity_is_dropped_from_the_fold(config):
+    note = make_note(
+        "n_01", "2026-08-01T00:00:00Z",
+        entities=[EntityInstance("a", "concept", "…")],
+    )
+    tables = fold([note], {}, config, retired={"a"})
+    assert "a" not in tables.entities
+    assert tables.revived == ()
+
+
+def test_a_live_assertion_revives_a_retired_entity_and_says_so(config):
+    note = make_note("n_01", "2026-08-01T00:00:00Z", relationships=[rel("x_1", "a", "b")])
+    tables = fold([note], {}, config, retired={"a"})
+    assert "a" in tables.entities
+    assert tables.revived == ("a",)
+
+
+def test_a_retirement_is_resolved_through_merges(config):
+    """Retire the canonical name: the merged-away alias goes with it."""
+    note = make_note(
+        "n_01", "2026-08-01T00:00:00Z",
+        entities=[EntityInstance("old", "concept", "…")],
+    )
+    tables = fold([note], {}, config, merges={"old": "new"}, retired={"new"})
+    assert tables.entities == {}
