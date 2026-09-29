@@ -8,7 +8,7 @@ from mindpalace.tools import (
     graph_stats,
     neighbors,
     read,
-    resolve_assertion,
+    decide,
     save_capture,
     search_global,
     search_local,
@@ -66,7 +66,7 @@ def test_neighbors_are_empty_until_confirmation(populated):
 
 def test_neighbors_appear_once_confirmed(populated):
     session, _, note = populated
-    resolve_assertion(session, note["relationship_assertions"][0]["id"], "confirm")
+    decide(session, note["relationship_assertions"][0]["id"], "confirm", "test")
     result = neighbors(session, "e_scaling-laws")
     assert result["neighbours"][0]["slug"] == "data-exhaustion"
     assert result["neighbours"][0]["type"] == "contradicts"
@@ -74,7 +74,7 @@ def test_neighbors_appear_once_confirmed(populated):
 
 def test_neighbors_filter_by_edge_type(populated):
     session, _, note = populated
-    resolve_assertion(session, note["relationship_assertions"][0]["id"], "confirm")
+    decide(session, note["relationship_assertions"][0]["id"], "confirm", "test")
     assert neighbors(session, "e_scaling-laws", edge_types=["supports"])["neighbours"] == []
 
 

@@ -1106,7 +1106,15 @@ def graph_stats(session: Session) -> dict:
     }
 
 
-VALID_ACTIONS = {"confirm": "confirmed", "dismiss": "dismissed", "reopen": "proposed"}
+DECISION_ACTIONS = {"confirm": "confirmed", "dismiss": "dismissed", "reopen": "proposed"}
+#: What the assistant may decide alone (docs/decisions/0005): both only ever
+#: remove structure or put it back under review.
+ASSISTANT_ACTIONS = ("dismiss", "reopen")
+CONFIRM_NEEDS_A_HUMAN = (
+    "confirming needs the user, not the assistant: call `review` so they decide "
+    "each proposal themselves, or they can confirm in the Obsidian window or with "
+    "`mindpalace review` (docs/decisions/0005)"
+)
 
 
 def propose_relationship(
@@ -1330,26 +1338,59 @@ def retire_entity(
     return {"slug": target, "status": status, "reason": reason}
 
 
-def resolve_assertion(
-    session: Session, identifier: str, action: str, reason: str | None = None
-) -> dict:
-    if action not in VALID_ACTIONS:
-        raise ToolError(f"action must be 'confirm', 'dismiss' or 'reopen', got {action!r}")
+def decide(
+    session: Session,
+    identifier: str,
+    action: str,
+    via: str,
+    reason: str | None = None,
+    *,
+    rebuild: bool = True,
+    require_proposed: bool = False,
+) -> bool:
+    """Append one review decision (docs/decisions/0005 §Part 2).
 
+    The only writer of `decisions.jsonl` on the Python side. `via` names who
+    decided. `require_proposed` re-checks, under the vault lock and against
+    the log rather than the cache, that nobody decided the item while a
+    person was being asked; it returns False and writes nothing if so.
+    `rebuild=False` is for a caller that decides several items and rebuilds
+    once at the end.
+    """
+    _require(
+        action in DECISION_ACTIONS,
+        f"action must be one of {sorted(DECISION_ACTIONS)}, got {action!r}",
+    )
     exists = session.conn.execute(
         "SELECT 1 FROM assertions WHERE id = ? UNION SELECT 1 FROM claims WHERE id = ?",
         (identifier, identifier),
     ).fetchone()
-    if exists is None:
-        raise ToolError(f"no such assertion: {identifier}")
+    _require(exists is not None, f"no such assertion: {identifier}")
 
     with session.operation(
-        {"tool": "resolve_assertion", "assertion": identifier, "action": action}
+        {"tool": "decide", "assertion": identifier, "action": action, "via": via}
     ) as op_id:
-        session.decisions.append(identifier, action, "resolve_assertion", op_id, reason)
-        _rebuild(session)
+        # Absent from the log, or last reopened: still proposed.
+        if require_proposed and session.statuses().get(identifier, "reopen") != "reopen":
+            return False
+        session.decisions.append(identifier, action, via, op_id, reason)
+        if rebuild:
+            _rebuild(session)
+    return True
 
-    return {"id": identifier, "status": VALID_ACTIONS[action], "reason": reason}
+
+def resolve_assertion(
+    session: Session, identifier: str, action: str, reason: str | None = None
+) -> dict:
+    """The assistant's decision tool: dismiss or reopen, never confirm."""
+    if action == "confirm":
+        raise ToolError(CONFIRM_NEEDS_A_HUMAN)
+    _require(
+        action in ASSISTANT_ACTIONS,
+        f"action must be 'dismiss' or 'reopen', got {action!r}",
+    )
+    decide(session, identifier, action, "resolve_assertion", reason)
+    return {"id": identifier, "status": DECISION_ACTIONS[action], "reason": reason}
 
 
 def _endpoint_snippet(session: Session, slug: str) -> str:

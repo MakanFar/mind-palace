@@ -4,7 +4,7 @@ import pytest
 
 from mindpalace.embed import StubEmbedder
 from mindpalace.session import Session
-from mindpalace.tools import resolve_assertion, save_capture, write_note
+from mindpalace.tools import decide, save_capture, write_note
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def test_sync_writes_graph_json_with_the_contract_shape(session):
         claim_assertions=[{"subject": "scaling-laws", "text": "Coined 2020.", "valid_from": "2020"}],
     )
     [typed, untyped] = note["relationship_assertions"]
-    resolve_assertion(session, typed["id"], "confirm")
+    decide(session, typed["id"], "confirm", "test")
 
     payload = json.loads(session.paths.graph_json.read_text())
     assert payload["version"] == 1 and payload["generated_at"].endswith("Z")
@@ -74,7 +74,7 @@ def test_cluster_refreshes_graph_json(session):
     write_note(session, save_capture(session, "x")["id"], "Body.", entities=[
         {"name": "a", "type": "concept", "description": "d"}, {"name": "b", "type": "concept", "description": "d"}])
     link = propose_relationship(session, "a", "b", "relates-to", "because")
-    resolve_assertion(session, link["id"], "confirm")
+    decide(session, link["id"], "confirm", "test")
     assert json.loads(session.paths.graph_json.read_text())["communities"] == []
     cluster_tool(session, force=True)
     communities = json.loads(session.paths.graph_json.read_text())["communities"]

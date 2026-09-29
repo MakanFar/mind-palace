@@ -9,6 +9,7 @@ from mindpalace.session import Session
 from mindpalace.tools import (
     ToolError,
     cluster_tool,
+    decide,
     propose_relationship,
     rebuild_tool,
     resolve_assertion,
@@ -62,9 +63,33 @@ def test_propose_relationship_keeps_an_unknown_type_as_a_proposal(session):
     assert "untyped" in result["landed"]
 
 
-def test_resolve_assertion_confirms(with_assertion):
+def test_resolve_assertion_refuses_confirm(with_assertion):
+    """docs/decisions/0005: the assistant may not confirm, only a person."""
     session, assertion_id = with_assertion
-    assert resolve_assertion(session, assertion_id, "confirm")["status"] == "confirmed"
+    with pytest.raises(ToolError, match="review"):
+        resolve_assertion(session, assertion_id, "confirm")
+    assert session.decisions.entries() == []
+
+
+def test_resolve_assertion_logs_the_assistant_as_the_decider(with_assertion):
+    session, assertion_id = with_assertion
+    resolve_assertion(session, assertion_id, "dismiss", reason="wrong sense")
+    resolve_assertion(session, assertion_id, "reopen")
+    assert [(d.action, d.via) for d in session.decisions.entries()] == [
+        ("dismiss", "resolve_assertion"),
+        ("reopen", "resolve_assertion"),
+    ]
+
+
+def test_decide_confirms_and_records_who_decided(with_assertion):
+    session, assertion_id = with_assertion
+    assert decide(session, assertion_id, "confirm", "cli", "looks right") is True
+    [entry] = session.decisions.entries()
+    assert (entry.action, entry.via, entry.reason) == ("confirm", "cli", "looks right")
+    status = session.conn.execute(
+        "SELECT status FROM assertions WHERE id = ?", (assertion_id,)
+    ).fetchone()[0]
+    assert status == "confirmed"
 
 
 def test_resolve_assertion_dismisses(with_assertion):
@@ -74,14 +99,41 @@ def test_resolve_assertion_dismisses(with_assertion):
 
 
 def test_a_dismissal_is_reversible_by_explicit_human_action(with_assertion):
-    """Spec §7.3: dismissal is terminal for the proposal loop, not for the human.
-    Forcing a whole new assertion to undo a mis-click buys no safety, and every
-    flip is recorded in the decision log anyway."""
+    """Spec §7.3: dismissal is terminal for the proposal loop, not for the human."""
     session, assertion_id = with_assertion
     resolve_assertion(session, assertion_id, "dismiss", reason="wrong sense")
-    assert resolve_assertion(session, assertion_id, "confirm")["status"] == "confirmed"
-    actions = [entry.action for entry in session.decisions.entries()]
-    assert actions == ["dismiss", "confirm"]
+    decide(session, assertion_id, "confirm", "cli")
+    assert [e.action for e in session.decisions.entries()] == ["dismiss", "confirm"]
+
+
+def test_decide_with_require_proposed_skips_a_decided_item(with_assertion):
+    session, assertion_id = with_assertion
+    decide(session, assertion_id, "dismiss", "obsidian")
+    assert decide(session, assertion_id, "confirm", "chat_review", require_proposed=True) is False
+    assert [e.action for e in session.decisions.entries()] == ["dismiss"]
+
+
+def test_decide_with_require_proposed_accepts_a_reopened_item(with_assertion):
+    session, assertion_id = with_assertion
+    decide(session, assertion_id, "dismiss", "obsidian")
+    decide(session, assertion_id, "reopen", "obsidian")
+    assert decide(session, assertion_id, "confirm", "chat_review", require_proposed=True) is True
+
+
+def test_decide_without_rebuild_leaves_the_cache_for_later(with_assertion):
+    session, assertion_id = with_assertion
+    decide(session, assertion_id, "confirm", "chat_review", rebuild=False)
+    status = session.conn.execute(
+        "SELECT status FROM assertions WHERE id = ?", (assertion_id,)
+    ).fetchone()[0]
+    assert status == "proposed"
+    assert session.statuses() == {assertion_id: "confirm"}
+
+
+def test_decide_rejects_an_unknown_action(with_assertion):
+    session, assertion_id = with_assertion
+    with pytest.raises(ToolError, match="action"):
+        decide(session, assertion_id, "maybe", "cli")
 
 
 def test_previously_dismissed_pairs_are_surfaced_not_suppressed(session):
@@ -122,7 +174,7 @@ def test_resolve_assertion_rejects_an_unknown_action(with_assertion):
 
 def test_resolve_assertion_rejects_an_unknown_id(session):
     with pytest.raises(ToolError, match="x_ghost"):
-        resolve_assertion(session, "x_ghost", "confirm")
+        resolve_assertion(session, "x_ghost", "dismiss")
 
 
 def test_review_queue_separates_proposals_from_issues(with_assertion):
@@ -198,7 +250,7 @@ def test_review_queue_ranks_by_asserted_strength(session):
 
 def test_review_queue_drops_resolved_proposals(with_assertion):
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     assert review_queue(session)["proposals"] == []
 
 
@@ -211,7 +263,7 @@ def test_cluster_refuses_below_the_threshold(with_assertion):
 
 def test_cluster_with_force_partitions_a_small_graph(with_assertion):
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     result = cluster_tool(session, force=True)
     assert result["clustered"] is True
     assert result["communities"]
@@ -228,7 +280,7 @@ def test_write_entity_description_clears_staleness(with_assertion):
 
 def test_write_community_report_rejects_unresolvable_citations(with_assertion):
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     cluster_tool(session, force=True)
     lineage_id = session.conn.execute(
         "SELECT lineage_id FROM communities LIMIT 1"
@@ -248,7 +300,7 @@ def test_write_community_report_rejects_unresolvable_citations(with_assertion):
 
 def test_write_community_report_stores_a_valid_report(with_assertion):
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     cluster_tool(session, force=True)
     lineage_id = session.conn.execute(
         "SELECT lineage_id FROM communities LIMIT 1"
@@ -275,7 +327,7 @@ def test_write_community_report_stores_a_valid_report(with_assertion):
 
 def test_write_community_report_requires_every_finding_to_be_grounded(with_assertion):
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     cluster_tool(session, force=True)
     lineage_id = session.conn.execute(
         "SELECT lineage_id FROM communities LIMIT 1"
@@ -296,7 +348,7 @@ def test_write_community_report_requires_every_finding_to_be_grounded(with_asser
 def test_write_community_report_rejects_a_citation_to_a_missing_note(with_assertion):
     """Note and capture ids used to be waved through without checking."""
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     cluster_tool(session, force=True)
     lineage_id = session.conn.execute(
         "SELECT lineage_id FROM communities LIMIT 1"
@@ -316,7 +368,7 @@ def test_write_community_report_rejects_a_citation_to_a_missing_note(with_assert
 
 def test_reclustering_preserves_report_lineage(with_assertion):
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     cluster_tool(session, force=True)
     before = session.conn.execute("SELECT lineage_id FROM communities").fetchone()[0]
     cluster_tool(session, force=True)
@@ -358,7 +410,7 @@ def test_reclustering_marks_an_affected_report_stale_immediately(session):
             }
         ],
     )
-    resolve_assertion(session, note["relationship_assertions"][0]["id"], "confirm")
+    decide(session, note["relationship_assertions"][0]["id"], "confirm", "test")
     clustered = cluster_tool(session, force=True)
     lineage_id = clustered["communities"][0]["lineage_id"]
     write_community_report(
@@ -429,7 +481,7 @@ def test_cluster_and_write_entity_description_survive_a_hand_written_bad_note(
     to call `fold()` bare -- exactly the same defect as `rebuild()`, so a
     note `fold()` rejects took these tools down too, not just `rebuild`."""
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     (session.paths.notes / "n_badedge-hand.md").write_text(
         "---\n"
         "id: n_badedge\n"
@@ -463,7 +515,7 @@ def test_cluster_and_write_entity_description_survive_a_hand_written_bad_entity_
     """The Tier-2 counterpart: `_resolve_slug`/`_tables`'s callers used to
     raise on a malformed *entity page* too, not just a malformed note."""
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     (session.paths.entities / "hand-made.md").write_text("---\ntitle: oops\n---\n")
 
     result = cluster_tool(session, force=True)
@@ -503,7 +555,7 @@ def test_cluster_needs_report_reflects_a_report_marked_stale_by_moved_evidence(
         ],
     )
     assertion_id = note["relationship_assertions"][0]["id"]
-    resolve_assertion(session, assertion_id, "confirm")
+    decide(session, assertion_id, "confirm", "test")
     clustered = cluster_tool(session, force=True)
     lineage_id = clustered["communities"][0]["lineage_id"]
     write_community_report(
@@ -542,7 +594,7 @@ def test_cluster_needs_report_reflects_a_report_marked_stale_by_moved_evidence(
 
 def test_rebuild_tool_does_not_rewrite_an_unchanged_entity_page(with_assertion):
     session, assertion_id = with_assertion
-    resolve_assertion(session, assertion_id, "confirm")  # already ran rebuild()
+    decide(session, assertion_id, "confirm", "test")  # already ran rebuild()
 
     page_path = next(session.paths.entities.glob("*.md"))
     before_text = page_path.read_text()

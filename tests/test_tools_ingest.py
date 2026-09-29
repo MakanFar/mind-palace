@@ -91,7 +91,7 @@ def test_a_file_with_no_extractable_text_is_refused_not_stored_empty(session, tm
 
 
 def test_reports_can_cite_captures_and_units(session, tmp_path):
-    from mindpalace.tools import cluster_tool, write_community_report, propose_relationship, resolve_assertion
+    from mindpalace.tools import cluster_tool, write_community_report, propose_relationship, decide
 
     src = tmp_path / "long.txt"
     src.write_text("\n\n".join("sentence " + "q" * 300 for _ in range(8)))
@@ -101,7 +101,7 @@ def test_reports_can_cite_captures_and_units(session, tmp_path):
     note = write_note(session, long["id"], "Body.", entities=[
         {"name": "a", "type": "concept", "description": "d"}, {"name": "b", "type": "concept", "description": "d"}])
     link = propose_relationship(session, "a", "b", "relates-to", "because")
-    resolve_assertion(session, link["id"], "confirm")
+    decide(session, link["id"], "confirm", "test")
     clustered = cluster_tool(session, force=True)
     lineage = clustered["communities"][0]["lineage_id"]
     result = write_community_report(

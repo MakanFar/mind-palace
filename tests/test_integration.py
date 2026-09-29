@@ -9,7 +9,7 @@ from mindpalace.tools import (
     graph_stats,
     neighbors,
     rebuild_tool,
-    resolve_assertion,
+    decide,
     review_queue,
     save_capture,
     search_global,
@@ -77,7 +77,7 @@ def seed(session):
             {"subject": "scaling-laws", "text": "The plateau reflects data exhaustion."}
         ],
     )
-    resolve_assertion(session, note["relationship_assertions"][0]["id"], "confirm")
+    decide(session, note["relationship_assertions"][0]["id"], "confirm", "test")
     return note
 
 

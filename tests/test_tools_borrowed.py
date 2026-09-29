@@ -12,6 +12,7 @@ from mindpalace.tools import (
     graph_stats,
     merge_entities,
     propose_relationship,
+    decide,
     resolve_assertion,
     retire_entity,
     review_queue,
@@ -76,7 +77,7 @@ def test_adopt_type_adds_the_edge_type_and_retypes_waiting_assertions(session):
         ],
     )
     [assertion] = first["relationship_assertions"]
-    resolve_assertion(session, assertion["id"], "confirm")
+    decide(session, assertion["id"], "confirm", "test")
     assert graph_stats(session)["traversable_aggregates"] == 0
 
     result = adopt_type(session, "edge", "available on", "available-on", directed=True)
@@ -269,7 +270,7 @@ def test_bad_validity_is_dropped_not_silently_accepted(session):
 def test_a_confirmed_correction_supersedes_the_old_claim(session):
     first = note(session, claim_assertions=[{"subject": "acme", "text": "HQ in Beijing."}])
     [old] = first["claim_assertions"]
-    resolve_assertion(session, old["id"], "confirm")
+    decide(session, old["id"], "confirm", "test")
     second = note(
         session,
         claim_assertions=[
@@ -280,7 +281,7 @@ def test_a_confirmed_correction_supersedes_the_old_claim(session):
     assert new["supersedes"] == old["id"]
     statuses = {c["id"]: c["status"] for c in get_entity(session, "acme")["claims"]}
     assert statuses[old["id"]] == "confirmed"
-    resolve_assertion(session, new["id"], "confirm")
+    decide(session, new["id"], "confirm", "test")
     statuses = {c["id"]: c["status"] for c in get_entity(session, "acme")["claims"]}
     assert statuses[old["id"]] == "superseded"
     assert statuses[new["id"]] == "confirmed"
@@ -350,7 +351,7 @@ def test_retire_entity_refuses_while_anything_live_touches_it(session):
     )["relationship_assertions"]
     with pytest.raises(ToolError, match="1 proposed relationship.*decide"):
         retire_entity(session, "a")
-    resolve_assertion(session, x["id"], "confirm")
+    decide(session, x["id"], "confirm", "test")
     with pytest.raises(ToolError, match="1 confirmed relationship.*dismiss"):
         retire_entity(session, "a")
     resolve_assertion(session, x["id"], "dismiss")
