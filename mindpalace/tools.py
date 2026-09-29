@@ -1175,25 +1175,18 @@ def propose_relationship(
     return payload
 
 
-def adopt_type(
+def _check_adopt(
     session: Session,
     kind: str,
     proposed: str,
     name: str,
-    directed: bool | None = None,
-    cluster_weight: float = 1.0,
-    domain: list[str] | None = None,
-    range: list[str] | None = None,
-    action: str = "adopt",
-) -> dict:
-    """Promote a proposed wording into the vocabulary (docs/decisions/0001 §1).
-
-    Adds `name` to MINDPALACE.md if it is not there yet, then records
-    `proposed -> name` in `vocabulary.jsonl`; the next fold retypes every
-    assertion (or entity) that carried that wording. Note files are never
-    rewritten. `action="revoke"` withdraws the mapping and leaves the type
-    in the config: a type that has been used is history, not clutter.
-    """
+    directed: bool | None,
+    domain: list[str] | None,
+    range: list[str] | None,
+    action: str,
+) -> tuple[str, list[str], bool, bool]:
+    """Every refusal `adopt_type` can make, before anything is written.
+    Returns (normalised proposal, ids it retypes, new edge type?, new entity type?)."""
     _require(kind in VOCABULARY_KINDS, f"kind must be one of {sorted(VOCABULARY_KINDS)}, got {kind!r}")
     _require(action in VOCABULARY_ACTIONS, f"action must be one of {sorted(VOCABULARY_ACTIONS)}, got {action!r}")
     key = _require_slug(proposed, "proposed wording")
@@ -1205,8 +1198,6 @@ def adopt_type(
     ).fetchone()
     waiting_ids = [i for i in waiting["ids"].split(",") if i] if waiting else []
 
-    # Everything that can be refused is refused before the operation frame
-    # opens: a `begin` with no `commit` replays as a crash on the next open.
     new_edge = action == "adopt" and kind == "edge" and name not in session.config.edge_types
     new_entity = action == "adopt" and kind == "entity" and name not in session.config.entity_types
     if new_edge:
@@ -1215,6 +1206,74 @@ def adopt_type(
             unknown = [t for t in (allowed or []) if t not in session.config.entity_types]
             _require(not unknown, f"{end} names unknown entity type(s) {unknown}")
         _require(directed or not range, "a symmetric edge type takes domain only, not range")
+    return key, waiting_ids, new_edge, new_entity
+
+
+def describe_adopt_type(
+    session: Session,
+    kind: str,
+    proposed: str,
+    name: str,
+    directed: bool | None = None,
+    cluster_weight: float = 1.0,
+    domain: list[str] | None = None,
+    range: list[str] | None = None,
+    action: str = "adopt",
+) -> str:
+    """What `adopt_type` would do, in words a person approves (docs/decisions/0005)."""
+    key, waiting_ids, new_edge, new_entity = _check_adopt(
+        session, kind, proposed, name, directed, domain, range, action
+    )
+    if action == "revoke":
+        return (
+            f"Revoke the adoption of {key!r} as {kind} type `{name}`: items with that "
+            f"wording go back to being untyped proposals."
+        )
+    retypes = _plural(len(waiting_ids), "item")
+    if new_edge:
+        shape = ["directed" if directed else "symmetric"]
+        if domain:
+            shape.append(f"domain {list(domain)}")
+        if range:
+            shape.append(f"range {list(range)}")
+        return (
+            f"Adopt {key!r} as a new edge type `{name}` ({', '.join(shape)}); "
+            f"adds it to MINDPALACE.md and retypes {retypes}."
+        )
+    if new_entity:
+        return (
+            f"Adopt {key!r} as a new entity type `{name}`; adds it to MINDPALACE.md "
+            f"and retypes {retypes}."
+        )
+    return f"Adopt the wording {key!r} as {kind} type `{name}` (existing): retypes {retypes}."
+
+
+def adopt_type(
+    session: Session,
+    kind: str,
+    proposed: str,
+    name: str,
+    directed: bool | None = None,
+    cluster_weight: float = 1.0,
+    domain: list[str] | None = None,
+    range: list[str] | None = None,
+    action: str = "adopt",
+    via: str = "adopt_type",
+) -> dict:
+    """Promote a proposed wording into the vocabulary (docs/decisions/0001 §1).
+
+    Adds `name` to MINDPALACE.md if it is not there yet, then records
+    `proposed -> name` in `vocabulary.jsonl`; the next fold retypes every
+    assertion (or entity) that carried that wording. Note files are never
+    rewritten. `action="revoke"` withdraws the mapping and leaves the type
+    in the config: a type that has been used is history, not clutter.
+    `via` names who decided (docs/decisions/0005).
+    """
+    # Everything that can be refused is refused before the operation frame
+    # opens: a `begin` with no `commit` replays as a crash on the next open.
+    key, waiting_ids, new_edge, new_entity = _check_adopt(
+        session, kind, proposed, name, directed, domain, range, action
+    )
 
     with session.operation({"tool": "adopt_type", "kind": kind, "proposed": key, "action": action}) as op_id:
         if new_edge or new_entity:
@@ -1230,7 +1289,7 @@ def adopt_type(
             except ConfigError as exc:
                 raise ToolError(str(exc)) from exc
             session.config = load_config(session.paths.mindpalace_md)
-        session.vocabulary.append(kind, key, name, action, "adopt_type", op_id)
+        session.vocabulary.append(kind, key, name, action, via, op_id)
         _rebuild(session)
 
     return {
@@ -1242,25 +1301,14 @@ def adopt_type(
     }
 
 
-def merge_entities(
-    session: Session,
-    duplicate: str,
-    canonical: str,
-    action: str = "merge",
-    reason: str | None = None,
-) -> dict:
-    """Record an identity decision in `merges.jsonl` (docs/decisions/0001 §5).
-
-    `merge` folds `duplicate` into `canonical` on every rebuild from now on;
-    `unmerge` reverses it; `keep` says the two are different so the
-    similarity lint stops asking. The note files are untouched, so the
-    decision is exactly as reversible as any other line in a log.
-    """
+def _check_merge(
+    session: Session, duplicate: str, canonical: str, action: str
+) -> tuple[str, str]:
+    """Every refusal `merge_entities` can make. Returns (duplicate, canonical) slugs."""
     _require(action in MERGE_ACTIONS, f"action must be one of {sorted(MERGE_ACTIONS)}, got {action!r}")
     dup = _require_slug(duplicate, "duplicate")
     canon = _require_slug(canonical, "canonical")
     _require(dup != canon, f"{dup!r} cannot be merged into itself")
-
     if action == "merge":
         current = session.merges.merges()
         known = {row["slug"] for row in session.conn.execute("SELECT slug FROM entities")}
@@ -1273,9 +1321,59 @@ def merge_entities(
             raise ToolError(
                 f"merging {dup!r} into {canon!r} would create a cycle: {exc}"
             ) from exc
+    return dup, canon
+
+
+def describe_merge_entities(
+    session: Session,
+    duplicate: str,
+    canonical: str,
+    action: str = "merge",
+    reason: str | None = None,
+) -> str:
+    """What `merge_entities` would do, in words a person approves (docs/decisions/0005)."""
+    dup, canon = _check_merge(session, duplicate, canonical, action)
+    if action == "merge":
+        relationships = session.conn.execute(
+            "SELECT COUNT(*) FROM assertions WHERE source = ? OR target = ?", (dup, dup)
+        ).fetchone()[0]
+        claims = session.conn.execute(
+            "SELECT COUNT(*) FROM claims WHERE subject = ?", (dup,)
+        ).fetchone()[0]
+        text = (
+            f"Merge `{dup}` into `{canon}`: {_plural(relationships, 'relationship')} and "
+            f"{_plural(claims, 'claim')} naming `{dup}` fold into `{canon}`."
+        )
+    elif action == "unmerge":
+        text = f"Unmerge `{dup}` from `{canon}`: it becomes its own entity again."
+    else:
+        text = (
+            f"Record that `{dup}` and `{canon}` are different entities, so the "
+            f"duplicate check stops flagging them."
+        )
+    return f"{text} Reason: {reason}" if reason else text
+
+
+def merge_entities(
+    session: Session,
+    duplicate: str,
+    canonical: str,
+    action: str = "merge",
+    reason: str | None = None,
+    via: str = "merge_entities",
+) -> dict:
+    """Record an identity decision in `merges.jsonl` (docs/decisions/0001 §5).
+
+    `merge` folds `duplicate` into `canonical` on every rebuild from now on;
+    `unmerge` reverses it; `keep` says the two are different so the
+    similarity lint stops asking. The note files are untouched, so the
+    decision is exactly as reversible as any other line in a log. `via`
+    names who decided (docs/decisions/0005).
+    """
+    dup, canon = _check_merge(session, duplicate, canonical, action)
 
     with session.operation({"tool": "merge_entities", "duplicate": dup, "canonical": canon, "action": action}) as op_id:
-        session.merges.append(dup, canon, action, "merge_entities", op_id, reason)
+        session.merges.append(dup, canon, action, via, op_id, reason)
         _rebuild(session)
 
     status = {"merge": "merged", "unmerge": "unmerged", "keep": "kept"}[action]
@@ -1298,24 +1396,13 @@ def _live_items(session: Session, slug: str) -> list[tuple[str, str, int]]:
     return [(r["status"], r["kind"], r["n"]) for r in rows if r["n"]]
 
 
-def retire_entity(
-    session: Session, slug: str, action: str = "retire", reason: str | None = None
-) -> dict:
-    """Record that a slug is not an entity in `retirements.jsonl`
-    (docs/decisions/0004 §Part 2), or restore one.
-
-    `retire` is refused while anything live names the slug: a proposed item
-    must be decided and a confirmed one dismissed first, so retiring never
-    drops an assertion and the review queue stays the one place assertions
-    are decided. The note files are untouched, so the decision is exactly as
-    reversible as a merge.
-    """
+def _check_retire(session: Session, slug: str, action: str) -> str:
+    """Every refusal `retire_entity` can make. Returns the slug."""
     _require(
         action in RETIREMENT_ACTIONS,
         f"action must be one of {sorted(RETIREMENT_ACTIONS)}, got {action!r}",
     )
     target = _require_slug(slug, "slug")
-    retired = session.retirements.retired()
     if action == "retire":
         known = {row["slug"] for row in session.conn.execute("SELECT slug FROM entities")}
         _require(target in known, f"no entity {target!r} in the graph")
@@ -1328,10 +1415,42 @@ def retire_entity(
                 parts.append(f"{count} {status} {noun}: {verb} {'it' if count == 1 else 'them'} first")
             raise ToolError(f"{target!r} still has {'; '.join(parts)}")
     else:
-        _require(target in retired, f"{target!r} is not retired")
+        _require(target in session.retirements.retired(), f"{target!r} is not retired")
+    return target
+
+
+def describe_retire_entity(
+    session: Session, slug: str, action: str = "retire", reason: str | None = None
+) -> str:
+    """What `retire_entity` would do, in words a person approves (docs/decisions/0005)."""
+    target = _check_retire(session, slug, action)
+    if action == "retire":
+        text = f"Retire `{target}`: it leaves the graph; its page stays."
+    else:
+        text = f"Restore `{target}` to the graph."
+    return f"{text} Reason: {reason}" if reason else text
+
+
+def retire_entity(
+    session: Session,
+    slug: str,
+    action: str = "retire",
+    reason: str | None = None,
+    via: str = "retire_entity",
+) -> dict:
+    """Record that a slug is not an entity in `retirements.jsonl`
+    (docs/decisions/0004 §Part 2), or restore one.
+
+    `retire` is refused while anything live names the slug: a proposed item
+    must be decided and a confirmed one dismissed first, so retiring never
+    drops an assertion and the review queue stays the one place assertions
+    are decided. The note files are untouched, so the decision is exactly as
+    reversible as a merge. `via` names who decided (docs/decisions/0005).
+    """
+    target = _check_retire(session, slug, action)
 
     with session.operation({"tool": "retire_entity", "slug": target, "action": action}) as op_id:
-        session.retirements.append(target, action, "retire_entity", op_id, reason)
+        session.retirements.append(target, action, via, op_id, reason)
         _rebuild(session)
 
     status = {"retire": "retired", "restore": "restored"}[action]

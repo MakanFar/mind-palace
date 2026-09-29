@@ -8,6 +8,9 @@ from mindpalace.session import Session
 from mindpalace.tools import (
     ToolError,
     adopt_type,
+    describe_adopt_type,
+    describe_merge_entities,
+    describe_retire_entity,
     get_entity,
     graph_stats,
     merge_entities,
@@ -511,3 +514,90 @@ def test_adopting_keeps_the_comments_in_mindpalace_md(session):
     assert "# Optional:" in after
     assert "available-on: {directed: true, cluster_weight: 1.0}" in after
     assert "entity_types: [person, concept, paper, project, term, theme, organisation]" in after
+
+
+# ---- docs/decisions/0005: summaries and `via` ----------------------------
+
+
+def _two_entities_and_an_untyped_link(session):
+    capture = save_capture(session, "Star Wars is on GeForce Now.")
+    return write_note(
+        session,
+        derived_from=capture["id"],
+        content="Availability note.",
+        entities=[
+            {"name": "star-wars", "type": "concept", "description": "game"},
+            {"name": "starwars", "type": "concept", "description": "game"},
+        ],
+        relationship_assertions=[
+            {"source": "starwars", "target": "geforce-now", "type": "available on",
+             "description": "playable there"}
+        ],
+    )
+
+
+def test_describe_adopt_type_names_a_new_edge_type_and_its_effect(session):
+    _two_entities_and_an_untyped_link(session)
+    text = describe_adopt_type(
+        session, "edge", "available on", "available-on", directed=True, domain=["concept"]
+    )
+    assert "new edge type `available-on`" in text
+    assert "directed" in text and "domain ['concept']" in text
+    assert "MINDPALACE.md" in text
+    assert "retypes 1 item" in text
+    assert session.vocabulary.adoptions()["edge"] == {}
+
+
+def test_describe_adopt_type_refuses_what_adopt_type_refuses(session):
+    with pytest.raises(ToolError, match="directed"):
+        describe_adopt_type(session, "edge", "x", "brand-new")
+
+
+def test_describe_merge_entities_counts_what_folds(session):
+    _two_entities_and_an_untyped_link(session)
+    text = describe_merge_entities(session, "starwars", "star-wars", reason="same game")
+    assert text.startswith("Merge `starwars` into `star-wars`")
+    assert "1 relationship and 0 claims" in text
+    assert "same game" in text
+    assert session.merges.merges() == {}
+
+
+def test_describe_merge_entities_refuses_a_cycle(session):
+    _two_entities_and_an_untyped_link(session)
+    merge_entities(session, "starwars", "star-wars")
+    with pytest.raises(ToolError, match="cycle"):
+        describe_merge_entities(session, "star-wars", "starwars")
+
+
+def test_describe_retire_entity_refuses_while_something_live_names_it(session):
+    _two_entities_and_an_untyped_link(session)
+    with pytest.raises(ToolError, match="decide"):
+        describe_retire_entity(session, "starwars")
+    assert describe_retire_entity(session, "star-wars", reason="dup") == (
+        "Retire `star-wars`: it leaves the graph; its page stays. Reason: dup"
+    )
+
+
+def test_the_gated_tools_record_the_via_they_are_given(session):
+    import json
+
+    _two_entities_and_an_untyped_link(session)
+    adopt_type(session, "edge", "available on", "available-on", directed=True, via="cli")
+    merge_entities(session, "starwars", "star-wars", via="chat_approval")
+    vocab = json.loads(session.paths.vocabulary_log.read_text().splitlines()[-1])
+    merges = json.loads(session.paths.merges_log.read_text().splitlines()[-1])
+    assert vocab["via"] == "cli"
+    assert merges["via"] == "chat_approval"
+
+
+def test_retire_entity_records_its_via(session):
+    import json
+
+    capture = save_capture(session, "Loose name.")
+    write_note(
+        session, derived_from=capture["id"], content="n",
+        entities=[{"name": "loose", "type": "concept", "description": "d"}],
+    )
+    retire_entity(session, "loose", via="chat_approval")
+    line = json.loads(session.paths.retirements_log.read_text().splitlines()[-1])
+    assert line["via"] == "chat_approval"
