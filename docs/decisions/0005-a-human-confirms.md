@@ -1,6 +1,6 @@
 # 0005 · A human confirms
 
-- **Status**: accepted, not yet implemented, 2026-09-29
+- **Status**: implemented on `node-review-2`, 2026-09-29
 - **Related**: PRD §5 P7 (durable structure is review-gated) and §11 (the hallucination
   feedback loop, the #1 risk); [0001](0001-what-we-borrowed-from-utopia.md) §1 and §5 (adoptions
   and merges are logged decisions); [0003](0003-a-window-into-the-palace.md) §Part 2 (the

@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import argparse
 import functools
-import sys
 from collections.abc import Callable
-from pathlib import Path
 from typing import Literal
 
 import anyio.to_thread
@@ -21,9 +18,7 @@ from mcp_types import ClientCapabilities, ElicitationCapability
 from pydantic import BaseModel
 
 from mindpalace import gate, tools
-from mindpalace.config import ConfigError
-from mindpalace.embed import EmbedderError
-from mindpalace.session import Session, VaultLockedError
+from mindpalace.session import Session
 
 TOOL_NAMES = (
     "save_capture",
@@ -336,29 +331,10 @@ def build_server(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="mindpalace")
-    parser.add_argument("--vault", required=True, help="path to the vault directory")
-    parser.add_argument("--init", action="store_true", help="scaffold a new vault")
-    parser.add_argument(
-        "--check", action="store_true", help="open and validate, then exit"
-    )
-    args = parser.parse_args(argv)
+    """The `mindpalace` console script; see mindpalace.cli."""
+    from mindpalace.cli import main as cli_main
 
-    try:
-        session = Session(Path(args.vault), init=args.init).open()
-    except (ConfigError, VaultLockedError, EmbedderError) as exc:
-        # EmbedderError included so a misconfigured embedder is a legible message
-        # rather than a traceback out of the MCP entry point.
-        print(str(exc), file=sys.stderr)
-        return 2
-
-    try:
-        if args.check:
-            return 0
-        build_server(session).run()
-        return 0
-    finally:
-        session.close()
+    return cli_main(argv)
 
 
 if __name__ == "__main__":
