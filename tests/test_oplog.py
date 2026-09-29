@@ -226,9 +226,12 @@ def test_decision_log_conformance_fixture_folds_the_same_as_the_plugin():
 
     fixture = Path(__file__).parent / "fixtures" / "decisions-conformance.jsonl"
     log = DecisionLog(fixture)
-    assert log.status_map() == {"x_1": "confirm", "k_2": "confirm", "x_3": "reopen"}
+    assert log.status_map() == {
+        "x_1": "confirm", "k_2": "confirm", "x_3": "reopen", "x_4": "confirm", "x_5": "dismiss",
+    }
     assert [d.via for d in log.entries()] == [
         "resolve_assertion", "obsidian", "resolve_assertion", "resolve_assertion", "obsidian",
+        "chat_review", "cli",
     ]
 
 

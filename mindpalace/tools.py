@@ -1540,6 +1540,8 @@ def review_queue(session: Session, limit: int = 20) -> dict:
             "id": row["id"],
             "kind": "relationship",
             "pair": _pair(row["source"], row["type"], row["proposed_type"], row["target"]),
+            "source": row["source"],
+            "target": row["target"],
             "type": row["type"],
             "proposed_type": row["proposed_type"],
             "direction_corrected": bool(row["direction_corrected"]),

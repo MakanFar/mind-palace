@@ -161,7 +161,9 @@ describe("conformance with the Python DecisionLog", () => {
 
   it("folds the shared fixture to the same map, torn final line included", () => {
     const overlay = foldDecisions(fixture);
-    expect([...overlay.entries()]).toEqual([["x_1", "confirm"], ["k_2", "confirm"], ["x_3", "reopen"]]);
+    expect([...overlay.entries()]).toEqual([
+      ["x_1", "confirm"], ["k_2", "confirm"], ["x_3", "reopen"], ["x_4", "confirm"], ["x_5", "dismiss"],
+    ]);
   });
 
   it("treats a torn line before a trailing newline as final, like splitlines()", () => {
