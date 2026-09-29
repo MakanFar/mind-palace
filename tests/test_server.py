@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import mindpalace.server as server_module
 from mindpalace import tools
 from mindpalace.embed import StubEmbedder
 from mindpalace.server import TOOL_NAMES, build_server, main
@@ -24,25 +25,38 @@ def registered_names(session):
     return {tool.name for tool in asyncio.run(server.list_tools())}
 
 
-def call(session, name: str, arguments: dict | None = None) -> dict:
+def _server(session, asker=None):
+    if asker is None:
+        return build_server(session)
+    return build_server(session, asker_for=lambda ctx: asker)
+
+
+def call(session, name: str, arguments: dict | None = None, asker=None) -> dict:
     """Round-trip a call through the real MCPServer object, not tools.py directly.
 
-    `list_tools()` alone only proves a name and a docstring got registered — it
-    would pass just as happily if a tool body called the wrong function or
-    passed arguments in the wrong order. Actually invoking `call_tool` exercises
-    the decorator, the argument binding, and the delegation into `tools.py` in
-    one pass, and decodes the MCP JSON content back into a plain dict so the
-    assertions read like a normal tool-return check.
+    `list_tools()` alone only proves a name and a docstring got registered. Actually
+    invoking `call_tool` exercises the decorator, the argument binding, and the
+    delegation into `tools.py` in one pass. `asker` stands in for the person a gated
+    tool asks (docs/decisions/0005).
     """
-    server = build_server(session)
-    result = asyncio.run(server.call_tool(name, arguments or {}))
+    result = asyncio.run(_server(session, asker).call_tool(name, arguments or {}))
     assert result.is_error is not True, result.content
     return json.loads(result.content[0].text)
 
 
-def test_all_fifteen_tools_are_registered(session):
+def call_error(session, name: str, arguments: dict | None = None, asker=None) -> str:
+    """The refusal a tool call produces. In-process, `MCPServer.call_tool`
+    raises the error that the protocol layer would wrap as `isError`."""
+    from mcp.server.mcpserver.exceptions import ToolError as McpToolError
+
+    with pytest.raises(McpToolError) as refused:
+        asyncio.run(_server(session, asker).call_tool(name, arguments or {}))
+    return str(refused.value)
+
+
+def test_all_tools_are_registered(session):
     assert registered_names(session) == set(TOOL_NAMES)
-    assert len(TOOL_NAMES) == 19
+    assert len(TOOL_NAMES) == 20
 
 
 def test_every_tool_has_a_description(session):
@@ -186,7 +200,7 @@ def test_the_session_lock_is_held_for_a_tool_calls_full_duration(session, monkey
     session.lock.release()
 
 
-def test_adopt_and_merge_round_trip_through_the_real_server(session):
+def test_adopt_and_merge_round_trip_through_the_real_server(session, scripted):
     capture = call(session, "save_capture", {"text": "Star Wars is on GeForce Now."})
     note = call(
         session,
@@ -211,9 +225,13 @@ def test_adopt_and_merge_round_trip_through_the_real_server(session):
         session,
         "adopt_type",
         {"kind": "edge", "proposed": "available on", "name": "available-on", "directed": True},
+        asker=scripted(confirms=[True]),
     )
     assert adopted["retyped"] == [note["relationship_assertions"][0]["id"]]
-    merged = call(session, "merge_entities", {"duplicate": "starwars", "canonical": "star-wars"})
+    merged = call(
+        session, "merge_entities", {"duplicate": "starwars", "canonical": "star-wars"},
+        asker=scripted(confirms=[True]),
+    )
     assert merged["status"] == "merged"
     entity = call(session, "get_entity", {"name": "starwars", "as_of": "2026"})
     assert entity["slug"] == "star-wars"
@@ -225,3 +243,128 @@ def test_ingest_file_round_trips_through_the_real_server(session, tmp_path):
     src.write_text("hello from a file")
     payload = call(session, "ingest_file", {"path": str(src)})
     assert payload["id"].startswith("c_") and payload["units"] == 1
+
+
+# ---- docs/decisions/0005: the gate on the chat surface --------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+from mindpalace.server import McpAsker  # noqa: E402
+
+
+def _proposal(session):
+    capture = call(session, "save_capture", {"text": "Scaling hits a data wall."})
+    note = call(session, "write_note", {
+        "derived_from": capture["id"], "content": "n",
+        "relationship_assertions": [{"source": "a", "target": "b", "type": "supports",
+                                     "description": "because"}],
+    })
+    return note["relationship_assertions"][0]["id"]
+
+
+def test_resolve_assertion_refuses_confirm_through_the_server(session):
+    assertion = _proposal(session)
+    assert "review" in call_error(session, "resolve_assertion",
+                                  {"identifier": assertion, "action": "confirm"})
+
+
+def test_review_is_refused_when_the_client_cannot_ask(session):
+    _proposal(session)
+    # The default asker over a Context with no live request: no elicitation capability.
+    assert "cannot ask" in call_error(session, "review")
+
+
+def test_review_confirms_through_the_server(session, scripted):
+    assertion = _proposal(session)
+    result = call(session, "review", {}, asker=scripted(confirms=[True], choices=[("confirm", None)]))
+    assert result["confirmed"] == 1
+    [entry] = session.decisions.entries()
+    assert (entry.assertion, entry.via) == (assertion, "chat_review")
+
+
+@pytest.mark.parametrize("tool, arguments", [
+    ("merge_entities", {"duplicate": "a", "canonical": "b"}),
+    ("retire_entity", {"slug": "a"}),
+    ("adopt_type", {"kind": "edge", "proposed": "inspires", "name": "supports"}),
+])
+def test_gated_tools_write_nothing_when_declined(session, scripted, tool, arguments):
+    capture = call(session, "save_capture", {"text": "x"})
+    call(session, "write_note", {
+        "derived_from": capture["id"], "content": "n",
+        "entities": [{"name": "a", "type": "concept", "description": "d"},
+                     {"name": "b", "type": "concept", "description": "d"}],
+    })
+    assert "declined" in call_error(session, tool, arguments, asker=scripted(confirms=[False]))
+    assert session.merges.merges() == {}
+    assert session.retirements.retired() == set()
+    assert session.vocabulary.adoptions()["edge"] == {}
+
+
+def test_a_gated_tool_records_chat_approval(session, scripted):
+    capture = call(session, "save_capture", {"text": "x"})
+    call(session, "write_note", {
+        "derived_from": capture["id"], "content": "n",
+        "entities": [{"name": "loose", "type": "concept", "description": "d"}],
+    })
+    asker = scripted(confirms=[True])
+    call(session, "retire_entity", {"slug": "loose", "reason": "noise"}, asker=asker)
+    assert asker.messages == ["Retire `loose`: it leaves the graph; its page stays. Reason: noise"]
+    line = json.loads(session.paths.retirements_log.read_text().splitlines()[-1])
+    assert line["via"] == "chat_approval"
+
+
+def test_no_lock_is_held_while_the_user_is_asked(session, scripted):
+    _proposal(session)
+    free = []
+
+    def probe(message):
+        # A worker thread stands in for a second tool call arriving mid-prompt.
+        # It must release what it grabs itself: an RLock belongs to its taker.
+        grabbed = []
+
+        def worker():
+            got = session.lock.acquire(timeout=1)
+            grabbed.append(got)
+            if got:
+                session.lock.release()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+        free.append(grabbed[0])
+
+    call(session, "review", {}, asker=scripted(confirms=[True], choices=[("stop", None)], on_ask=probe))
+    assert free == [True, True]
+
+
+def test_an_elicitation_error_counts_as_a_decline():
+    async def broken(message, schema):
+        raise RuntimeError("client timed out")
+
+    ctx = SimpleNamespace(
+        elicit=broken,
+        request_context=SimpleNamespace(
+            session=SimpleNamespace(check_client_capability=lambda capability: True)
+        ),
+    )
+    asker = McpAsker(ctx)
+    assert asker.can_ask() is True
+    assert asyncio.run(asker.confirm("Proceed?")) is False
+    assert asyncio.run(asker.choose("Decide")) == ("stop", None)
+
+
+def test_mcp_asker_maps_the_answers():
+    from mcp.server.elicitation import AcceptedElicitation, DeclinedElicitation
+
+    answers = []
+
+    async def elicit(message, schema):
+        return answers.pop(0)
+
+    asker = McpAsker(SimpleNamespace(elicit=elicit))
+    answers[:] = [AcceptedElicitation(data=server_module._Proceed()), DeclinedElicitation()]
+    assert asyncio.run(asker.confirm("?")) is True
+    assert asyncio.run(asker.confirm("?")) is False
+    answers[:] = [AcceptedElicitation(data=server_module._Decision(decision="dismiss", reason="no"))]
+    assert asyncio.run(asker.choose("?")) == ("dismiss", "no")
+

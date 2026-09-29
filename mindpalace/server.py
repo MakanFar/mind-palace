@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Literal
+
+import anyio.to_thread
 
 # The installed `mcp` package (2.x) no longer ships `mcp.server.fastmcp`; the
 # server class now lives at `mcp.server.mcpserver.MCPServer`. Its decorator
 # and `list_tools()` behave the same way the brief assumed FastMCP's would
 # (docstring becomes the description, `list_tools()` is async), so only the
 # import path changes here.
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
+from mcp_types import ClientCapabilities, ElicitationCapability
+from pydantic import BaseModel
 
-from mindpalace import tools
+from mindpalace import gate, tools
 from mindpalace.config import ConfigError
 from mindpalace.embed import EmbedderError
 from mindpalace.session import Session, VaultLockedError
@@ -34,6 +41,7 @@ TOOL_NAMES = (
     "merge_entities",
     "retire_entity",
     "review_queue",
+    "review",
     "cluster",
     "write_community_report",
     "write_entity_description",
@@ -57,8 +65,59 @@ def _run(session: Session, fn, *args, **kwargs):
         return fn(session, *args, **kwargs)
 
 
-def build_server(session: Session) -> MCPServer:
+class _Proceed(BaseModel):
+    """Accept means yes; the form has nothing to fill in."""
+
+
+class _Decision(BaseModel):
+    decision: Literal["confirm", "dismiss", "skip", "stop"]
+    reason: str | None = None
+
+
+class McpAsker:
+    """An `Asker` over MCP elicitation (docs/decisions/0005): the client puts
+    the question to the user, and the assistant never sees it until it is
+    answered. An error from the client -- a timeout, a closed dialog --
+    counts as no."""
+
+    def __init__(self, ctx: Context) -> None:
+        self.ctx = ctx
+
+    def can_ask(self) -> bool:
+        try:
+            session = self.ctx.request_context.session
+        except ValueError:
+            return False  # no live request: nobody to ask
+        return session.check_client_capability(
+            ClientCapabilities(elicitation=ElicitationCapability())
+        )
+
+    async def confirm(self, message: str) -> bool:
+        try:
+            answer = await self.ctx.elicit(message, _Proceed)
+        except Exception:
+            return False
+        return answer.action == "accept"
+
+    async def choose(self, message: str) -> tuple[str, str | None]:
+        try:
+            answer = await self.ctx.elicit(message, _Decision)
+        except Exception:
+            return "stop", None
+        if answer.action != "accept":
+            return "stop", None
+        return answer.data.decision, answer.data.reason
+
+
+def build_server(
+    session: Session, asker_for: Callable[[Context], gate.Asker] = McpAsker
+) -> MCPServer:
     server = MCPServer("mindpalace")
+
+    async def call(fn):
+        """Run one locked unit of gated work off the event loop, so no lock is
+        held while `gate` waits on a person (docs/decisions/0005 §Part 2)."""
+        return await anyio.to_thread.run_sync(_run, session, fn)
 
     @server.tool(name="save_capture")
     def _save_capture(text: str, why: str | None = None, source: str = "manual") -> dict:
@@ -157,16 +216,17 @@ def build_server(session: Session) -> MCPServer:
     def _resolve_assertion(
         identifier: str, action: str, reason: str | None = None
     ) -> dict:
-        """Confirm or dismiss a proposed relationship or claim, or reopen a
-        decided one so it is proposed again. Call this only on the user's
-        explicit instruction; the decision is logged with your stated reason."""
+        """Dismiss a proposed relationship or claim, or reopen a decided one so
+        it is proposed again. You cannot confirm: call `review` so the user
+        decides, or they confirm in Obsidian or with `mindpalace review`."""
         return _run(session, tools.resolve_assertion, identifier, action, reason)
 
     @server.tool(name="adopt_type")
-    def _adopt_type(
+    async def _adopt_type(
         kind: str,
         proposed: str,
         name: str,
+        ctx: Context,
         directed: bool | None = None,
         cluster_weight: float = 1.0,
         domain: list[str] | None = None,
@@ -175,46 +235,64 @@ def build_server(session: Session) -> MCPServer:
     ) -> dict:
         """Adopt a proposed wording (see review_queue's `vocabulary`) into the
         vocabulary as edge or entity type `name`, adding it to MINDPALACE.md
-        if new (a new edge type needs `directed`). Every assertion carrying
-        that wording is retyped on the next fold; note files are untouched.
-        action="revoke" withdraws the mapping. Call on the user's instruction."""
-        return _run(
-            session,
-            tools.adopt_type,
-            kind,
-            proposed,
-            name,
-            directed,
-            cluster_weight,
-            domain,
-            range,
-            action,
+        if new (a new edge type needs `directed`). The user is asked to
+        approve first; nothing is written if they decline. action="revoke"
+        withdraws the mapping."""
+        args = dict(kind=kind, proposed=proposed, name=name, directed=directed,
+                    cluster_weight=cluster_weight, domain=domain, range=range, action=action)
+        return await gate.approve(
+            asker_for(ctx), call,
+            functools.partial(tools.describe_adopt_type, **args),
+            functools.partial(tools.adopt_type, **args, via="chat_approval"),
         )
 
     @server.tool(name="merge_entities")
-    def _merge_entities(
-        duplicate: str, canonical: str, action: str = "merge", reason: str | None = None
+    async def _merge_entities(
+        duplicate: str,
+        canonical: str,
+        ctx: Context,
+        action: str = "merge",
+        reason: str | None = None,
     ) -> dict:
-        """Record that two entities are one (action="merge": duplicate folds
-        into canonical on every rebuild, reversible with "unmerge") or that a
-        flagged pair is genuinely different ("keep", so the similarity lint
-        stops asking). Logged, never applied to note files. Call on the
-        user's instruction."""
-        return _run(session, tools.merge_entities, duplicate, canonical, action, reason)
+        """Record that two entities are one (action="merge", reversible with
+        "unmerge") or that a flagged pair is genuinely different ("keep").
+        The user is asked to approve first; nothing is written if they
+        decline. Logged, never applied to note files."""
+        args = dict(duplicate=duplicate, canonical=canonical, action=action, reason=reason)
+        return await gate.approve(
+            asker_for(ctx), call,
+            functools.partial(tools.describe_merge_entities, **args),
+            functools.partial(tools.merge_entities, **args, via="chat_approval"),
+        )
 
     @server.tool(name="retire_entity")
-    def _retire_entity(slug: str, action: str = "retire", reason: str | None = None) -> dict:
+    async def _retire_entity(
+        slug: str, ctx: Context, action: str = "retire", reason: str | None = None
+    ) -> dict:
         """Record that a slug is not an entity (action="retire", reversible
         with "restore"). Refused while any proposed or confirmed relationship
-        or claim names it: decide or dismiss those first. Logged, never
-        applied to note files. Call on the user's instruction."""
-        return _run(session, tools.retire_entity, slug, action, reason)
+        or claim names it. The user is asked to approve first; nothing is
+        written if they decline."""
+        args = dict(slug=slug, action=action, reason=reason)
+        return await gate.approve(
+            asker_for(ctx), call,
+            functools.partial(tools.describe_retire_entity, **args),
+            functools.partial(tools.retire_entity, **args, via="chat_approval"),
+        )
 
     @server.tool(name="review_queue")
     def _review_queue(limit: int = 20) -> dict:
         """Pending proposals, vocabulary proposals (wordings with no type yet),
         recent extraction drops, and vault issues, in separate sections."""
         return _run(session, tools.review_queue, limit)
+
+    @server.tool(name="review")
+    async def _review(ctx: Context, limit: int = 20) -> dict:
+        """Ask the user whether to review pending proposals now and, if they
+        agree, put each one to them to confirm, dismiss, or skip. The user
+        answers, not you; you receive only the outcome. Call this when the
+        user wants to review or when proposals need confirming."""
+        return await gate.run_review(asker_for(ctx), call, via="chat_review", limit=limit)
 
     @server.tool(name="cluster")
     def _cluster(force: bool = False) -> dict:
