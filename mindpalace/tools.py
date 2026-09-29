@@ -1542,6 +1542,12 @@ def review_queue(session: Session, limit: int = 20) -> dict:
             "pair": _pair(row["source"], row["type"], row["proposed_type"], row["target"]),
             "source": row["source"],
             "target": row["target"],
+            # An untyped proposal, or a type no longer in the config, has no
+            # direction to show.
+            "directed": bool(
+                row["type"] in session.config.edge_types
+                and session.config.edge_types[row["type"]].directed
+            ),
             "type": row["type"],
             "proposed_type": row["proposed_type"],
             "direction_corrected": bool(row["direction_corrected"]),

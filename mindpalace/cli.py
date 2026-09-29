@@ -211,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # The bare `mindpalace --vault X` form predates subcommands and is in
     # every existing MCP config: it keeps meaning `serve`.
-    if not argv or argv[0] not in SUBCOMMANDS:
+    if not argv or argv[0] not in (*SUBCOMMANDS, "-h", "--help"):
         argv = ["serve", *argv]
     args = _parser().parse_args(argv)
     if args.command == "serve":

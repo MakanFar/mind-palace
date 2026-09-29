@@ -50,7 +50,8 @@ def render_proposal(proposal: dict, position: int, total: int) -> str:
     if proposal["kind"] == "relationship":
         label = proposal["type"] or f"untyped: {proposal['proposed_type']}"
         lines = [
-            f"{head} Relationship: {proposal['source']} —[{label}]— {proposal['target']}",
+            f"{head} Relationship: {proposal['source']} —[{label}]"
+            f"{'→' if proposal['directed'] else '—'} {proposal['target']}",
             f"Why: {proposal['why']}",
             f"Strength: {proposal['strength']}/10"
             + (" (direction corrected to fit the edge type)" if proposal["direction_corrected"] else ""),

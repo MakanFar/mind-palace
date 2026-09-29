@@ -103,3 +103,10 @@ def test_subcommands_require_a_vault():
     for command in ("review", "merge", "retire", "adopt", "serve"):
         with pytest.raises(SystemExit):
             cli.main([command])
+
+
+def test_top_level_help_lists_the_subcommands(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["--help"])
+    out = capsys.readouterr().out
+    assert "review" in out and "retire" in out

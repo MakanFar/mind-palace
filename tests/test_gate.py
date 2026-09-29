@@ -169,3 +169,13 @@ def test_approve_revalidates_after_the_answer(session, scripted):
             functools.partial(tools.merge_entities, duplicate="a", canonical="b", via="chat_approval"),
         ))
     assert session.merges.merges() == {"b": "a"}
+
+
+def test_render_proposal_shows_the_direction_of_a_directed_edge(session):
+    capture = save_capture(session, "x")
+    write_note(session, derived_from=capture["id"], content="n", relationship_assertions=[
+        {"source": "evidence", "target": "claim", "type": "supports", "description": "backs it"},
+    ])
+    [proposal] = tools.review_queue(session)["proposals"]
+    first = gate.render_proposal(proposal, 1, 1).splitlines()[0]
+    assert first == "(1 of 1) Relationship: evidence —[supports]→ claim"
